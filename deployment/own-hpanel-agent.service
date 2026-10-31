@@ -23,7 +23,7 @@ Environment=DOCKER_SOCKET=/var/run/docker.sock
 Environment=SITES_DIR=/opt/own-hpanel/websites
 Environment=BACKUPS_DIR=/opt/own-hpanel/backups
 RuntimeDirectory=own-hpanel
-RuntimeDirectoryMode=0750
+RuntimeDirectoryMode=0755
 Restart=on-failure
 RestartSec=3
 # The agent is host-privileged by necessity (Docker access). It is confined

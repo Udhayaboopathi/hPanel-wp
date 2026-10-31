@@ -224,7 +224,12 @@ jobs:
           # "Load configuration" step, before this step and before the
           # ensure-panel-DB step - this step never handles the password.
           $SUDO test -s /opt/own-hpanel/secrets/db_admin_password.txt || { echo "::error::DB admin password file is missing - the Load configuration step did not run or failed"; exit 1; }
-          $SUDO install -d -m 750 /opt/own-hpanel/bin /opt/own-hpanel/secrets /opt/own-hpanel/websites /opt/own-hpanel/backups /opt/own-hpanel/logs
+          $SUDO install -d -m 750 /opt/own-hpanel/bin /opt/own-hpanel/secrets /opt/own-hpanel/logs
+          # websites/backups are bind-mounted into the panel container whose
+          # user has fixed gid 10001: group-share them (setgid) so the panel
+          # can use the file manager while they stay closed to other users.
+          $SUDO install -d -m 2770 -o root -g 10001 /opt/own-hpanel/websites
+          $SUDO install -d -m 2750 -o root -g 10001 /opt/own-hpanel/backups
           $SUDO install -m 755 "${RUNNER_TEMP}/hpanel-bin/agent" /opt/own-hpanel/bin/agent
           # Agent token: generated once, never overwritten, never printed.
           if ! $SUDO test -f /opt/own-hpanel/secrets/agent.token; then
@@ -259,20 +264,29 @@ jobs:
           $SUDO systemctl daemon-reload
           $SUDO systemctl enable own-hpanel-agent >/dev/null
           $SUDO systemctl restart own-hpanel-agent
+          # Do NOT test the socket file as the runner user: /run/own-hpanel
+          # is root-owned, so the runner cannot stat inside it even when the
+          # agent is listening (that false negative failed earlier deploys).
+          # /proc/net/unix lists bound socket paths for any user, and plain
+          # `systemctl is-active` needs no sudo - use both.
+          agent_up=""
           for i in $(seq 1 30); do
-            [ -S /run/own-hpanel/agent.sock ] && break
+            if systemctl is-active --quiet own-hpanel-agent && grep -q " /run/own-hpanel/agent.sock\$" /proc/net/unix; then
+              agent_up=1; break
+            fi
             sleep 1
           done
-          if [ ! -S /run/own-hpanel/agent.sock ]; then
-            echo "::error::agent socket did not appear under systemd (binary smoke test passed, so this is a service/sandbox problem) - diagnostics follow"
-            $SUDO systemctl status own-hpanel-agent --no-pager -l || true
-            $SUDO systemctl show own-hpanel-agent -p NRestarts -p ExecMainStatus -p ExecMainCode -p Result || true
+          if [ -z "$agent_up" ]; then
+            echo "::error::agent did not come up under systemd (binary smoke test passed, so this is a service/sandbox problem) - diagnostics follow"
+            systemctl status own-hpanel-agent --no-pager -l || true
+            systemctl show own-hpanel-agent -p NRestarts -p ExecMainStatus -p ExecMainCode -p Result || true
             exit 1
           fi
-          $SUDO systemctl is-active own-hpanel-agent
-          # Panel reads the agent token through the shared /run/own-hpanel mount.
-          $SUDO cp /opt/own-hpanel/secrets/agent.token /run/own-hpanel/agent.token
-          $SUDO chmod 640 /run/own-hpanel/agent.token
+          systemctl is-active own-hpanel-agent
+          # Panel reads the agent token through the shared /run/own-hpanel
+          # mount. The panel image's user has the fixed gid 10001, so the
+          # token copy is group-owned by it (640): root + panel only.
+          $SUDO install -m 640 -o root -g 10001 /opt/own-hpanel/secrets/agent.token /run/own-hpanel/agent.token
           echo "agent installed and running (panel-owned service only)"
 
       - name: Generate the MariaDB root password file if missing (server-side only)

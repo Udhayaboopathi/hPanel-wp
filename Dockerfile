@@ -8,7 +8,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/panel .
  && CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/agent ./cmd/agent
 
 FROM alpine:3.20 AS panel
-RUN adduser -D -H panel && mkdir -p /data && chown panel:panel /data
+RUN addgroup -g 10001 panel && adduser -D -H -u 10001 -G panel panel && mkdir -p /data && chown panel:panel /data
 COPY --from=build /out/panel /usr/local/bin/panel
 USER panel
 ENV PANEL_ADDR=":8080" PANEL_DATA_DIR="/data" PANEL_SECURE_COOKIES="true"

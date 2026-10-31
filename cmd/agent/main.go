@@ -112,7 +112,12 @@ func main() {
 		log.Error("listen", "err", err)
 		os.Exit(1)
 	}
-	_ = os.Chmod(socketPath, 0o660)
+	// The socket must be connectable by the panel container's user (fixed
+	// uid/gid 10001, a different uid than the agent's root). Connect
+	// permission is not the auth boundary: every operation requires the
+	// bearer token, which stays in 0600/0640 files. So the socket itself
+	// is 0666, like the Docker socket pattern used by group proxies.
+	_ = os.Chmod(socketPath, 0o666)
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("ok")) })
 	mux.HandleFunc("POST /execute", a.auth(a.execute))
