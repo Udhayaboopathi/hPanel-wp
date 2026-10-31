@@ -312,7 +312,7 @@ jobs:
           docker run --rm \
             -v /opt/own-hpanel/secrets:/secrets:ro \
             -v /run:/hostrun \
-            alpine:3.20 sh -c 'install -m 640 -o 0 -g 10001 /secrets/agent.token /hostrun/own-hpanel/agent.token'
+            alpine:3.20 sh -c 'mkdir -p /hostrun/own-hpanel && install -m 640 -o 0 -g 10001 /secrets/agent.token /hostrun/own-hpanel/agent.token'
           echo "agent token copy staged for the panel at /run/own-hpanel/agent.token (640, group 10001)"
           # 3) MariaDB root password: server-generated, never a GitHub
           # secret, generated once and never overwritten.
