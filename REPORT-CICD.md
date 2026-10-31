@@ -645,3 +645,22 @@ single failing line:
    it must be disabled once by the server owner
    (`systemctl disable --now own-hpanel-agent`). The container agent is
    the only agent the stack uses.
+
+## Follow-up (same day): stale bind-mount inode on /run/own-hpanel
+
+The a3b1169 run showed agent_running=true and host_socket=yes, but the
+socket was never visible inside the panel (panel_socket=no, 45/45). The
+containers dated from the first successful compose up and had never
+been recreated (unchanged images), while /run/own-hpanel is volatile:
+tmpfs, and historically owned by the legacy systemd unit's
+RuntimeDirectory cleanup, which deletes the directory when that service
+stops. A deleted-then-recreated host directory leaves long-lived
+containers mounting the old, unlinked inode - agent, panel and host
+path each see a different "same" directory. Fix: every deploy now runs
+`docker compose up -d --force-recreate panel agent` (both stateless;
+MariaDB excluded - named volume, unaffected), so bind mounts always
+re-resolve against current host paths. The verify step also gained
+panel restart-count reporting and a full diagnostics dump (container
+states, host vs panel views of the directory, panel logs) on failure,
+after two consecutive runs failed without the panel's logs ever being
+captured.

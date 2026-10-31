@@ -366,7 +366,20 @@ jobs:
           # only service with the Docker socket mounted). Nothing
           # pre-existing can be started/stopped by it.
           docker compose build
-          if ! docker compose up -d; then
+          # --force-recreate for panel + agent on EVERY deploy: both
+          # bind-mount the host directory /run/own-hpanel, which is
+          # volatile (tmpfs, and historically also managed by a legacy
+          # systemd unit's RuntimeDirectory). If that directory was
+          # deleted and recreated since the containers were first
+          # created, long-lived containers keep mounting the DELETED
+          # inode: the agent's socket then exists in a directory the
+          # current host path - and a freshly staged token - do not
+          # share, and panel/agent silently disagree about the socket.
+          # Recreating the two stateless containers re-resolves every
+          # bind mount against the current host paths. MariaDB is NOT
+          # force-recreated: its state lives in a named volume (immune
+          # to this) and it is only started if not already running.
+          if ! docker compose up -d --force-recreate panel agent; then
             echo "::error::docker compose up failed - diagnostics follow"
             docker compose ps -a || true
             echo "===== wordpress-mariadb logs (tail 150) ====="
@@ -417,11 +430,13 @@ jobs:
           for i in $(seq 1 45); do
             running="$(docker inspect -f '{{.State.Running}}' own-hpanel-agent 2>/dev/null || echo false)"
             sock=no; [ -S /run/own-hpanel/agent.sock ] && sock=yes
+            panel_running="$(docker inspect -f '{{.State.Running}}' own-hpanel 2>/dev/null || echo false)"
+            panel_restarts="$(docker inspect -f '{{.RestartCount}}' own-hpanel 2>/dev/null || echo '?')"
             panel_sock=na
-            if [ "$(docker inspect -f '{{.State.Running}}' own-hpanel 2>/dev/null || echo false)" = "true" ]; then
+            if [ "$panel_running" = "true" ]; then
               if docker exec own-hpanel sh -c 'test -S /run/own-hpanel/agent.sock' 2>/dev/null; then panel_sock=yes; else panel_sock=no; fi
             fi
-            echo "attempt $i: agent_running=$running host_socket=$sock panel_socket=$panel_sock"
+            echo "attempt $i: agent_running=$running host_socket=$sock panel_running=$panel_running panel_restarts=$panel_restarts panel_socket=$panel_sock"
             if [ "$running" = "true" ] && [ "$sock" = "yes" ] && [ "$panel_sock" != "no" ]; then
               agent_ok=1; break
             fi
@@ -430,7 +445,19 @@ jobs:
           echo "--- own-hpanel-agent logs (last 50 lines) ---"
           docker logs --tail 50 own-hpanel-agent || true
           echo "--- end own-hpanel-agent logs ---"
-          [ -n "$agent_ok" ] || { echo "::error::own-hpanel-agent socket verification failed after 45s - see the attempt lines and its logs above"; exit 1; }
+          if [ -z "$agent_ok" ]; then
+            echo "--- diagnostics: container states ---"
+            docker ps -a --filter 'name=own-hpanel' --filter 'name=wordpress-mariadb' --format '{{.Names}} {{.Status}}' || true
+            echo "--- diagnostics: host /run/own-hpanel ---"
+            ls -la /run/own-hpanel/ || true
+            echo "--- diagnostics: panel view of /run/own-hpanel ---"
+            docker exec own-hpanel ls -la /run/own-hpanel/ 2>&1 || true
+            echo "--- own-hpanel (panel) logs (last 80 lines) ---"
+            docker logs --tail 80 own-hpanel || true
+            echo "--- end panel logs ---"
+            echo "::error::own-hpanel-agent socket verification failed after 45s - see the attempt lines and diagnostics above"
+            exit 1
+          fi
           echo "agent container running; socket /run/own-hpanel/agent.sock is bound on the host and visible inside the panel container"
 
       - name: Ensure the panel database and provisioning grants (root exec into wordpress-mariadb)
