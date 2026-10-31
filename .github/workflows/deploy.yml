@@ -1,0 +1,286 @@
+name: Deploy Own hPanel
+
+# Production deployment. The self-hosted runner runs ON the target server
+# itself (see docs/CICD.md), so this workflow deploys locally on that host:
+# there are NO SSH steps and no SSH secrets. All configuration comes from
+# GitHub Secrets (repository or the `production` environment).
+#
+# Safety contract:
+#   - only panel-owned resources are created/updated (own-hpanel container,
+#     own-hpanel-agent systemd service, /opt/own-hpanel data)
+#   - the existing Traefik (redberyl-traefik) is reused, never touched
+#   - the shared pre-existing MariaDB (construction-mariadb) is used as-is,
+#     never created/stopped/restarted/removed
+#   - docker ps is snapshotted BEFORE and AFTER; the deploy FAILS if any of
+#     the 10 pre-existing production containers changed or disappeared
+#   - no docker prune, no compose down of anything else, ever
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: "Confirm production deploy"
+        required: true
+        type: choice
+        options:
+          - deploy
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+env:
+  DB_CONTAINER: construction-mariadb
+  PROTECTED_CONTAINERS: "krweb-ui redberyl-api redberyl-ui redberyl-rustfs redberyl-postgres construction-api construction-ui construction-mariadb redberyl-postgres-proxy redberyl-traefik"
+
+jobs:
+  deploy:
+    name: Deploy (self-hosted, on-server)
+    runs-on: [self-hosted, linux]
+    environment: production
+    steps:
+      - name: Guard - this runner must be the target server
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/hpanel-snapshots"
+          echo "SNAP_DIR=${RUNNER_TEMP}/hpanel-snapshots" >> "$GITHUB_ENV"
+          if [ "$(id -u)" -eq 0 ]; then echo "SUDO=" >> "$GITHUB_ENV"; else echo "SUDO=sudo" >> "$GITHUB_ENV"; fi
+          command -v docker >/dev/null || { echo "::error::docker not found - this workflow must run on the target server's self-hosted runner"; exit 1; }
+          command -v rsync >/dev/null || { echo "::error::rsync not found on the runner host (apt install rsync)"; exit 1; }
+          docker ps --format '{{.Names}}' | grep -qx 'redberyl-traefik' || { echo "::error::redberyl-traefik is not visible from this runner - wrong host, refusing to deploy"; exit 1; }
+          docker ps --format '{{.Names}}' | grep -qx "$DB_CONTAINER" || { echo "::error::shared MariaDB container $DB_CONTAINER is not running - wrong host or the existing stack is down, refusing to deploy"; exit 1; }
+          if [ "$(id -u)" -ne 0 ] && ! sudo -n true 2>/dev/null; then
+            echo "::error::the runner user needs passwordless sudo to install the agent systemd unit (or run the runner as root)"
+            exit 1
+          fi
+          echo "Runner host: $(hostname) - target server confirmed (Traefik + shared MariaDB visible)"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Snapshot production containers (BEFORE)
+        run: |
+          set -euo pipefail
+          docker ps -a --format '{{.ID}} {{.Names}} {{.Image}} {{.Status}}' > "${SNAP_DIR}/docker-before.txt"
+          : > "${SNAP_DIR}/protected-before.txt"
+          for c in $PROTECTED_CONTAINERS; do
+            id="$(docker inspect -f '{{.Id}}' "$c" 2>/dev/null || echo MISSING)"
+            echo "$c $id" >> "${SNAP_DIR}/protected-before.txt"
+          done
+          cat "${SNAP_DIR}/docker-before.txt"
+
+      - name: Verify prerequisites (existing Traefik, network, DB, disk)
+        run: |
+          set -euo pipefail
+          docker network inspect redberyl-internal >/dev/null 2>&1 || { echo "::error::Docker network redberyl-internal is missing - aborting, nothing was changed"; exit 1; }
+          [ "$(docker inspect -f '{{.State.Running}}' redberyl-traefik)" = "true" ] || { echo "::error::redberyl-traefik is not running - aborting"; exit 1; }
+          [ "$(docker inspect -f '{{.State.Running}}' "$DB_CONTAINER")" = "true" ] || { echo "::error::shared MariaDB $DB_CONTAINER is not running - aborting (the panel never starts it)"; exit 1; }
+          avail_kb="$(df -k --output=avail / | tail -1 | tr -d ' ')"
+          [ "$((avail_kb / 1024))" -gt 5120 ] || { echo "::error::less than 5 GB free disk - aborting"; exit 1; }
+          echo "Prerequisites OK: network, Traefik, shared MariaDB, >5 GB free disk"
+
+      - name: Resolve deploy directory
+        env:
+          DEPLOY_DIR_SECRET: ${{ secrets.DEPLOY_DIR }}
+        run: |
+          set -euo pipefail
+          dir="${DEPLOY_DIR_SECRET:-/opt/own-hpanel/app}"
+          echo "DEPLOY_DIR=$dir" >> "$GITHUB_ENV"
+          echo "Deploy directory: $dir"
+
+      - name: Sync source to deploy directory
+        run: |
+          set -euo pipefail
+          $SUDO install -d -m 755 "$DEPLOY_DIR"
+          rsync -a --delete \
+            --exclude='.git' \
+            --exclude='.env' \
+            --exclude='.deploy-snapshots' \
+            "${GITHUB_WORKSPACE}/" "${DEPLOY_DIR}/"
+          echo "Source synced to $DEPLOY_DIR (.env preserved - it is rewritten from Secrets in the next step)"
+
+      - name: Write .env from GitHub Secrets (never printed)
+        env:
+          PANEL_DOMAIN: ${{ secrets.PANEL_DOMAIN }}
+          SERVER_IP: ${{ secrets.SERVER_IP }}
+          DB_HOST: ${{ secrets.DB_HOST }}
+          DB_EXTERNAL_PORT: ${{ secrets.DB_EXTERNAL_PORT }}
+          DB_ADMIN_USER: ${{ secrets.DB_ADMIN_USER }}
+          DB_ADMIN_PASSWORD: ${{ secrets.DB_ADMIN_PASSWORD }}
+          PANEL_DB_NAME: ${{ secrets.PANEL_DB_NAME }}
+        run: |
+          set -euo pipefail
+          [ -n "${PANEL_DOMAIN:-}" ] || { echo "::error::GitHub Secret PANEL_DOMAIN is empty - set it before deploying"; exit 1; }
+          [ -n "${DB_ADMIN_PASSWORD:-}" ] || { echo "::error::GitHub Secret DB_ADMIN_PASSWORD is empty - set it before deploying"; exit 1; }
+          cd "$DEPLOY_DIR"
+          umask 077
+          {
+            printf 'PANEL_DOMAIN=%s\n' "$PANEL_DOMAIN"
+            printf 'SERVER_IP=%s\n' "${SERVER_IP:-130.210.42.20}"
+            printf 'DB_CONTAINER=%s\n' "$DB_CONTAINER"
+            printf 'DB_HOST=%s\n' "${DB_HOST:-db.krwebsolution.com}"
+            printf 'DB_EXTERNAL_PORT=%s\n' "${DB_EXTERNAL_PORT:-3024}"
+            printf 'DB_ADMIN_USER=%s\n' "${DB_ADMIN_USER:-WordPress_common_DB}"
+            printf 'DB_ADMIN_PASSWORD=%s\n' "$DB_ADMIN_PASSWORD"
+            printf 'PANEL_STORE_DRIVER=mysql\n'
+            printf 'PANEL_DB_NAME=%s\n' "${PANEL_DB_NAME:-hpanel_panel}"
+          } > .env.tmp
+          mv .env.tmp .env
+          chmod 600 .env
+          echo ".env written from Secrets (PANEL_DOMAIN=$PANEL_DOMAIN, DB host ${DB_HOST:-db.krwebsolution.com}:${DB_EXTERNAL_PORT:-3024}, password: ***)"
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache: true
+
+      - name: Test and build
+        working-directory: ${{ env.DEPLOY_DIR }}
+        run: |
+          set -euo pipefail
+          go test ./...
+          go vet ./...
+          mkdir -p "${RUNNER_TEMP}/hpanel-bin"
+          CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "${RUNNER_TEMP}/hpanel-bin/agent" ./cmd/agent
+          CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "${RUNNER_TEMP}/hpanel-bin/panel" ./cmd/panel
+          ls -lh "${RUNNER_TEMP}/hpanel-bin"
+
+      - name: Install agent binary, host secrets and systemd unit
+        env:
+          DB_ADMIN_PASSWORD: ${{ secrets.DB_ADMIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          $SUDO install -d -m 750 /opt/own-hpanel/bin /opt/own-hpanel/secrets /opt/own-hpanel/websites /opt/own-hpanel/backups /opt/own-hpanel/logs
+          $SUDO install -m 755 "${RUNNER_TEMP}/hpanel-bin/agent" /opt/own-hpanel/bin/agent
+          # Agent token: generated once, never overwritten, never printed.
+          if ! $SUDO test -f /opt/own-hpanel/secrets/agent.token; then
+            openssl rand -hex 32 | $SUDO tee /opt/own-hpanel/secrets/agent.token >/dev/null
+            $SUDO chmod 600 /opt/own-hpanel/secrets/agent.token
+            echo "agent token generated"
+          fi
+          # Shared-DB admin password as a 0600 file for the agent (value never printed).
+          printf '%s' "$DB_ADMIN_PASSWORD" | $SUDO tee /opt/own-hpanel/secrets/db_admin_password.txt >/dev/null
+          $SUDO chmod 600 /opt/own-hpanel/secrets/db_admin_password.txt
+          $SUDO install -m 644 "${DEPLOY_DIR}/deployment/own-hpanel-agent.service" /etc/systemd/system/own-hpanel-agent.service
+          $SUDO systemctl daemon-reload
+          $SUDO systemctl enable own-hpanel-agent >/dev/null
+          $SUDO systemctl restart own-hpanel-agent
+          for i in $(seq 1 30); do
+            [ -S /run/own-hpanel/agent.sock ] && break
+            sleep 1
+          done
+          [ -S /run/own-hpanel/agent.sock ] || { echo "::error::agent socket did not appear; check: systemctl status own-hpanel-agent"; exit 1; }
+          $SUDO systemctl is-active own-hpanel-agent
+          # Panel reads the agent token through the shared /run/own-hpanel mount.
+          $SUDO cp /opt/own-hpanel/secrets/agent.token /run/own-hpanel/agent.token
+          $SUDO chmod 640 /run/own-hpanel/agent.token
+          echo "agent installed and running (panel-owned service only)"
+
+      - name: Ensure the panel database exists on the shared MariaDB
+        env:
+          DB_HOST: ${{ secrets.DB_HOST }}
+          DB_EXTERNAL_PORT: ${{ secrets.DB_EXTERNAL_PORT }}
+          DB_ADMIN_USER: ${{ secrets.DB_ADMIN_USER }}
+          DB_ADMIN_PASSWORD: ${{ secrets.DB_ADMIN_PASSWORD }}
+          PANEL_DB_NAME: ${{ secrets.PANEL_DB_NAME }}
+        run: |
+          set -euo pipefail
+          host="${DB_HOST:-db.krwebsolution.com}"
+          port="${DB_EXTERNAL_PORT:-3024}"
+          user="${DB_ADMIN_USER:-WordPress_common_DB}"
+          dbname="${PANEL_DB_NAME:-hpanel_panel}"
+          # One-shot client container; MYSQL_PWD keeps the password out of argv.
+          if ! docker run --rm -e MYSQL_PWD="$DB_ADMIN_PASSWORD" mariadb:11.4 \
+                 mariadb -h "$host" -P "$port" -u "$user" \
+                 -e "CREATE DATABASE IF NOT EXISTS \`${dbname}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"; then
+            echo "::error::could not create database ${dbname} on ${host}:${port} as ${user}. The common DB account needs CREATE DATABASE privilege - or create the database manually as a privileged user, grant the common account ALL PRIVILEGES on ${dbname}.*, and re-run."
+            exit 1
+          fi
+          if ! docker run --rm -e MYSQL_PWD="$DB_ADMIN_PASSWORD" mariadb:11.4 \
+                 mariadb -h "$host" -P "$port" -u "$user" "$dbname" -e "SELECT 1;" >/dev/null; then
+            echo "::error::database ${dbname} exists but ${user} cannot use it. Grant it: GRANT ALL PRIVILEGES ON \`${dbname}\`.* TO '${user}'@'%'; (run as a privileged user), then re-run this workflow."
+            exit 1
+          fi
+          echo "panel database ${dbname} exists and is usable by ${user}"
+
+      - name: Build and start the panel container (panel-owned only)
+        working-directory: ${{ env.DEPLOY_DIR }}
+        run: |
+          set -euo pipefail
+          docker compose build panel
+          docker compose up -d
+          docker ps --filter 'name=own-hpanel' --format '{{.Names}} {{.Status}}'
+
+      - name: Verify panel health
+        env:
+          PANEL_DOMAIN: ${{ secrets.PANEL_DOMAIN }}
+        run: |
+          set -euo pipefail
+          healthy=""
+          for i in $(seq 1 60); do
+            status="$(docker inspect -f '{{.State.Status}}' own-hpanel 2>/dev/null || echo missing)"
+            health="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' own-hpanel 2>/dev/null || echo unknown)"
+            echo "attempt $i: container=$status health=$health"
+            if [ "$status" = "running" ] && { [ "$health" = "healthy" ] || [ "$health" = "none" ]; }; then healthy=1; break; fi
+            if [ "$status" = "exited" ] || [ "$status" = "dead" ]; then
+              docker logs --tail 100 own-hpanel || true
+              echo "::error::panel container is $status"
+              exit 1
+            fi
+            sleep 3
+          done
+          [ -n "$healthy" ] || { docker logs --tail 100 own-hpanel || true; echo "::error::panel container did not become healthy in time"; exit 1; }
+          code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "https://${PANEL_DOMAIN}/healthz" || echo 000)"
+          echo "PANEL_HTTPS_CODE=$code" >> "$GITHUB_ENV"
+          if [ "$code" = "200" ]; then
+            echo "panel is reachable at https://${PANEL_DOMAIN}/healthz (200)"
+          else
+            echo "::warning::panel container is healthy but https://${PANEL_DOMAIN}/healthz returned $code - this is usually SSL-pending (Let's Encrypt not issued yet, DNS not pointing at the server, or Cloudflare in front). The deploy itself succeeded; verify DNS for ${PANEL_DOMAIN} and check Traefik."
+          fi
+
+      - name: Snapshot production containers (AFTER) and diff protected set
+        run: |
+          set -euo pipefail
+          docker ps -a --format '{{.ID}} {{.Names}} {{.Image}} {{.Status}}' > "${SNAP_DIR}/docker-after.txt"
+          : > "${SNAP_DIR}/protected-after.txt"
+          for c in $PROTECTED_CONTAINERS; do
+            id="$(docker inspect -f '{{.Id}}' "$c" 2>/dev/null || echo MISSING)"
+            echo "$c $id" >> "${SNAP_DIR}/protected-after.txt"
+          done
+          if ! diff -u "${SNAP_DIR}/protected-before.txt" "${SNAP_DIR}/protected-after.txt"; then
+            echo "::error::PRODUCTION PROTECTION FAILURE: at least one pre-existing production container changed ID or disappeared during the deploy. Investigate immediately with the uploaded snapshots."
+            exit 1
+          fi
+          echo "production protection check passed: all 10 pre-existing containers unchanged"
+
+      - name: Upload deploy snapshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deploy-snapshots-${{ github.run_id }}
+          path: ${{ env.SNAP_DIR }}
+          if-no-files-found: ignore
+
+      - name: Deploy summary
+        if: always()
+        run: |
+          {
+            echo "## Own hPanel deploy"
+            echo ""
+            echo "- Commit: ${GITHUB_SHA}"
+            echo "- Trigger: ${GITHUB_EVENT_NAME}"
+            echo "- Panel: https://${PANEL_DOMAIN:-unknown} (healthz HTTPS code: ${PANEL_HTTPS_CODE:-not checked})"
+            echo "- Database: shared pre-existing MariaDB (${DB_CONTAINER}), panel DB ${PANEL_DB_NAME:-hpanel_panel} - the DB container was used, never managed"
+            echo "- Protected containers: IDs compared before/after (see artifact deploy-snapshots-${GITHUB_RUN_ID})"
+            echo ""
+            echo "Rollback: re-run this workflow from a previous commit, or git revert + push. See docs/CICD.md."
+          } >> "$GITHUB_STEP_SUMMARY"
+        env:
+          PANEL_DOMAIN: ${{ secrets.PANEL_DOMAIN }}
+          PANEL_DB_NAME: ${{ secrets.PANEL_DB_NAME }}

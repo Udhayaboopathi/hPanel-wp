@@ -2,7 +2,7 @@
 
 ## Roll back the panel itself (leaves every website running)
 
-Websites are independent containers + a shared MariaDB; removing the panel does **not** stop them (Traefik keeps routing by label).
+Websites are independent containers + the pre-existing shared MariaDB; removing the panel does **not** stop them (Traefik keeps routing by label).
 
 ```bash
 cd hPanel-wp
@@ -13,8 +13,9 @@ systemctl stop own-hpanel-agent    # provisioning paused; sites unaffected
 Full removal of panel-owned resources only (explicit, no prune):
 
 ```bash
-docker compose down                # removes own-hpanel + wordpress-mariadb containers
-                                   # (NOT the named volumes, NOT any other service)
+docker compose down                # removes the own-hpanel panel container only
+                                   # (NOT the named volumes, NOT any other service,
+                                   #  and NEVER the shared construction-mariadb)
 systemctl disable --now own-hpanel-agent
 rm /etc/systemd/system/own-hpanel-agent.service
 # Data remains under /opt/own-hpanel and in the named volumes until you
@@ -25,7 +26,7 @@ Never run `docker system prune`, `docker volume prune` or similar generic cleanu
 
 ## Panel database recovery
 
-Panel metadata lives in the panel container's `panel-data` volume (`panel.db`, SQLite WAL) plus `/opt/own-hpanel/panel/panel.key` in the documented layout. Restore by stopping the panel, replacing `panel.db` with a backup copy, and starting the panel again. Without `panel.key`, stored per-site DB passwords cannot be decrypted (sites keep running; rotate each site's DB password afterwards).
+Panel metadata in production lives in the panel's own database (`hpanel_panel`) on the shared MariaDB server (`PANEL_STORE_DRIVER=mysql`); locally it is the panel container volume's `panel.db` (SQLite WAL). Recover the MySQL copy from your MariaDB backups of that database (dump/restore with the admin account). The AES encryption key for stored per-site DB passwords lives in the panel volume (`/data`, file created by the panel with 0600) — back it up with the metadata. Without that key, stored per-site DB passwords cannot be decrypted (sites keep running; rotate each site's DB password afterwards).
 
 ## Website recovery
 
@@ -36,4 +37,4 @@ Panel metadata lives in the panel container's `panel-data` volume (`panel.db`, S
 
 ## MariaDB recovery
 
-`wordpress-mariadb` data is in the `own-hpanel-wordpress-mariadb-data` volume. Restore from a volume backup or by importing per-site `db.sql` dumps from panel backups (Backups → Restore handles this per site). Do not touch `construction-mariadb` — it is a different, unrelated production database.
+All WordPress databases (and the panel's own `hpanel_panel` database) live in the ONE pre-existing shared MariaDB container (`construction-mariadb`) — its data volume belongs to the existing production stack and is backed up with that stack, not by Own hPanel. Per-site recovery does not need volume-level access: import the site's `db.sql` dump from its panel backup (Backups → Restore handles this per site). The panel never stops/restarts/recreates `construction-mariadb`; if that server itself is down, restore it via the existing stack's own procedures first.

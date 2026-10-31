@@ -25,6 +25,23 @@ func TestProvisionSQL(t *testing.T) {
 	}
 }
 
+func TestDropDatabaseOnlyNeverDropsUser(t *testing.T) {
+	sql, err := DropDatabaseOnlySQL("wp_ab12_db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(sql, "\n")
+	if !strings.Contains(joined, "DROP DATABASE IF EXISTS `wp_ab12_db`") {
+		t.Error("must drop the site's database")
+	}
+	if strings.Contains(joined, "DROP USER") {
+		t.Error("database-only drop must never drop the shared common user")
+	}
+	if _, err := DropDatabaseOnlySQL("bad`db"); err == nil {
+		t.Error("expected bad db name rejected")
+	}
+}
+
 func TestProvisionSQLRejectsInjection(t *testing.T) {
 	if _, err := ProvisionSQL("db;DROP DATABASE mysql", "user1", "x"); err == nil {
 		t.Error("expected injected db name rejected")

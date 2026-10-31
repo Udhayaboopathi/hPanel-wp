@@ -1,5 +1,6 @@
 // Package provisioning implements the durable, DB-backed job runner in the
-// panel. Job rows and deployment events persist in SQLite; secrets for a
+// panel. Job rows and deployment events persist in the panel store
+// (SQLite locally, MariaDB in production); secrets for a
 // create job (the WordPress admin password) live only in process memory and
 // are lost on restart - the job is then marked interrupted on boot by the
 // store's crash recovery and the operator can retry creation.
@@ -143,6 +144,13 @@ func (r *Runner) execute(jobID string, req agentproto.Request, kind string) {
 	for _, ev := range resp.Events {
 		_ = r.Store.AddEvent(jobID, ev.Level, ev.Message)
 		_ = r.Store.UpdateJob(jobID, "running", ev.Progress, ev.Message, "")
+	}
+	if resp.UsedCommonDBUser {
+		// The agent fell back to the shared common DB user for this site
+		// (admin account lacks CREATE USER/GRANT). This must be visible in
+		// the audit log, not only in job events - never fail silently.
+		_ = r.Store.AddAudit(0, "db.common_user_fallback", req.Site.SiteID,
+			"site provisioned with the shared common DB user because the DB admin account could not create a dedicated user/grant; per-site database isolation is reduced for this site", "")
 	}
 	if !resp.OK {
 		_ = r.Store.UpdateJob(jobID, "failed", 100, "failed", resp.Error)

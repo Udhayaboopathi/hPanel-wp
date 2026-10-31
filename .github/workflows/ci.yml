@@ -1,0 +1,62 @@
+name: CI
+
+# Test + build gate. Runs on GitHub-hosted runners and uses NO secrets:
+# this workflow never touches the production server or the shared database.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test, vet, build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache: true
+
+      - name: Unit tests
+        run: go test ./...
+
+      - name: Vet (default and integration tags)
+        run: |
+          go vet ./...
+          go vet -tags integration ./...
+
+      - name: Build both binaries
+        run: |
+          mkdir -p bin
+          CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o bin/panel ./cmd/panel
+          CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o bin/agent ./cmd/agent
+          ls -lh bin/
+
+      - name: Shell syntax check (deployment scripts)
+        run: |
+          bash -n deployment/install.sh
+          bash -n scripts/dev-agent.sh
+
+      - name: YAML sanity (compose + workflows)
+        run: |
+          python3 -m pip install --quiet pyyaml
+          python3 - <<'PYEOF'
+          import glob, yaml
+          for path in ["compose.yaml", ".github/workflows/ci.yml", ".github/workflows/deploy.yml"]:
+              with open(path) as fh:
+                  yaml.safe_load(fh)
+              print("YAML OK:", path)
+          PYEOF
+
+      - name: Compose config sanity (dummy values only, no secrets)
+        run: |
+          PANEL_DOMAIN=panel.example.com DB_ADMIN_PASSWORD=dummy-not-a-secret \
+            docker compose -f compose.yaml config --quiet
+          echo "compose.yaml renders OK"

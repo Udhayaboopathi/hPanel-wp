@@ -55,6 +55,19 @@ func DropDatabaseSQL(dbName, dbUser string) ([]string, error) {
 	}, nil
 }
 
+// DropDatabaseOnlySQL drops only the site's database. It is used when the
+// site was provisioned on the shared common DB user (privilege fallback):
+// that user must NEVER be dropped because every other site and the panel's
+// provisioning path depend on it.
+func DropDatabaseOnlySQL(dbName string) ([]string, error) {
+	if err := security.ValidateSQLIdentifier(dbName); err != nil {
+		return nil, err
+	}
+	return []string{
+		fmt.Sprintf("DROP DATABASE IF EXISTS `%s`;", dbName),
+	}, nil
+}
+
 func RotatePasswordSQL(dbUser, newPassword string) ([]string, error) {
 	if err := security.ValidateDBUser(dbUser); err != nil {
 		return nil, err

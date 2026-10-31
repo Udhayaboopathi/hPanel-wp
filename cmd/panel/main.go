@@ -26,6 +26,7 @@ import (
 	"github.com/Udhayaboopathi/hPanel-wp/internal/agentclient"
 	"github.com/Udhayaboopathi/hPanel-wp/internal/agentproto"
 	"github.com/Udhayaboopathi/hPanel-wp/internal/auth"
+	"github.com/Udhayaboopathi/hPanel-wp/internal/dbconfig"
 	"github.com/Udhayaboopathi/hPanel-wp/internal/provisioning"
 	"github.com/Udhayaboopathi/hPanel-wp/internal/secrets"
 	"github.com/Udhayaboopathi/hPanel-wp/internal/store"
@@ -42,6 +43,10 @@ type Config struct {
 	ServerIP      string
 	PanelDomain   string
 	SecureCookies bool
+	// SiteDBHost is the hostname written into generated site configs as
+	// WORDPRESS_DB_HOST: the shared MariaDB container's name (DB_CONTAINER),
+	// reachable from WP containers on their per-site network (port 3306).
+	SiteDBHost string
 }
 
 func envOr(k, def string) string {
@@ -99,8 +104,9 @@ func main() {
 		ServerIP:      envOr("SERVER_IP", "130.210.42.20"),
 		PanelDomain:   os.Getenv("PANEL_DOMAIN"),
 		SecureCookies: envBool("PANEL_SECURE_COOKIES", false),
+		SiteDBHost:    envOr("DB_CONTAINER", "construction-mariadb"),
 	}
-	st, err := store.Open(filepath.Join(dataDir, "panel.db"))
+	st, err := openStore(log, dataDir)
 	if err != nil {
 		log.Error("open store", "err", err)
 		os.Exit(1)
@@ -232,6 +238,43 @@ func main() {
 	if err := srv.Serve(ln); err != nil {
 		log.Error("serve", "err", err)
 		os.Exit(1)
+	}
+}
+
+// openStore selects the panel metadata store. Default is SQLite in the
+// data dir (local development). In production PANEL_STORE_DRIVER=mysql
+// stores panel metadata in the ONE pre-existing shared MariaDB server, in
+// its own database (PANEL_DB_NAME, default hpanel_panel), reached through
+// DB_HOST:DB_EXTERNAL_PORT with the common admin account - the same server
+// every WordPress site uses. PANEL_STORE_DSN overrides the built DSN.
+func openStore(log *slog.Logger, dataDir string) (*store.Store, error) {
+	driver := envOr("PANEL_STORE_DRIVER", "sqlite")
+	switch driver {
+	case "sqlite":
+		return store.Open(filepath.Join(dataDir, "panel.db"))
+	case "mysql":
+		dsn := os.Getenv("PANEL_STORE_DSN")
+		if dsn == "" {
+			dbCfg, err := dbconfig.FromEnv()
+			if err != nil {
+				return nil, err
+			}
+			if dbCfg.AdminPassword == "" {
+				return nil, fmt.Errorf("PANEL_STORE_DRIVER=mysql but no DB admin credential is configured (set DB_ADMIN_PASSWORD_FILE or DB_ADMIN_PASSWORD, or supply PANEL_STORE_DSN)")
+			}
+			port := dbCfg.ExternalPort
+			dsn = store.BuildMySQLDSN(dbCfg.Host, port,
+				envOr("PANEL_DB_NAME", dbconfig.DefaultPanelDBName),
+				dbCfg.AdminUser, dbCfg.AdminPassword)
+		}
+		st, err := store.OpenMySQL(dsn)
+		if err != nil {
+			return nil, err
+		}
+		log.Info("panel store: mysql (shared MariaDB)", "db", envOr("PANEL_DB_NAME", dbconfig.DefaultPanelDBName))
+		return st, nil
+	default:
+		return nil, fmt.Errorf("unknown PANEL_STORE_DRIVER %q (want sqlite or mysql)", driver)
 	}
 }
 

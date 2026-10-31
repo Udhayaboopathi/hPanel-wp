@@ -8,7 +8,15 @@ Type=simple
 ExecStart=/opt/own-hpanel/bin/agent
 Environment=AGENT_SOCKET=/run/own-hpanel/agent.sock
 Environment=AGENT_TOKEN_FILE=/opt/own-hpanel/secrets/agent.token
-Environment=AGENT_MARIADB_ROOT_PASSWORD_FILE=/opt/own-hpanel/secrets/mariadb_root_password.txt
+# Shared MariaDB (pre-existing construction-mariadb): the agent connects as
+# the common admin user. Password comes from a 0600 file, never from a unit
+# literal. DB_* values may be overridden via a systemd drop-in or the
+# EnvironmentFile below (written by CI from GitHub Secrets).
+Environment=DB_CONTAINER=construction-mariadb
+Environment=DB_HOST=db.krwebsolution.com
+Environment=DB_EXTERNAL_PORT=3024
+Environment=DB_ADMIN_USER=WordPress_common_DB
+Environment=DB_ADMIN_PASSWORD_FILE=/opt/own-hpanel/secrets/db_admin_password.txt
 Environment=DOCKER_SOCKET=/var/run/docker.sock
 Environment=SITES_DIR=/opt/own-hpanel/websites
 Environment=BACKUPS_DIR=/opt/own-hpanel/backups

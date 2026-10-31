@@ -227,7 +227,7 @@ func (a *App) createSubmit(w http.ResponseWriter, r *http.Request) {
 	// the encrypted column and the site .env written by the agent).
 	spec := configgen.SiteSpec{
 		SiteID: siteID, Domain: in.Domain, AdminDomain: in.AdminDomain, Title: in.Title,
-		DBName: dbName, DBUser: dbUser, DBHost: "wordpress-mariadb",
+		DBName: dbName, DBUser: dbUser, DBHost: a.cfg.SiteDBHost,
 		PHPVersion: in.PHPVersion, Profile: profile, SiteDir: siteDir,
 		ContainerName: site.ContainerName, Network: websites.NetworkName(siteID),
 	}

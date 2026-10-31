@@ -2,10 +2,10 @@
 
 ## Trust boundaries
 
-- **Panel** (internet-facing via Traefik): unprivileged. No Docker socket, no host root access. Holds the SQLite metadata DB and an AES-256-GCM key (0600 file) used to encrypt per-site DB passwords at rest.
+- **Panel** (internet-facing via Traefik): unprivileged. No Docker socket, no host root access. Holds the metadata store (SQLite locally; in production a dedicated database on the shared MariaDB) and an AES-256-GCM key (0600 file) used to encrypt per-site DB passwords at rest.
 - **Agent** (host systemd service): the only Docker client. Docker access is effectively host-root, so the agent is treated as trusted code with a minimal surface: Unix socket only (never TCP), bearer token from a 0600 file with constant-time comparison, allowlisted operations, full re-validation of every request (the panel's validation is never trusted), and a production guard that refuses to mutate containers lacking `own-hpanel.managed=true`.
 - **WordPress containers**: `cap_drop: ALL` + a minimal cap allowlist, `no-new-privileges`, no Docker socket, no published ports, private per-site network + the shared Traefik network only, CPU/RAM limits.
-- **MariaDB**: dedicated `wordpress-mariadb` instance, no published ports, per-site database + user with least-privilege grants on that database only.
+- **MariaDB**: the ONE pre-existing shared MariaDB container (default `construction-mariadb`) serves every WordPress site AND the panel itself. The panel never creates/stops/restarts/removes it. The agent's only interactions are exec of the `mariadb` SQL client (as the env-configured common admin user, never root) and connecting it to new per-site networks. Normally each site still gets its own database + dedicated least-privilege user created by that admin account; if the account lacks CREATE USER/GRANT, the agent falls back to the common user for that site and records a warning event + audit entry (isolation reduced for that site only — see REPORT-CICD.md). Per-site users are never dropped/rotated when they are the common user.
 
 ## Authentication
 

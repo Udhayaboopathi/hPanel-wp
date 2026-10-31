@@ -324,7 +324,7 @@ func (a *App) siteApplyConfig(w http.ResponseWriter, r *http.Request) {
 	profile, _ := configgen.ProfileFor(site.ResourceProfile, site.CPULimit, site.MemLimitMB)
 	cs := configgen.SiteSpec{
 		SiteID: site.SiteID, Domain: site.Domain, AdminDomain: site.AdminDomain, Title: site.Title,
-		DBName: site.DBName, DBUser: site.DBUser, DBPassword: spec.DBPassword, DBHost: "wordpress-mariadb",
+		DBName: site.DBName, DBUser: site.DBUser, DBPassword: spec.DBPassword, DBHost: a.cfg.SiteDBHost,
 		PHPVersion: site.PHPVersion, Profile: profile, SiteDir: site.SiteDir,
 		ContainerName: site.ContainerName, Network: websites.NetworkName(site.SiteID),
 		PHPMemory: env["PHP_MEMORY_LIMIT"], UploadSize: env["UPLOAD_MAX_FILESIZE"], Debug: env["WORDPRESS_DEBUG"] == "1",

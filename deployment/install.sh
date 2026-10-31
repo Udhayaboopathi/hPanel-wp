@@ -35,6 +35,17 @@ mkdir -p "$BASE" 2>/dev/null || { echo "Cannot create $BASE (run with sudo)"; ex
   done
   echo "--- traefik ---"
   docker inspect redberyl-traefik --format '{{.Name}} state={{.State.Status}} image={{.Config.Image}}' || echo "TRAEFIK NOT FOUND"
+  echo "--- shared MariaDB (pre-existing; the panel uses it but NEVER manages it) ---"
+  DB_CONTAINER="${DB_CONTAINER:-construction-mariadb}"
+  docker inspect "$DB_CONTAINER" --format '{{.Name}} state={{.State.Status}} image={{.Config.Image}}' || echo "SHARED DB CONTAINER $DB_CONTAINER NOT FOUND"
+  echo "--- external DB endpoint (warning-only check) ---"
+  DB_HOST="${DB_HOST:-db.krwebsolution.com}"
+  DB_EXTERNAL_PORT="${DB_EXTERNAL_PORT:-3024}"
+  if timeout 5 bash -c "exec 3<>/dev/tcp/$DB_HOST/$DB_EXTERNAL_PORT" 2>/dev/null; then
+    echo "DB endpoint $DB_HOST:$DB_EXTERNAL_PORT reachable"
+  else
+    echo "WARNING: DB endpoint $DB_HOST:$DB_EXTERNAL_PORT not reachable from here (check DNS/firewall; the deploy can still proceed if WP containers reach the DB over their Docker network)"
+  fi
   echo "--- networks ---"; docker network ls
   docker network inspect redberyl-internal >/dev/null 2>&1 && echo "network redberyl-internal: OK" || echo "network redberyl-internal: MISSING"
   echo "--- ports 80/443 (must belong to Traefik) ---"
@@ -52,8 +63,14 @@ docker network inspect redberyl-internal >/dev/null 2>&1 || { echo "ABORT: redbe
 docker inspect redberyl-traefik >/dev/null 2>&1 || { echo "ABORT: redberyl-traefik not found"; exit 1; }
 AVAIL_MB=$(df -m / | awk 'NR==2{print $4}')
 [[ "$AVAIL_MB" -gt 5120 ]] || { echo "ABORT: less than 5 GB free disk"; exit 1; }
-if docker inspect wordpress-mariadb >/dev/null 2>&1; then
-  echo "NOTE: wordpress-mariadb already exists; --apply will not recreate it."
+DB_CONTAINER="${DB_CONTAINER:-construction-mariadb}"
+if docker inspect "$DB_CONTAINER" >/dev/null 2>&1; then
+  DB_STATE=$(docker inspect "$DB_CONTAINER" --format '{{.State.Status}}')
+  [[ "$DB_STATE" == "running" ]] || { echo "ABORT: shared MariaDB container $DB_CONTAINER exists but is not running (state=$DB_STATE). The panel will not start it - fix the existing stack first."; exit 1; }
+  echo "shared MariaDB container $DB_CONTAINER: running (it will be used as-is, never managed by the panel)"
+else
+  echo "ABORT: shared MariaDB container $DB_CONTAINER not found. Own hPanel does not create a MariaDB container; the pre-existing shared DB server is required."
+  exit 1
 fi
 if docker inspect own-hpanel >/dev/null 2>&1; then
   echo "NOTE: own-hpanel panel container already exists."
@@ -71,15 +88,16 @@ install -d -m 750 "$BASE"/{panel,state,secrets,logs,websites,backups}
 install -d -m 750 /run/own-hpanel
 
 # Secrets: generated once, never overwritten, never printed.
+# NOTE: there is no MariaDB root/Admin secret to generate here - the shared
+# DB server is pre-existing and its common admin password is supplied by
+# the operator (GitHub Secrets in CI, or a 0600 file at
+# $BASE/secrets/db_admin_password.txt referenced by DB_ADMIN_PASSWORD_FILE).
 if [[ ! -f "$BASE/secrets/agent.token" ]]; then
   openssl rand -hex 32 > "$BASE/secrets/agent.token"; chmod 600 "$BASE/secrets/agent.token"
 fi
-if [[ ! -f "$BASE/secrets/mariadb_root_password.txt" ]]; then
-  openssl rand -base64 36 | tr -d '\n' > "$BASE/secrets/mariadb_root_password.txt"; chmod 600 "$BASE/secrets/mariadb_root_password.txt"
-fi
-install -d -m 750 ./secrets 2>/dev/null || true
-if [[ ! -f ./secrets/mariadb_root_password.txt ]]; then
-  cp "$BASE/secrets/mariadb_root_password.txt" ./secrets/mariadb_root_password.txt; chmod 600 ./secrets/mariadb_root_password.txt
+if [[ ! -f "$BASE/secrets/db_admin_password.txt" && -z "${DB_ADMIN_PASSWORD:-}" ]]; then
+  echo "WARNING: no DB admin credential found ($BASE/secrets/db_admin_password.txt missing and DB_ADMIN_PASSWORD unset)."
+  echo "         The agent/panel will not be able to provision databases until it is provided (0600 file, never printed)."
 fi
 # Panel reads the agent token through the shared /run/own-hpanel mount.
 cp "$BASE/secrets/agent.token" /run/own-hpanel/agent.token; chmod 640 /run/own-hpanel/agent.token
@@ -90,10 +108,10 @@ systemctl daemon-reload
 systemctl enable --now own-hpanel-agent
 systemctl --no-pager status own-hpanel-agent | head -5
 
-# Panel + shared MariaDB stack.
+# Panel stack (panel-owned container only; the shared MariaDB is external
+# to this stack and is never started/stopped by it).
 : "${PANEL_DOMAIN:?Set PANEL_DOMAIN, e.g. PANEL_DOMAIN=panel.example.com}"
 export PANEL_DOMAIN
-docker compose pull wordpress-mariadb || true
 docker compose up -d --build
 
 echo "--- containers AFTER (compare with the BEFORE snapshot) ---"

@@ -119,9 +119,12 @@ func (c *Client) IsManaged(ctx context.Context, id string) (bool, string, error)
 	return managed, siteID, nil
 }
 
-// Guard refuses mutation of containers not owned by the panel. The single
-// exception (connecting wordpress-mariadb to a new per-site network) does not
-// go through this guard; it never stops/restarts/recreates that container.
+// Guard refuses mutation of containers not owned by the panel. The shared
+// pre-existing MariaDB container is NOT panel-managed, so all lifecycle
+// operations on it are refused here. The only operations ever performed on
+// it are: ConnectNetwork (adding it to a new per-site network - it never
+// stops/restarts/recreates the container) and ExecDB (exec of the mariadb
+// SQL client only, see below).
 func (c *Client) Guard(ctx context.Context, id string) error {
 	managed, _, err := c.IsManaged(ctx, id)
 	if err != nil {
@@ -340,6 +343,39 @@ func (c *Client) Exec(ctx context.Context, container string, argv []string) (str
 	if err := c.Guard(ctx, container); err != nil {
 		return "", -1, err
 	}
+	return c.execRun(ctx, container, argv)
+}
+
+// ExecDB is the narrow exec-only exception for the ONE pre-existing shared
+// MariaDB container (production name: construction-mariadb). That container
+// is deliberately NOT labelled own-hpanel.managed=true - it belongs to the
+// existing production stack - so Guard would (correctly) refuse lifecycle
+// operations on it. ExecDB therefore:
+//
+//   - refuses any argv whose program is not the `mariadb` SQL client,
+//   - refuses if the named container does not exist,
+//   - offers NO start/stop/restart/remove path: it is exec and nothing else.
+//
+// SQL statements passed here are built only by internal/database from
+// validated identifiers; no user input is executed as raw SQL.
+func (c *Client) ExecDB(ctx context.Context, container string, argv []string) (string, int, error) {
+	if len(argv) == 0 || argv[0] != "mariadb" {
+		return "", -1, fmt.Errorf("ExecDB: only the mariadb SQL client may be executed in the shared DB container")
+	}
+	found, err := c.FindByName(ctx, container)
+	if err != nil {
+		return "", -1, err
+	}
+	if found == nil {
+		return "", -1, fmt.Errorf("ExecDB: shared DB container %q not found", container)
+	}
+	if found.Labels["own-hpanel.site-id"] != "" {
+		return "", -1, fmt.Errorf("ExecDB: %q is a per-site container, not the shared DB container", container)
+	}
+	return c.execRun(ctx, container, argv)
+}
+
+func (c *Client) execRun(ctx context.Context, container string, argv []string) (string, int, error) {
 	var created struct {
 		ID string `json:"Id"`
 	}

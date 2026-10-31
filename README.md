@@ -9,13 +9,14 @@ A lightweight, self-hosted WordPress hosting control panel written in Go.
 ```
 Panel (unprivileged, NO Docker socket)          Agent (host systemd service)
   Go + html/templates + HTMX                       Unix socket + bearer token
-  SQLite (WAL) metadata, durable jobs      ───►    Allowlisted ops only, re-validates
+  SQLite/MySQL metadata, durable jobs      ───►    Allowlisted ops only, re-validates
   Sessions, Argon2id, TOTP, audit                  Production guard: managed label
                                                         │ Docker Engine API (unix socket)
         ┌──────────────── Traefik (existing redberyl-traefik, network redberyl-internal)
         ▼                        ▼                          ▼
-   WordPress site 1        WordPress site N          wordpress-mariadb (shared, new)
-   own container/db        own container/db          one database + user per site
+   WordPress site 1        WordPress site N          construction-mariadb (pre-existing,
+   own container/db        own container/db          shared: one DB + user per site,
+                                                     panel metadata DB too)
 ```
 
 - The panel process never opens `/var/run/docker.sock`. All privileged work goes through the agent (`internal/agentproto`), which accepts only `CreateSite, DeleteSite, StartSite, StopSite, RestartSite, BackupSite, RestoreSite, WPCLI, ApplyConfig, RotateDBPassword, DBSize, Ping, Discovery, Stats, Logs`.
@@ -42,7 +43,7 @@ AGENT_TOKEN_FILE=./data/agent.token ./bin/panel
 
 ## Production deployment
 
-See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md). In short: `deployment/install.sh` first performs **read-only discovery** (container snapshot, Traefik/network/port checks, headroom) and changes nothing; only `--apply` installs, after review and backup. Rollback: [docs/RECOVERY.md](docs/RECOVERY.md). Security model: [SECURITY.md](SECURITY.md).
+CI/CD (GitHub Actions, self-hosted runner on the server): [docs/CICD.md](docs/CICD.md). Manual path — see [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md). In short: `deployment/install.sh` first performs **read-only discovery** (container snapshot, Traefik/network/port checks, headroom) and changes nothing; only `--apply` installs, after review and backup. Rollback: [docs/RECOVERY.md](docs/RECOVERY.md). Security model: [SECURITY.md](SECURITY.md).
 
 ## Repository layout
 
@@ -51,7 +52,8 @@ See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md). In short: `deployment/install.sh` 
 | `cmd/panel` | Web UI + API (unprivileged) |
 | `cmd/agent` | Privileged provisioning worker |
 | `internal/auth` | Argon2id, TOTP, sessions helpers, recovery codes |
-| `internal/store` | SQLite (WAL) store + embedded migrations |
+| `internal/store` | Panel metadata store: SQLite (WAL) locally, MariaDB/MySQL in production, embedded dialect-paired migrations |
+| `internal/dbconfig` | Shared-MariaDB configuration (container/host/port/common admin user) from env/secret files |
 | `internal/provisioning` | Durable job runner |
 | `internal/docker` | Docker Engine API client over the unix socket (stdlib only) |
 | `internal/database` | Validated MariaDB provisioning SQL builders |

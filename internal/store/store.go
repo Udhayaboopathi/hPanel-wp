@@ -5,17 +5,22 @@ import (
 	"database/sql"
 	_ "embed"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/go-sql-driver/mysql"
 	_ "modernc.org/sqlite"
 )
 
 //go:embed migrations/001_init.sql
 var migration001 string
+
+//go:embed migrations/001_init_mysql.sql
+var migration001MySQL string
 
 func Now() string { return time.Now().UTC().Format(time.RFC3339) }
 
@@ -25,7 +30,14 @@ func NewID(prefix string) string {
 	return prefix + hex.EncodeToString(b)
 }
 
-type Store struct{ DB *sql.DB }
+type Store struct {
+	DB     *sql.DB
+	driver string // "sqlite" or "mysql"
+}
+
+// Driver returns the backend in use ("sqlite" dev default, "mysql" in
+// production where the panel metadata lives in the shared MariaDB server).
+func (s *Store) Driver() string { return s.driver }
 
 func Open(path string) (*Store, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
@@ -40,12 +52,96 @@ func Open(path string) (*Store, error) {
 	if _, err := db.Exec(migration001); err != nil {
 		return nil, fmt.Errorf("migrations: %w", err)
 	}
-	s := &Store{DB: db}
+	return finishOpen(db, "sqlite")
+}
+
+// OpenMySQL opens the panel store on a MariaDB/MySQL server (in production:
+// the ONE pre-existing shared MariaDB, reached through its external
+// host:port). The database itself must already exist - the deploy workflow
+// creates it with CREATE DATABASE IF NOT EXISTS using the admin account.
+func OpenMySQL(dsn string) (*Store, error) {
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(4)
+	db.SetMaxIdleConns(4)
+	for _, stmt := range SplitStatements(migration001MySQL) {
+		if _, err := db.Exec(stmt); err != nil {
+			if isDuplicateObjectErr(err) {
+				continue // table/index already exists from a previous boot
+			}
+			return nil, fmt.Errorf("migrations (mysql): %w", err)
+		}
+	}
+	return finishOpen(db, "mysql")
+}
+
+func finishOpen(db *sql.DB, driver string) (*Store, error) {
+	s := &Store{DB: db, driver: driver}
 	// Crash recovery: jobs left running when the process died are interrupted.
 	if _, err := db.Exec(`UPDATE jobs SET status='interrupted', error=COALESCE(NULLIF(error,''),'panel restarted during job'), updated_at=? WHERE status='running'`, Now()); err != nil {
 		return nil, err
 	}
 	return s, nil
+}
+
+// OpenDriver selects the store backend: "sqlite" with a file path, or
+// "mysql" with a full DSN (see BuildMySQLDSN).
+func OpenDriver(driver, target string) (*Store, error) {
+	switch driver {
+	case "", "sqlite":
+		return Open(target)
+	case "mysql":
+		return OpenMySQL(target)
+	default:
+		return nil, fmt.Errorf("unknown PANEL_STORE_DRIVER %q (want sqlite or mysql)", driver)
+	}
+}
+
+// BuildMySQLDSN builds a go-sql-driver/mysql DSN from parts. If the
+// password contains characters that are ambiguous in a DSN (notably '@',
+// '/' or '?'), supply a complete PANEL_STORE_DSN instead.
+func BuildMySQLDSN(host string, port int, dbName, user, password string) string {
+	return fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?charset=utf8mb4&parseTime=false&multiStatements=true&timeout=10s&readTimeout=30s&writeTimeout=30s",
+		user, password, host, port, dbName)
+}
+
+// SplitStatements splits a migration file into individual statements. The
+// migration files contain no semicolons inside string literals, so a plain
+// split is safe here (and lint-tested).
+func SplitStatements(sqlText string) []string {
+	var out []string
+	for _, part := range strings.Split(sqlText, ";") {
+		// Strip leading comment lines so they don't become empty statements.
+		var lines []string
+		for _, ln := range strings.Split(part, "\n") {
+			if strings.HasPrefix(strings.TrimSpace(ln), "--") {
+				continue
+			}
+			lines = append(lines, ln)
+		}
+		stmt := strings.TrimSpace(strings.Join(lines, "\n"))
+		if stmt != "" {
+			out = append(out, stmt)
+		}
+	}
+	return out
+}
+
+func isDuplicateObjectErr(err error) bool {
+	var me *mysql.MySQLError
+	if errors.As(err, &me) {
+		switch me.Number {
+		case 1050, // table already exists
+			1060, // duplicate column
+			1061: // duplicate key name (index)
+			return true
+		}
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "already exists") || strings.Contains(msg, "Duplicate key name")
 }
 
 func (s *Store) Close() error { return s.DB.Close() }
@@ -231,7 +327,13 @@ func (s *Store) CreateWebsite(w *Website) (int64, error) {
 	w.ID = id
 	_, _ = s.DB.Exec(`INSERT INTO website_domains(website_id,domain,kind,created_at) VALUES(?,?, 'primary', ?)`, id, w.Domain, now)
 	if w.AdminDomain != "" {
-		_, _ = s.DB.Exec(`INSERT OR IGNORE INTO website_domains(website_id,domain,kind,created_at) VALUES(?,?, 'admin', ?)`, id, w.AdminDomain, now)
+		// INSERT OR IGNORE (SQLite) vs INSERT IGNORE (MySQL): the only
+		// dialect-specific insert besides the settings upsert.
+		q := `INSERT OR IGNORE INTO website_domains(website_id,domain,kind,created_at) VALUES(?,?, 'admin', ?)`
+		if s.driver == "mysql" {
+			q = `INSERT IGNORE INTO website_domains(website_id,domain,kind,created_at) VALUES(?,?, 'admin', ?)`
+		}
+		_, _ = s.DB.Exec(q, id, w.AdminDomain, now)
 	}
 	_, _ = s.DB.Exec(`INSERT INTO website_databases(website_id,db_name,db_user) VALUES(?,?,?)`, id, w.DBName, w.DBUser)
 	return id, nil
@@ -311,7 +413,7 @@ func (s *Store) UpdateWebsite(siteID string, fields map[string]any) error {
 	var args []any
 	for k, v := range fields {
 		switch k {
-		case "status", "wp_version", "container_id", "container_name", "title", "domain", "admin_domain", "php_version", "resource_profile", "cpu_limit", "mem_limit_mb", "db_password_enc":
+		case "status", "wp_version", "container_id", "container_name", "title", "domain", "admin_domain", "php_version", "resource_profile", "cpu_limit", "mem_limit_mb", "db_password_enc", "db_user", "db_name":
 			sets = append(sets, k+"=?")
 			args = append(args, v)
 		default:
@@ -721,12 +823,18 @@ func (s *Store) ListAudit(limit, offset int) ([]*AuditEntry, error) {
 }
 
 func (s *Store) SetSetting(k, v string) error {
-	_, err := s.DB.Exec(`INSERT INTO system_settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, k, v)
+	// `key` is backtick-quoted: it is a (non-reserved) keyword in MySQL and
+	// SQLite accepts backtick quoting too.
+	if s.driver == "mysql" {
+		_, err := s.DB.Exec("INSERT INTO system_settings(`key`,value) VALUES(?,?) ON DUPLICATE KEY UPDATE value=VALUES(value)", k, v)
+		return err
+	}
+	_, err := s.DB.Exec("INSERT INTO system_settings(`key`,value) VALUES(?,?) ON CONFLICT(`key`) DO UPDATE SET value=excluded.value", k, v)
 	return err
 }
 func (s *Store) GetSetting(k, def string) string {
 	var v string
-	if err := s.DB.QueryRow(`SELECT value FROM system_settings WHERE key=?`, k).Scan(&v); err != nil {
+	if err := s.DB.QueryRow("SELECT value FROM system_settings WHERE `key`=?", k).Scan(&v); err != nil {
 		return def
 	}
 	return v

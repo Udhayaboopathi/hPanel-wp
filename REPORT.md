@@ -1,3 +1,5 @@
+> **Superseded in part (2026-10-31, shared-DB + CI/CD rework):** the panel no longer deploys a `wordpress-mariadb` container; all sites and the panel itself use the pre-existing shared MariaDB (`construction-mariadb`). The panel store also supports MariaDB/MySQL. See **REPORT-CICD.md** for what changed — statements below about a panel-owned MariaDB describe the original build.
+
 # Own hPanel — Implementation Report
 
 Built locally on 2026-10-31 in `~/workspace/own-hpanel-build` (git repo, branch `main`, not pushed — the push is handled separately). Go toolchain: go1.23.12 installed under `~/workspace/.tools/go`. **No connection of any kind was made to the production server (130.210.42.20)** — no SSH, no probing, no deployment. That server is referenced only as the default `SERVER_IP` value in DNS instructions, exactly as specified.
