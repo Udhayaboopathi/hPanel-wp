@@ -105,15 +105,23 @@ jobs:
         run: |
           set -euo pipefail
           # The DB admin password is FILE-ONLY: it is written straight to
-          # /opt/own-hpanel/secrets/db_admin_password.txt (0600) and never
+          # /opt/own-hpanel/secrets/db_admin_password.txt (0640 root:10001) and never
           # exported, never put in the compose .env (its `$` characters
           # would be corrupted by Docker Compose interpolation) and never
           # printed - only key NAMES are ever echoed.
           pwfile=/opt/own-hpanel/secrets/db_admin_password.txt
           write_pw() {
-            $SUDO install -d -m 750 /opt/own-hpanel/secrets
-            printf '%s' "$1" | $SUDO tee "$pwfile" >/dev/null
-            $SUDO chmod 600 "$pwfile"
+            $SUDO install -d -m 750 -o root -g 10001 /opt/own-hpanel/secrets
+            # Write via a runner-owned temp file + `sudo install` (install
+            # is in the runner's scoped sudoers; chown is not). The panel
+            # container (fixed gid 10001) reads this file through its bind
+            # mount and the agent reads it as root: 640 root:10001, not
+            # 600 root-only (which crash-loops the panel - it cannot open
+            # its own DB credential).
+            tmp_pw="$(mktemp)"
+            printf '%s' "$1" > "$tmp_pw"
+            $SUDO install -m 640 -o root -g 10001 "$tmp_pw" "$pwfile"
+            rm -f "$tmp_pw"
           }
           if [ -n "${HPANEL_ENV:-}" ]; then
             echo "HPANEL_ENV detected - parsing it (values are never printed)"
@@ -224,7 +232,8 @@ jobs:
           # "Load configuration" step, before this step and before the
           # ensure-panel-DB step - this step never handles the password.
           $SUDO test -s /opt/own-hpanel/secrets/db_admin_password.txt || { echo "::error::DB admin password file is missing - the Load configuration step did not run or failed"; exit 1; }
-          $SUDO install -d -m 750 /opt/own-hpanel/bin /opt/own-hpanel/secrets /opt/own-hpanel/logs
+          $SUDO install -d -m 750 /opt/own-hpanel/bin /opt/own-hpanel/logs
+          $SUDO install -d -m 750 -o root -g 10001 /opt/own-hpanel/secrets
           # websites/backups are bind-mounted into the panel container whose
           # user has fixed gid 10001: group-share them (setgid) so the panel
           # can use the file manager while they stay closed to other users.
@@ -296,7 +305,7 @@ jobs:
           if $SUDO test -s "$rootpw_file"; then
             echo "MariaDB root password file already exists (never overwritten, value never printed)"
           else
-            $SUDO install -d -m 750 /opt/own-hpanel/secrets
+            $SUDO install -d -m 750 -o root -g 10001 /opt/own-hpanel/secrets
             openssl rand -hex 24 | $SUDO tee "$rootpw_file" >/dev/null
             $SUDO chmod 600 "$rootpw_file"
             echo "MariaDB root password generated into $rootpw_file (0600, value never printed)"
