@@ -7,7 +7,7 @@ A lightweight, self-hosted WordPress hosting control panel written in Go.
 ## Architecture
 
 ```
-Panel (unprivileged, NO Docker socket)          Agent (host systemd service)
+Panel (unprivileged, NO Docker socket)          Agent (Compose container, Docker socket)
   Go + html/templates + HTMX                       Unix socket + bearer token
   SQLite/MySQL metadata, durable jobs      ───►    Allowlisted ops only, re-validates
   Sessions, Argon2id, TOTP, audit                  Production guard: managed label

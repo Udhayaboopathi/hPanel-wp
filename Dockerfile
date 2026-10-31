@@ -16,9 +16,10 @@ EXPOSE 8080
 ENTRYPOINT ["/usr/local/bin/panel"]
 
 FROM alpine:3.20 AS agent
-# The agent runs on the HOST as a systemd service in the recommended
-# deployment (it needs the Docker socket and host site directories).
-# This image exists for hosts that prefer a containerised agent with the
-# Docker socket mounted into the AGENT ONLY - never into the panel.
+# The agent runs as a Docker Compose service (the `agent` service in
+# compose.yaml). It runs as root (the image default - no USER directive)
+# because it needs the Docker socket and host site directories; the
+# socket is mounted into the AGENT ONLY - never into the panel. The
+# binary is a static Go binary, so plain Alpine is all it needs.
 COPY --from=build /out/agent /usr/local/bin/agent
 ENTRYPOINT ["/usr/local/bin/agent"]

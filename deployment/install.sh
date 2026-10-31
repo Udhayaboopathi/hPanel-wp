@@ -4,8 +4,9 @@
 # Phase A (always run): snapshots the current production state and checks
 # every prerequisite. It changes NOTHING.
 # Phase B (only with --apply, after you reviewed Phase A output): creates
-# panel-owned directories/secrets, installs the agent systemd unit, and
-# starts the panel compose stack.
+# panel-owned directories/secrets and starts the panel compose stack.
+# The provisioning agent is part of that stack (the `agent` service in
+# compose.yaml) - there is no systemd unit to install.
 #
 # This script NEVER: stops/removes/recreates existing containers, runs
 # docker prune / system cleanup, modifies Traefik, Construction MariaDB or
@@ -19,7 +20,7 @@ BASE=/opt/own-hpanel
 SNAPSHOT="$BASE/discovery-$(date +%Y%m%d-%H%M%S).txt"
 
 echo "=== Own hPanel discovery (read-only) ==="
-mkdir -p "$BASE" 2>/dev/null || { echo "Cannot create $BASE (run with sudo)"; exit 1; }
+mkdir -p "$BASE" 2>/dev/null || { echo "Cannot create $BASE (run this script as root)"; exit 1; }
 {
   echo "--- date ---";           date -Is
   echo "--- os ---";             cat /etc/os-release | head -3
@@ -92,7 +93,7 @@ fi
 
 echo "=== Applying (panel-owned resources only) ==="
 install -d -m 750 "$BASE"/{panel,state,secrets,logs,websites,backups}
-# This script runs as root directly (no scoped sudo involved), so it may
+# This script runs as root directly, so it may
 # group-share the secrets directory with the panel's fixed gid 10001:
 # group members may traverse it, while the secret FILES inside stay 0600
 # root (agent token, MariaDB passwords) unless copied for the panel
@@ -124,7 +125,7 @@ cp "$BASE/secrets/agent.token" /run/own-hpanel/agent.token; chgrp 10001 /run/own
 
 # Stage the panel's OWN copy of the DB admin password into its data
 # volume - the same Docker one-shot pattern the deploy workflow uses
-# (docs/CICD.md, "Scoped sudo"). The panel (uid/gid 10001) reads
+# (docs/CICD.md, "Zero-sudo deploys"). The panel (uid/gid 10001) reads
 # /data/db_admin_password.txt; the host secrets directory is NOT mounted
 # into the panel container, and the host file stays 0600 root. The
 # volume name matches the one compose.yaml declares for the panel, so
@@ -144,15 +145,15 @@ else
   echo "WARNING: skipping panel credential staging - $BASE/secrets/db_admin_password.txt is missing/empty (see the warning above). Provide it and re-run --apply before starting the panel with PANEL_STORE_DRIVER=mysql."
 fi
 
-# Agent systemd service (host process; the only Docker-socket holder).
-install -m 644 deployment/own-hpanel-agent.service /etc/systemd/system/own-hpanel-agent.service
-systemctl daemon-reload
-systemctl enable --now own-hpanel-agent
-systemctl --no-pager status own-hpanel-agent | head -5
+# The provisioning agent needs NO host installation: it is the `agent`
+# service of the compose stack started below (the only container holding
+# the Docker socket). deployment/own-hpanel-agent.service is kept as a
+# deprecated alternative for manual installs that prefer a host process -
+# do not use both at once (same socket path).
 
-# Panel stack (panel-owned containers only: the panel + the dedicated
-# wordpress-mariadb defined in compose.yaml; pre-existing production
-# containers are never started/stopped by it).
+# Panel stack (panel-owned containers only: the panel, the provisioning
+# agent, and the dedicated wordpress-mariadb defined in compose.yaml;
+# pre-existing production containers are never started/stopped by it).
 : "${PANEL_DOMAIN:?Set PANEL_DOMAIN, e.g. PANEL_DOMAIN=panel.example.com}"
 export PANEL_DOMAIN
 docker compose up -d --build

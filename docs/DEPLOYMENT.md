@@ -28,14 +28,14 @@ echo "panel.example.com" # your PANEL_DOMAIN
 sudo PANEL_DOMAIN=panel.example.com ./deployment/install.sh --apply
 ```
 
-This creates `/opt/own-hpanel/{websites,backups,secrets,logs}`, generates the agent token (0600, printed never), generates the MariaDB **root** password file if missing (`/opt/own-hpanel/secrets/mariadb_root_password.txt`, 0600, printed never — it becomes the root password of the stack's dedicated `wordpress-mariadb` container on its first initialization), installs `own-hpanel-agent.service`, builds the agent binary to `/opt/own-hpanel/bin/agent` — **build step**: run `make build && sudo install -m 755 bin/agent /opt/own-hpanel/bin/agent && sudo install -m 755 bin/panel /opt/own-hpanel/bin/panel` before `--apply` — and starts the compose stack (panel + the dedicated `wordpress-mariadb`, all configuration in compose.yaml). The common DB admin password is supplied by you (see `.env.example` / docs/CICD.md), never generated or printed by the installer. For the normal path prefer the GitHub Actions deploy (docs/CICD.md); this script remains the manual fallback.
+This creates `/opt/own-hpanel/{websites,backups,secrets,logs}`, generates the agent token (0600, printed never), generates the MariaDB **root** password file if missing (`/opt/own-hpanel/secrets/mariadb_root_password.txt`, 0600, printed never — it becomes the root password of the stack's dedicated `wordpress-mariadb` container on its first initialization), stages the panel's own copy of the DB admin password into its data volume, and starts the compose stack (panel + provisioning agent + the dedicated `wordpress-mariadb`, all configuration in compose.yaml — the agent is a Compose service, so there is no host binary or systemd unit to install; `deployment/own-hpanel-agent.service` remains only as a deprecated alternative). The common DB admin password is supplied by you (see `.env.example` / docs/CICD.md), never generated or printed by the installer. For the normal path prefer the GitHub Actions deploy (docs/CICD.md); this script remains the manual fallback.
 
 ## 3. Verify — production protection test
 
 ```bash
 docker ps -a --format '{{.Names}} {{.Status}}'   # compare with the BEFORE snapshot
 curl -fsS https://panel.example.com/healthz      # -> ok
-systemctl status own-hpanel-agent
+docker logs --tail 20 own-hpanel-agent           # agent started, socket bound
 ```
 
 Every pre-existing container must be present, running and unchanged. Then open the panel URL: first-run setup creates the administrator (save the recovery codes + TOTP secret shown once).

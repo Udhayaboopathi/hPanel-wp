@@ -10,12 +10,16 @@ Own hPanel ships two workflows:
 ## Why the deploy runner is on the server
 
 The production host already runs GitHub Actions self-hosted runners. The
-deploy job therefore executes **locally on the server**: it uses Docker and
-systemd directly. There are **no SSH steps and no SSH secrets** — nothing
-connects to the server from outside. A guard step refuses to run anywhere
-else: it fails unless `redberyl-traefik` is visible in `docker ps` on the
-runner host. (The stack's dedicated DB container is created by compose
-during the deploy itself, so it is not part of the host proof.)
+deploy job therefore executes **locally on the server**, using Docker
+directly. There are **no SSH steps and no SSH secrets** — nothing
+connects to the server from outside — and the workflow **never
+escalates privileges on the host**: it runs start to finish as the
+runner user, and everything that needs root-level effect is done inside
+one-shot Docker containers (see "Zero-sudo deploys" below). A guard step
+refuses to run anywhere else: it fails unless `redberyl-traefik` is
+visible in `docker ps` on the runner host. (The stack's dedicated DB
+container is created by compose during the deploy itself, so it is not
+part of the host proof.)
 
 Triggers:
 
@@ -64,13 +68,13 @@ Rules the workflow applies when parsing the blob:
 ### The DB password is file-only — never in the compose `.env`
 
 `DB_ADMIN_PASSWORD` is **never** exported to the job environment and
-**never** written into the compose `.env` file. The workflow writes its
-value directly to
-`/opt/own-hpanel/secrets/db_admin_password.txt` (0600, root-owned, via
-sudo), before the agent is installed/restarted and before the panel-DB
-check runs. That host file serves two readers: the agent (runs as root
-on the host) and the MariaDB container (via the compose `secrets:`
-mount).
+**never** written into the compose `.env` file. The workflow stages its
+value directly into
+`/opt/own-hpanel/secrets/db_admin_password.txt` (0600, root-owned) via a
+one-shot Docker container, before the stack starts and before the
+panel-DB check runs. That host file serves two readers: the agent
+container (it runs as root and gets the file through a read-only bind
+mount) and the MariaDB container (via the compose `secrets:` mount).
 
 The **panel does not read the host file** — it runs as uid/gid 10001
 and cannot open a root-owned 0600 file, and the host secrets directory
@@ -125,9 +129,10 @@ the panel database and sync the common user's provisioning grants. Both
 passwords reach MariaDB only as file-based compose `secrets:`; neither is
 ever a compose literal or a `${...}` interpolation. The ensure step
 reads both passwords back **out of the MariaDB container's own secret
-mounts** (`docker exec … cat /run/secrets/…`) instead of `sudo cat` on
-the host files — the runner's scoped sudo does not cover that (see the
-scoped-sudo section below).
+mounts** (`docker exec … cat /run/secrets/…`) instead of reading the
+host files — the host files are root-owned 0600 in a root-owned
+directory the runner user cannot even traverse, and the container
+already holds exactly the values MariaDB itself uses.
 
 ## Cloudflare notes (panel + DB records)
 
@@ -151,44 +156,72 @@ scoped-sudo section below).
   testing/admin tools — exactly the traffic that needs the record to be
   DNS-only.
 
-## Scoped sudo on the runner — and the Docker-staging pattern
+## Zero-sudo deploys — the Docker-staging pattern
 
-The runner user's passwordless sudo on the production host is **scoped
-to specific command forms** (as granted in its sudoers drop-in). Real
-deploys proved that only these forms run without sudo demanding a
-password:
+The deploy workflow contains **no privilege-escalation calls at all**.
+It runs start to finish as the unprivileged runner user, and the
+runner's **only** requirement is membership of the `docker` group. No
+sudoers configuration is needed, expected, or used.
 
-- `sudo install -d -m <mode> <paths…>` (plain)
-- `sudo install -m 755 <file> <dest>` and `sudo install -m 644 <file> <dest>`
-- `sudo tee <file>`, `sudo chmod <mode> <file>`, `sudo test -f/-s <file>`
-- `sudo systemctl daemon-reload|enable|restart …`
+This was not the first design. The workflow originally escalated
+privileges for a handful of host operations (installing the agent
+binary and its systemd unit, writing root-owned secret files), based on
+the assumption that the runner had passwordless escalation rights. In
+production that assumption proved unreliable in ways that were not
+visible from the repository: the server accepted some command forms
+without a password and demanded one for others (plain file installs
+worked; the same tool with owner/group flags for a foreign uid/gid did
+not; some read-only service queries did not), and the failures changed
+as the workflow evolved, because each new step risked using an
+unaccepted form. Rather than keep probing an opaque configuration, the
+dependency was eliminated:
 
-Forms that **fail** with `sudo: a password is required` include
-`sudo install … -o <user> -g <group> …` for a foreign user/group,
-`sudo chown …`, `sudo cat <root-owned file>` and
-`sudo systemctl status/show …` (read-only `systemctl` queries are run
-**without** sudo instead — they need no privilege).
+- **Every privileged file operation runs inside a one-shot Docker
+  container** (`docker run --rm … alpine:3.20 sh -c '…'`): writing all
+  the root-owned secret files (DB admin password, agent token, MariaDB
+  root password), creating the host directories the stack bind-mounts,
+  staging the panel's credential copy into its data volume, staging the
+  panel's agent-token copy into `/run/own-hpanel`, group-sharing
+  `websites`/`backups` with the panel gid, and fixing `DEPLOY_DIR`
+  ownership when the sync directory is not runner-writable.
+- **Read-only container queries need no privilege** and are run
+  directly (`docker ps/inspect/logs`, plus the agent's bound-socket
+  entry in `/proc/net/unix` for liveness).
+- **The agent itself is a Docker Compose service now** (see below), so
+  nothing needs to be installed into the host's binary directories or
+  service manager at all.
 
-**Rule for the workflow: host-sudo calls use ONLY the proven forms
-above.** Every other privileged operation — changing ownership/mode for
-another uid/gid, copying between root-owned locations — is done inside
-a **one-shot Docker container** (`docker run --rm … alpine:3.20 sh -c
-'…'`): the runner is in the `docker` group, and Docker needs no sudo.
-This pattern is used for:
+**Rule for the workflow: if a new step needs a privileged host
+operation, give it the Docker treatment.** Do not reintroduce host
+privilege escalation in any form — that is the failure mode this design
+exists to avoid.
 
-- staging the panel's DB credential copy into its data volume
-  (`install -m 600 -o 10001 -g 10001 … /data/db_admin_password.txt`),
-- group-sharing `/opt/own-hpanel/websites` (2770) and `…/backups`
-  (2750) with the panel's gid 10001,
-- copying the agent token to `/run/own-hpanel/agent.token` as
-  `640 root:10001`,
-- reading the DB passwords in the ensure step, via
-  `docker exec wordpress-mariadb cat /run/secrets/…`.
+### The agent as a container
 
-When editing the workflow, keep this rule: if a new step needs a
-privileged host operation that is not on the proven list, give it the
-Docker treatment — do not widen the sudoers and do not reach for an
-unproven sudo form.
+The provisioning agent is the `agent` service in `compose.yaml`
+(container `own-hpanel-agent`). It is the **only** container with
+`/var/run/docker.sock` mounted — the panel, the database and every
+WordPress container must never get it — and it is exactly as privileged
+as the host root systemd service it replaces: Docker socket access *is*
+host-root equivalence, by design, because provisioning WordPress sites
+means creating containers, networks and volumes. The containment story
+is unchanged in substance:
+
+- the agent has **no network listener at all** — it serves only its
+  Unix socket in `/run/own-hpanel` (bind-mounted into both the agent
+  and the panel containers), and every call needs the agent token;
+- the socket is mode 0666 so the panel's uid 10001 can connect, but the
+  token file itself stays 0600 (agent's copy) / 640 group-10001
+  (panel's staged copy);
+- it runs with `cap_drop: ALL` and `no-new-privileges`, with tight
+  memory/CPU limits, and it re-validates every request against its
+  allowlist, exactly as the host service did.
+
+The old systemd unit (`deployment/own-hpanel-agent.service`) is kept as
+a **deprecated alternative** for manual installs that deliberately
+prefer a host process; the deploy workflow and `install.sh` no longer
+use it, and it must never run at the same time as the compose agent
+(both bind the same socket path).
 
 ## Runner setup (on the server, one time)
 
@@ -196,9 +229,10 @@ unproven sudo form.
    (Settings → Actions → Runners → New self-hosted runner), with labels
    `self-hosted, linux` (the defaults). Run it as a user that can use
    Docker.
-2. That user must be in the `docker` group and have **passwordless sudo**
-   (needed only to install `/opt/own-hpanel/bin/agent` and the
-   `own-hpanel-agent` systemd unit) — or run the runner as root.
+2. That user must be in the `docker` group. **Nothing else**: the
+   workflow uses no sudo at all (see "Zero-sudo deploys" above), so no
+   sudoers setup is needed — and any sudoers entries left over from the
+   earlier design are simply never invoked.
 3. Install `rsync`, `git`, `curl`, `openssl` (`apt install rsync curl openssl`).
 4. Go does **not** need to be installed on the runner: the workflow uses
    `actions/setup-go` (1.23), which provisions the toolchain on self-hosted
@@ -209,7 +243,9 @@ unproven sudo form.
 
 ## What a deploy does (in order)
 
-1. Guard: correct host, docker/rsync/sudo available.
+1. Guard: correct host (existing Traefik visible), docker/rsync
+   available. The workflow runs entirely as the runner user — there is
+   no privilege-escalation step anywhere in the run.
 2. Snapshot `docker ps` + the IDs of the 10 pre-existing production
    containers (the protection baseline).
 3. Prerequisite checks: `redberyl-internal` network exists, Traefik
@@ -217,50 +253,59 @@ unproven sudo form.
    the stack creates its own DB container in step 11.)
 4. Load configuration: parse the `HPANEL_ENV` secret (or the individual-
    secret fallback), export the known non-secret keys for later steps,
-   and write the DB admin password file-only to
-   `/opt/own-hpanel/secrets/db_admin_password.txt` (0600). This happens
-   before the agent is installed/restarted, before the stack starts
-   (compose mounts it as a file secret) and before the ensure step.
+   and stage the DB admin password file-only into
+   `/opt/own-hpanel/secrets/db_admin_password.txt` (0600) via a one-shot
+   Docker container. This happens before the stack starts (compose
+   mounts the file as a secret, and the agent container reads it
+   through its own read-only mount).
 5. `rsync` the checkout to `DEPLOY_DIR` (excluding `.git` and `.env`).
+   If the directory is missing or not runner-writable, a one-shot
+   Docker container creates it and hands it to the runner user first.
 6. Write `DEPLOY_DIR/.env` (chmod 600; key names only in the log). It
    contains `PANEL_DOMAIN`, `SERVER_IP`, `DB_HOST`, `DB_EXTERNAL_PORT`,
    `DB_ADMIN_USER`, `PANEL_DB_NAME`, `PANEL_STORE_DRIVER=mysql` — and
    **no password** (see the file-only note above).
-7. `go test ./...`, `go vet ./...`; build panel + agent binaries.
-8. Install the agent binary to `/opt/own-hpanel/bin/agent`, generate the
-   agent token if missing (0600, never printed), install/refresh
-   `own-hpanel-agent.service`, `daemon-reload`, restart **the agent
-   only** (verifying the password file written in step 4 exists first).
-   The token is then copied to `/run/own-hpanel/agent.token` (640,
-   group 10001) for the panel by a one-shot Docker container — the
-   scoped sudoers reject the equivalent `sudo install -o/-g` form (see
-   the scoped-sudo section above).
-9. Generate the MariaDB **root** password file if missing
+7. `go test ./...`, `go vet ./...`. That is all the host-side build
+   there is: the panel and agent binaries are built by Docker Compose
+   from the repo `Dockerfile` in step 11 — nothing is compiled into,
+   or installed onto, the host.
+8. Prepare host state — **Docker one-shots only**: create the
+   `/opt/own-hpanel` directories the stack bind-mounts and
+   `/run/own-hpanel` (the shared socket directory, 755); verify the DB
+   admin password file from step 4 exists; generate the **agent
+   token** if missing (0600, never printed) and stage the panel's copy
+   to `/run/own-hpanel/agent.token` (640, group 10001); generate the
+   MariaDB **root** password file if missing
    (`/opt/own-hpanel/secrets/mariadb_root_password.txt`, 0600, never
    printed, never overwritten — see the root-password section above).
-10. Stage the panel's credentials and shared directories — **Docker
-    only, no sudo** (see the scoped-sudo section): create the
-    `own-hpanel-panel-data` volume if needed and copy the DB admin
-    password into it as `/data/db_admin_password.txt` (0600, owned by
-    the panel's uid/gid 10001) — the copy the panel actually reads;
-    group-share `/opt/own-hpanel/websites` (2770) and `…/backups`
-    (2750) with the panel gid. Runs on every deploy, so secret
-    rotations propagate.
-11. `docker compose build` + `docker compose up -d` — the whole stack
-    defined in compose.yaml, i.e. exactly two panel-owned services:
+9. Stage the panel's credentials and shared directories — **Docker
+   only**: create the `own-hpanel-panel-data` volume if needed and
+   copy the DB admin password into it as `/data/db_admin_password.txt`
+   (0600, owned by the panel's uid/gid 10001) — the copy the panel
+   actually reads; group-share `/opt/own-hpanel/websites` (2770) and
+   `…/backups` (2750) with the panel gid. Runs on every deploy, so
+   secret rotations propagate.
+10. `docker compose build` + `docker compose up -d` — the whole stack
+    defined in compose.yaml, i.e. exactly three panel-owned services:
     `wordpress-mariadb` (image pulled by compose; on first boot of its
     empty volume the entrypoint creates the panel database and the
     common user from the file secrets, and
     `deployment/mariadb-init/01-grants.sh` upgrades that user to full
-    provisioning admin of this container) and `own-hpanel` (starts once
-    the DB is healthy). The step then waits until `wordpress-mariadb`
-    reports healthy.
+    provisioning admin of this container), `own-hpanel` (starts once
+    the DB is healthy) and `own-hpanel-agent` (the provisioning agent;
+    the only service with the Docker socket mounted). The step then
+    waits until `wordpress-mariadb` reports healthy.
+11. Verify the agent: the `own-hpanel-agent` container must be running
+    and its socket path must appear as bound in `/proc/net/unix`; the
+    container's last 50 log lines are printed either way, and the step
+    fails if the agent is not up within 30 s.
 12. Ensure the panel database and provisioning grants — **after** the
     stack is up: `docker exec` **into `wordpress-mariadb` as root**
-    (`MYSQL_PWD` loaded silently — the root password is read out of the
-    container's own `/run/secrets/mariadb_root_password` mount via
-    `docker exec … cat`, because `sudo cat` on the host file is outside
-    the runner's scoped sudo) feeds it a
+    (`MYSQL_PWD` loaded silently — both passwords are read out of the
+    container's own `/run/secrets/…` mounts via `docker exec … cat`,
+    because the host copies are root-owned in a directory the runner
+    cannot traverse, and the container holds exactly the values
+    MariaDB itself uses) feeds it a
     generated SQL file (0600 temp file, shredded afterwards) that runs
     `CREATE DATABASE IF NOT EXISTS …`, `CREATE USER IF NOT EXISTS …` /
     `ALTER USER … IDENTIFIED BY …` (syncing the common user's password
@@ -308,9 +353,9 @@ in any way — it only appears in the protected before/after ID comparison.
   commit's ref where available), or simpler: `git revert <bad-commit>` and
   push to `main` — the normal deploy then rolls the panel forward to the
   reverted code.
-- **Panel offline only**: on the server, `docker compose stop panel` and
-  `systemctl stop own-hpanel-agent` — websites and the dedicated DB
-  container are unaffected (docs/RECOVERY.md).
+- **Panel offline only**: on the server, `docker compose stop panel
+  agent` — websites and the dedicated DB container are unaffected
+  (docs/RECOVERY.md).
 - Rollback never needs to touch Traefik, the dedicated MariaDB's data
   volume, or any pre-existing container.
 

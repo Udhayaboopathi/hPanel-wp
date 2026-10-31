@@ -9,10 +9,26 @@ name: Deploy Own hPanel
 # admin password is handled file-only: it never enters the compose .env,
 # because its `$` characters would be corrupted by Compose interpolation.
 #
+# This workflow NEVER escalates privileges on the host. It runs start to
+# finish as the unprivileged runner user; every operation that needs
+# root-level effect (writing root-owned files, fixing ownership between
+# different uids/gids) is done inside a one-shot Docker container - the
+# runner is in the docker group, and Docker is its only privilege
+# channel. There is deliberately not a single privilege-escalation call
+# in this file: an earlier design relied on the runner having
+# passwordless escalation rights for specific command forms, which the
+# server's configuration accepted only inconsistently, so the dependency
+# was removed entirely.
+#
 # Safety contract:
-#   - only panel-owned resources are created/updated (own-hpanel panel
-#     container, the dedicated wordpress-mariadb DB container defined in
-#     compose.yaml, own-hpanel-agent systemd service, /opt/own-hpanel data)
+#   - only panel-owned resources are created/updated: the three Compose
+#     services defined in compose.yaml (own-hpanel panel container,
+#     own-hpanel-agent provisioning-agent container, and the dedicated
+#     wordpress-mariadb DB container) plus /opt/own-hpanel data
+#   - the provisioning agent is a Compose service: it is the ONLY
+#     container with the Docker socket mounted (exactly as privileged as
+#     the host root service it replaces), it has no network listener,
+#     and the panel reaches it over an authenticated Unix socket
 #   - the existing Traefik (redberyl-traefik) is reused, never touched
 #   - the database is the stack's OWN dedicated MariaDB container
 #     (wordpress-mariadb): compose pulls the image and runs it; ALL its
@@ -58,15 +74,10 @@ jobs:
           set -euo pipefail
           mkdir -p "${RUNNER_TEMP}/hpanel-snapshots"
           echo "SNAP_DIR=${RUNNER_TEMP}/hpanel-snapshots" >> "$GITHUB_ENV"
-          if [ "$(id -u)" -eq 0 ]; then echo "SUDO=" >> "$GITHUB_ENV"; else echo "SUDO=sudo" >> "$GITHUB_ENV"; fi
           command -v docker >/dev/null || { echo "::error::docker not found - this workflow must run on the target server's self-hosted runner"; exit 1; }
           command -v rsync >/dev/null || { echo "::error::rsync not found on the runner host (apt install rsync)"; exit 1; }
           docker ps --format '{{.Names}}' | grep -qx 'redberyl-traefik' || { echo "::error::redberyl-traefik is not visible from this runner - wrong host, refusing to deploy"; exit 1; }
-          if [ "$(id -u)" -ne 0 ] && ! sudo -n true 2>/dev/null; then
-            echo "::error::the runner user needs passwordless sudo to install the agent systemd unit (or run the runner as root)"
-            exit 1
-          fi
-          echo "Runner host: $(hostname) - target server confirmed (existing Traefik visible; the dedicated DB container $DB_CONTAINER is created by compose during this deploy, so it need not exist yet)"
+          echo "Runner host: $(hostname) - target server confirmed (existing Traefik visible; the dedicated DB container $DB_CONTAINER is created by compose during this deploy, so it need not exist yet). The workflow runs entirely as $(id -un) + Docker - no host privilege escalation is used or needed."
 
       - name: Checkout
         uses: actions/checkout@v4
@@ -104,23 +115,29 @@ jobs:
           S_DEPLOY_DIR: ${{ secrets.DEPLOY_DIR }}
         run: |
           set -euo pipefail
-          # The DB admin password is FILE-ONLY: it is written straight to
+          # The DB admin password is FILE-ONLY: it is staged straight into
           # /opt/own-hpanel/secrets/db_admin_password.txt (0600, root) and
           # never exported, never put in the compose .env (its `$`
           # characters would be corrupted by Docker Compose
           # interpolation) and never printed - only key NAMES are echoed.
-          # This host file serves the root agent and the MariaDB compose
-          # secret. The PANEL does not read it: it cannot (root-owned
-          # 0600 in a root-owned dir, and the runner's scoped sudoers
-          # reject the chown / install -o/-g forms that would group-share
-          # it - sudo asks for a password instead). A later step stages
-          # the panel its OWN copy inside its data volume, using a
-          # one-shot Docker container (no sudo).
+          # The write itself runs inside a one-shot Docker container: the
+          # host secrets directory is root-owned, the workflow runs
+          # entirely as the unprivileged runner user, and Docker is its
+          # only privilege channel. The host file serves the agent
+          # container (bind-mounted read-only, read as root) and the
+          # MariaDB compose secret. The PANEL does not read it: it runs
+          # as uid/gid 10001 and the host secrets directory is not
+          # mounted into it - a later step stages the panel its OWN copy
+          # inside its data volume, again via Docker.
           pwfile=/opt/own-hpanel/secrets/db_admin_password.txt
           write_pw() {
-            $SUDO install -d -m 750 /opt/own-hpanel/secrets
-            printf '%s' "$1" | $SUDO tee "$pwfile" >/dev/null
-            $SUDO chmod 600 "$pwfile"
+            tmpdir="$(mktemp -d)"
+            printf '%s' "$1" > "$tmpdir/pw"
+            docker run --rm \
+              -v /opt/own-hpanel/secrets:/secrets \
+              -v "$tmpdir":/in:ro \
+              alpine:3.20 sh -c 'mkdir -p /secrets && install -m 600 -o 0 -g 0 /in/pw /secrets/db_admin_password.txt'
+            rm -rf "$tmpdir"
           }
           if [ -n "${HPANEL_ENV:-}" ]; then
             echo "HPANEL_ENV detected - parsing it (values are never printed)"
@@ -162,6 +179,8 @@ jobs:
             if [ -n "${S_DEPLOY_DIR:-}" ]; then echo "DEPLOY_DIR=$S_DEPLOY_DIR" >> "$GITHUB_ENV"; fi
             echo "individual secrets loaded; DB admin password written file-only"
           fi
+          docker run --rm -v /opt/own-hpanel/secrets:/secrets:ro alpine:3.20 sh -c 'test -s /secrets/db_admin_password.txt' \
+            || { echo "::error::DB admin password file $pwfile was not written - the staging container above must have failed"; exit 1; }
           echo "DB admin password file ready at $pwfile (0600, value never printed)"
 
       - name: Resolve deploy directory
@@ -174,7 +193,20 @@ jobs:
       - name: Sync source to deploy directory
         run: |
           set -euo pipefail
-          $SUDO install -d -m 755 -o "$(id -un)" -g "$(id -gn)" "$DEPLOY_DIR"
+          # DEPLOY_DIR must be writable by the runner user for rsync. It
+          # normally already is (created by earlier deploys); if it is
+          # missing or root-owned, fix it with a one-shot Docker
+          # container instead of any host privilege escalation (the
+          # /opt:/opt mount covers the standard /opt/own-hpanel/app
+          # location).
+          mkdir -p "$DEPLOY_DIR" 2>/dev/null || true
+          if [ ! -w "$DEPLOY_DIR" ]; then
+            docker run --rm \
+              -v /opt:/opt \
+              -e TARGET="$DEPLOY_DIR" -e OWNER="$(id -u):$(id -g)" \
+              alpine:3.20 sh -c 'mkdir -p "$TARGET" && chown "$OWNER" "$TARGET"'
+          fi
+          [ -w "$DEPLOY_DIR" ] || { echo "::error::DEPLOY_DIR $DEPLOY_DIR is not writable by the runner user and the Docker ownership fix did not help - pre-create it owned by the runner user"; exit 1; }
           rsync -a --delete \
             --exclude='.git' \
             --exclude='.env' \
@@ -214,122 +246,90 @@ jobs:
           go-version: "1.23"
           cache: true
 
-      - name: Test and build
+      - name: Go tests
         working-directory: ${{ env.DEPLOY_DIR }}
         run: |
           set -euo pipefail
+          # Tests + vet only. The panel and agent binaries are built by
+          # Docker Compose from the repo Dockerfile (multi-stage build)
+          # in the "Build and start" step - there is no host binary
+          # build, nothing is installed onto the host, and no host
+          # service is managed by this workflow.
           go test ./...
           go vet ./...
-          mkdir -p "${RUNNER_TEMP}/hpanel-bin"
-          CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "${RUNNER_TEMP}/hpanel-bin/agent" ./cmd/agent
-          CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "${RUNNER_TEMP}/hpanel-bin/panel" ./cmd/panel
-          ls -lh "${RUNNER_TEMP}/hpanel-bin"
 
-      - name: Install agent binary and systemd unit
+      - name: Prepare host state (directories, agent token, DB root password - Docker only)
         run: |
           set -euo pipefail
-          # The DB admin password file was already written (0600) by the
-          # "Load configuration" step, before this step and before the
-          # ensure-panel-DB step - this step never handles the password.
-          $SUDO test -s /opt/own-hpanel/secrets/db_admin_password.txt || { echo "::error::DB admin password file is missing - the Load configuration step did not run or failed"; exit 1; }
-          # All host directories are created with the one plain
-          # `install -d` form the runner's scoped sudoers accept (any
-          # -o/-g/chown form makes sudo demand a password). The
-          # panel-visible ownership of websites/backups is fixed later by
-          # the docker staging step, without sudo.
-          $SUDO install -d -m 750 /opt/own-hpanel/bin /opt/own-hpanel/secrets /opt/own-hpanel/websites /opt/own-hpanel/backups /opt/own-hpanel/logs
-          $SUDO install -m 755 "${RUNNER_TEMP}/hpanel-bin/agent" /opt/own-hpanel/bin/agent
-          # Agent token: generated once, never overwritten, never printed.
-          if ! $SUDO test -f /opt/own-hpanel/secrets/agent.token; then
-            openssl rand -hex 32 | $SUDO tee /opt/own-hpanel/secrets/agent.token >/dev/null
-            $SUDO chmod 600 /opt/own-hpanel/secrets/agent.token
-            echo "agent token generated"
+          # Everything in this step that needs root-level effect runs
+          # inside one-shot Docker containers; the step itself runs as
+          # the runner user. The host directories and root-owned secret
+          # files it prepares are consumed by the Compose stack in the
+          # "Build and start" step (bind mounts + file-based compose
+          # secrets), so ALL of them must exist before compose runs.
+          secrets_nonempty() {
+            docker run --rm \
+              -v /opt/own-hpanel/secrets:/secrets:ro \
+              -e F="$1" \
+              alpine:3.20 sh -c 'test -s "/secrets/$F"'
+          }
+          stage_secret() {
+            # $1 = runner temp file holding the value, $2 = target file
+            # name in the secrets dir, $3 = mode. Installed root-owned.
+            docker run --rm \
+              -v /opt/own-hpanel/secrets:/secrets \
+              -v "$1":/in/file:ro \
+              -e TARGET="$2" -e MODE="$3" \
+              alpine:3.20 sh -c 'mkdir -p /secrets && install -m "$MODE" -o 0 -g 0 /in/file "/secrets/$TARGET"'
+          }
+          # 1) Host directories the stack bind-mounts. /run/own-hpanel is
+          # the socket directory shared by the agent and panel
+          # containers; it must be traversable by the panel's uid 10001,
+          # hence 755 (the socket itself and the token file inside carry
+          # their own stricter permissions).
+          docker run --rm -v /opt:/opt alpine:3.20 sh -c 'mkdir -p /opt/own-hpanel/secrets /opt/own-hpanel/websites /opt/own-hpanel/backups /opt/own-hpanel/logs'
+          docker run --rm -v /run:/hostrun alpine:3.20 sh -c 'mkdir -p /hostrun/own-hpanel && chmod 755 /hostrun/own-hpanel'
+          # Sanity: the DB admin password must exist by now - the Load
+          # configuration step wrote it, compose mounts it as a file
+          # secret, and the agent reads it through its secrets mount.
+          secrets_nonempty db_admin_password.txt || { echo "::error::DB admin password file is missing - the Load configuration step did not run or failed"; exit 1; }
+          # 2) Agent token: generated once, never overwritten, never
+          # printed. The agent container reads the original from its
+          # read-only secrets mount.
+          if secrets_nonempty agent.token; then
+            echo "agent token already exists (never overwritten, value never printed)"
+          else
+            tmp_tok="$(mktemp)"
+            openssl rand -hex 32 > "$tmp_tok"
+            stage_secret "$tmp_tok" agent.token 600
+            rm -f "$tmp_tok"
+            echo "agent token generated into /opt/own-hpanel/secrets/agent.token (0600, value never printed)"
           fi
-          # Smoke-test the agent binary DIRECTLY (no systemd): separates
-          # binary/config errors from systemd sandbox errors, and prints the
-          # agent's own stderr into this log either way.
-          smoke_dir="${RUNNER_TEMP}/agent-smoke"; mkdir -p "$smoke_dir"
-          openssl rand -hex 32 > "$smoke_dir/token"
-          printf 'smoke-dummy' > "$smoke_dir/dbpw"
-          AGENT_SOCKET="$smoke_dir/agent.sock" \
-          AGENT_TOKEN_FILE="$smoke_dir/token" \
-          DB_ADMIN_PASSWORD_FILE="$smoke_dir/dbpw" \
-          SITES_DIR="$smoke_dir/websites" BACKUPS_DIR="$smoke_dir/backups" \
-            timeout 6 "${RUNNER_TEMP}/hpanel-bin/agent" > "$smoke_dir/agent.log" 2>&1 &
-          smoke_pid=$!
-          smoke_ok=""
-          for i in $(seq 1 10); do
-            [ -S "$smoke_dir/agent.sock" ] && { smoke_ok=1; break; }
-            sleep 0.5
-          done
-          kill "$smoke_pid" 2>/dev/null || true
-          echo "--- agent direct smoke test log ---"
-          cat "$smoke_dir/agent.log" || true
-          echo "--- end agent smoke test log ---"
-          [ -n "$smoke_ok" ] || { echo "::error::agent binary failed its direct smoke test (systemd not involved) - see its log above"; exit 1; }
-          echo "agent binary smoke test OK - starting it under systemd"
-          $SUDO install -m 644 "${DEPLOY_DIR}/deployment/own-hpanel-agent.service" /etc/systemd/system/own-hpanel-agent.service
-          $SUDO systemctl daemon-reload
-          $SUDO systemctl enable own-hpanel-agent >/dev/null
-          $SUDO systemctl restart own-hpanel-agent
-          # Do NOT test the socket file as the runner user: /run/own-hpanel
-          # is root-owned, so the runner cannot stat inside it even when the
-          # agent is listening (that false negative failed earlier deploys).
-          # /proc/net/unix lists bound socket paths for any user, and plain
-          # `systemctl is-active` needs no sudo - use both.
-          agent_up=""
-          for i in $(seq 1 30); do
-            if systemctl is-active --quiet own-hpanel-agent && grep -q " /run/own-hpanel/agent.sock\$" /proc/net/unix; then
-              agent_up=1; break
-            fi
-            sleep 1
-          done
-          if [ -z "$agent_up" ]; then
-            echo "::error::agent did not come up under systemd (binary smoke test passed, so this is a service/sandbox problem) - diagnostics follow"
-            systemctl status own-hpanel-agent --no-pager -l || true
-            systemctl show own-hpanel-agent -p NRestarts -p ExecMainStatus -p ExecMainCode -p Result || true
-            exit 1
-          fi
-          systemctl is-active own-hpanel-agent
-          # Panel reads the agent token through the shared /run/own-hpanel
-          # mount. The panel image's user has the fixed gid 10001, so the
-          # token copy must be group-owned by it (640): root + panel only.
-          # `sudo install -o root -g 10001` is NOT in the runner's scoped
-          # sudoers (sudo demands a password), so the copy is made by a
-          # one-shot Docker container instead - the runner is in the
-          # docker group and docker needs no sudo.
+          # Panel copy of the token: the panel authenticates to the agent
+          # with it and reads it from /run/own-hpanel/agent.token (its
+          # AGENT_TOKEN_FILE), so stage a copy there on every deploy -
+          # 640, group-owned by the panel image's fixed gid 10001.
           docker run --rm \
-            -v /run/own-hpanel:/run/own-hpanel \
             -v /opt/own-hpanel/secrets:/secrets:ro \
-            alpine:3.20 sh -c 'install -m 640 -o 0 -g 10001 /secrets/agent.token /run/own-hpanel/agent.token'
-          echo "agent installed and running (panel-owned service only)"
-
-      - name: Generate the MariaDB root password file if missing (server-side only)
-        run: |
-          set -euo pipefail
-          rootpw_file=/opt/own-hpanel/secrets/mariadb_root_password.txt
-          if $SUDO test -s "$rootpw_file"; then
+            -v /run:/hostrun \
+            alpine:3.20 sh -c 'install -m 640 -o 0 -g 10001 /secrets/agent.token /hostrun/own-hpanel/agent.token'
+          echo "agent token copy staged for the panel at /run/own-hpanel/agent.token (640, group 10001)"
+          # 3) MariaDB root password: server-generated, never a GitHub
+          # secret, generated once and never overwritten.
+          if secrets_nonempty mariadb_root_password.txt; then
             echo "MariaDB root password file already exists (never overwritten, value never printed)"
           else
-            $SUDO install -d -m 750 /opt/own-hpanel/secrets
-            openssl rand -hex 24 | $SUDO tee "$rootpw_file" >/dev/null
-            $SUDO chmod 600 "$rootpw_file"
-            echo "MariaDB root password generated into $rootpw_file (0600, value never printed)"
+            tmp_root="$(mktemp)"
+            openssl rand -hex 24 > "$tmp_root"
+            stage_secret "$tmp_root" mariadb_root_password.txt 600
+            rm -f "$tmp_root"
+            echo "MariaDB root password generated into /opt/own-hpanel/secrets/mariadb_root_password.txt (0600, value never printed)"
           fi
           echo "Note: this password becomes the root password of the dedicated wordpress-mariadb container on its FIRST initialization (empty data volume). If the volume was already initialized earlier, the file must match the root password set back then - the ensure step below fails loudly if it does not."
 
-      - name: Stage panel credentials and shared dirs (docker, no sudo)
+      - name: Stage panel credentials and shared dirs (Docker only)
         run: |
           set -euo pipefail
-          # PATTERN for everything in this step: the runner's scoped
-          # sudoers accept only a handful of exact sudo invocation forms
-          # (plain install -d, install -m, tee, chmod, test, systemctl
-          # verbs). Every ownership/mode operation beyond those - chown,
-          # install -o/-g for a foreign user/group - makes sudo demand a
-          # password and kills the deploy. Such operations are therefore
-          # done inside one-shot Docker containers: the runner is in the
-          # docker group, and docker needs no sudo.
-          #
           # 1) The panel's OWN copy of the DB admin password, staged into
           #    its data volume (own-hpanel-panel-data, the volume compose
           #    declares for the panel). The host file in
@@ -354,15 +354,17 @@ jobs:
             alpine:3.20 sh -c 'mkdir -p /o/websites /o/backups && chown 0:10001 /o/websites /o/backups && chmod 2770 /o/websites && chmod 2750 /o/backups'
           echo "websites/backups group-shared with the panel gid 10001 (2770/2750)"
 
-      - name: Build and start the hPanel stack (panel + dedicated MariaDB, panel-owned only)
+      - name: Build and start the hPanel stack (panel + agent + dedicated MariaDB, panel-owned only)
         working-directory: ${{ env.DEPLOY_DIR }}
         run: |
           set -euo pipefail
           # The compose file defines ONLY panel-owned services:
           # wordpress-mariadb (the stack's OWN dedicated DB container -
           # image pulled by compose, all config in compose.yaml,
-          # file-based secrets) and own-hpanel (depends_on the DB being
-          # healthy). Nothing pre-existing can be started/stopped by it.
+          # file-based secrets), own-hpanel (depends_on the DB being
+          # healthy) and own-hpanel-agent (the provisioning agent, the
+          # only service with the Docker socket mounted). Nothing
+          # pre-existing can be started/stopped by it.
           docker compose build
           docker compose up -d
           # Wait for the dedicated DB container to become healthy.
@@ -381,7 +383,31 @@ jobs:
           done
           [ -n "$dbhealth" ] || { docker logs --tail 100 "$DB_CONTAINER" || true; echo "::error::dedicated MariaDB container $DB_CONTAINER did not become healthy in time"; exit 1; }
           docker ps --filter "name=$DB_CONTAINER" --filter 'name=own-hpanel' --format '{{.Names}} {{.Status}}'
-          echo "stack is up: dedicated MariaDB ($DB_CONTAINER) healthy; panel starts once its DB dependency is healthy"
+          echo "stack is up: dedicated MariaDB ($DB_CONTAINER) healthy; panel and agent are started by the same compose file"
+
+      - name: Verify the agent container and its socket
+        run: |
+          set -euo pipefail
+          # The agent must be running AND have bound its Unix socket. The
+          # socket file lives in the host /run/own-hpanel directory
+          # (bind-mounted into both the agent and the panel containers);
+          # a bound socket path is visible in /proc/net/unix to any
+          # user, which avoids having to stat inside a root-owned
+          # directory as the runner (that false negative failed earlier
+          # deploys in the agent's previous form).
+          agent_ok=""
+          for i in $(seq 1 30); do
+            running="$(docker inspect -f '{{.State.Running}}' own-hpanel-agent 2>/dev/null || echo false)"
+            if [ "$running" = "true" ] && grep -q " /run/own-hpanel/agent.sock\$" /proc/net/unix; then
+              agent_ok=1; break
+            fi
+            sleep 1
+          done
+          echo "--- own-hpanel-agent logs (last 50 lines) ---"
+          docker logs --tail 50 own-hpanel-agent || true
+          echo "--- end own-hpanel-agent logs ---"
+          [ -n "$agent_ok" ] || { echo "::error::own-hpanel-agent is not running with its socket bound after 30s - see its logs above"; exit 1; }
+          echo "agent container running; socket /run/own-hpanel/agent.sock is bound and shared with the panel container"
 
       - name: Ensure the panel database and provisioning grants (root exec into wordpress-mariadb)
         run: |
@@ -394,18 +420,17 @@ jobs:
           case "$user" in *[!A-Za-z0-9_]*) echo "::error::DB_ADMIN_USER is not a plain identifier - refusing to build SQL with it"; exit 1 ;; esac
           case "$dbname" in *[!A-Za-z0-9_]*) echo "::error::PANEL_DB_NAME is not a plain identifier - refusing to build SQL with it"; exit 1 ;; esac
           rootpw_file=/opt/own-hpanel/secrets/mariadb_root_password.txt
-          userpw_file=/opt/own-hpanel/secrets/db_admin_password.txt
-          $SUDO test -s "$rootpw_file" || { echo "::error::MariaDB root password file $rootpw_file is missing/empty - the root-password generation step should have written it"; exit 1; }
-          $SUDO test -s "$userpw_file" || { echo "::error::DB admin password file $userpw_file is missing/empty - the Load configuration step should have written it"; exit 1; }
           # Load both passwords silently (no echo, no set -x). They are
           # read out of the dedicated MariaDB container's OWN compose
           # secret mounts via `docker exec cat`: the host files are
-          # root-owned in a root-owned directory, the runner's scoped
-          # sudoers do not cover `sudo cat` for them (it demanded a
-          # password in a real run), and docker needs no sudo. An empty
-          # read fails loudly instead of sending an empty password to
-          # the SQL below. Passwords reach the mariadb client via
-          # MYSQL_PWD passed by NAME only - never in argv, never printed.
+          # root-owned in a root-owned directory the runner user cannot
+          # traverse, and the container already holds exactly the values
+          # MariaDB itself uses. An empty read fails loudly instead of
+          # sending an empty password to the SQL below - this also
+          # covers the "file missing" case, because the container could
+          # not have started with a missing compose secret. Passwords
+          # reach the mariadb client via MYSQL_PWD passed by NAME only -
+          # never in argv, never printed.
           root_pw="$(docker exec "$DB_CONTAINER" cat /run/secrets/mariadb_root_password)"
           user_pw="$(docker exec "$DB_CONTAINER" cat /run/secrets/db_admin_password)"
           [ -n "$root_pw" ] || { echo "::error::could not read the MariaDB root password from ${DB_CONTAINER}:/run/secrets/mariadb_root_password (empty) - check the container is running and its compose secrets are mounted"; exit 1; }
@@ -520,6 +545,7 @@ jobs:
             echo "- Commit: ${GITHUB_SHA}"
             echo "- Trigger: ${GITHUB_EVENT_NAME}"
             echo "- Panel: https://${PANEL_DOMAIN:-unknown} (healthz HTTPS code: ${PANEL_HTTPS_CODE:-not checked})"
+            echo "- Agent: own-hpanel-agent container (Compose service; the only container holding the Docker socket - the panel never has it)"
             echo "- Database: dedicated panel-owned MariaDB (${DB_CONTAINER}) defined in compose.yaml, panel DB ${PANEL_DB_NAME:-hpanel_panel}; construction-mariadb is NOT used by the stack and must be unchanged (protected check)"
             echo "- Protected containers: IDs compared before/after (see artifact deploy-snapshots-${GITHUB_RUN_ID})"
             echo ""

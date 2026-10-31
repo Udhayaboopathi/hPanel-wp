@@ -7,19 +7,20 @@ Websites are independent containers + the stack's dedicated wordpress-mariadb; r
 ```bash
 cd hPanel-wp
 docker compose stop panel          # panel UI offline; sites unaffected
-systemctl stop own-hpanel-agent    # provisioning paused; sites unaffected
+docker compose stop agent          # provisioning paused; sites unaffected
 ```
 
 Full removal of panel-owned resources only (explicit, no prune):
 
 ```bash
 docker compose down                # removes the panel-owned containers of this
-                                   # stack only (panel + wordpress-mariadb);
-                                   # NOT the named volumes, NOT any other
-                                   # stack's containers, and NEVER the
-                                   # pre-existing production containers
-systemctl disable --now own-hpanel-agent
-rm /etc/systemd/system/own-hpanel-agent.service
+                                   # stack only (panel + agent +
+                                   # wordpress-mariadb); NOT the named volumes,
+                                   # NOT any other stack's containers, and
+                                   # NEVER the pre-existing production containers
+# (If you ever used the deprecated systemd unit instead of the compose
+# agent: systemctl disable --now own-hpanel-agent && rm
+# /etc/systemd/system/own-hpanel-agent.service.)
 # Data remains under /opt/own-hpanel and in the named volumes until you
 # deliberately delete them after taking a backup.
 ```

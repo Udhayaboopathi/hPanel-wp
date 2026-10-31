@@ -506,3 +506,102 @@ other privileged operation goes through a **one-shot Docker container**
   drift between deploys if the GitHub secret is rotated mid-cycle;
   the next deploy re-stages. The agent always reads the host file,
   so panel/agent credentials agree again after any deploy.
+
+## Zero-sudo redesign — agent becomes a Compose service (supersedes the scoped-sudo design)
+
+### What production taught us (the end of the sudo saga)
+
+The "proven forms" approach above did not hold. The NEXT real deploy
+(faa2e1d) failed again with `sudo: a password is required` — this time
+in a step whose sudo forms had been classified as proven. The runner's
+sudoers configuration accepts some command forms and prompts for
+others, and *which* forms prompt is not predictable from the
+repository: it changed as the workflow changed, because every step
+that touched sudo was a fresh gamble against an opaque allowlist.
+Iterating against it cost several deploy cycles.
+
+**Decision: eliminate sudo from the deploy workflow entirely.** The
+final `deploy.yml` contains zero sudo invocations (verified by grep,
+count 0, including comments). The workflow runs start to finish as the
+runner user, whose only privilege channel is Docker (docker group
+membership). Anything that previously needed root on the host is now
+done inside a one-shot `alpine:3.20` container with bind mounts.
+
+### Changes
+
+- **Agent is a Compose service** (`agent` in compose.yaml, container
+  `own-hpanel-agent`, image built from the Dockerfile `agent` target):
+  the ONLY service with `/var/run/docker.sock` mounted (with a loud
+  warning comment), plus `/run/own-hpanel` (shared socket dir with the
+  panel), the secrets dir read-only, and the websites/backups dirs.
+  Env mirrors the old systemd unit (socket path, token file, DB
+  container/host/port, common admin user + password file, Docker
+  socket, site/backup dirs). No Traefik labels, no published ports,
+  `panel-db` network only, 128 MB / 0.25 CPU, `cap_drop: ALL`,
+  `no-new-privileges`. It binds its socket with mode 0666 as before;
+  the token (0600 original in the secrets mount, 640 group-10001 copy
+  staged into `/run/own-hpanel` by the workflow) remains the auth gate.
+- **deploy.yml**: guard no longer exports or tests any escalation
+  mechanism; `write_pw` stages the DB password via a Docker one-shot
+  (runner temp file + container-side `install -m 600`); the whole
+  systemd step (host binary build, smoke test, unit install,
+  daemon-reload/enable/restart, socket polling via systemctl) is
+  deleted — the host "Test and build" step is now just `go test` +
+  `go vet`, since Compose builds both binaries; a new "Prepare host
+  state" step creates the bind-mounted host dirs and `/run/own-hpanel`
+  (755), generates the agent token and the MariaDB root password if
+  missing (both staged via one-shots), and stages the panel's token
+  copy — all before compose up; DEPLOY_DIR creation/ownership for the
+  rsync step uses a Docker one-shot when the directory is not
+  runner-writable; the ensure-DB step dropped its last host-file
+  existence checks (the `docker exec … cat /run/secrets/…` reads with
+  empty-checks already fail loudly and cover the missing-file case);
+  a new "Verify the agent container and its socket" step polls
+  `docker inspect` + `/proc/net/unix` for 30 s and prints the agent's
+  logs either way.
+- **deployment/own-hpanel-agent.service**: kept, but header-marked as a
+  DEPRECATED alternative (manual installs only; never together with
+  the compose agent — same socket path).
+- **deployment/install.sh**: the systemd install/enable/status block is
+  gone; the agent starts as part of `docker compose up`. bash -n clean.
+- **docs/CICD.md**: the scoped-sudo section is replaced by "Zero-sudo
+  deploys — the Docker-staging pattern" (history, pattern, the
+  agent-as-container rationale, and the standing rule: new privileged
+  operations get the Docker treatment, escalation is never
+  reintroduced); runner setup now requires only docker-group
+  membership; the deploy step list is rewritten (14 steps); rollback
+  uses `docker compose stop panel agent`. README/SECURITY/
+  DEPLOYMENT/RECOVERY got matching one-line corrections.
+
+### Why the privilege story is unchanged
+
+A Docker-socket holder is host-root equivalent whether it is a host
+process or a container — the old systemd agent ran as root for the
+same reason. Moving it into a container neither grants nor removes
+meaningful privilege; it removes the *deployment mechanics* that
+needed root on the host (copying a binary into /opt, installing a
+unit, restarting a service), because Compose manages the container
+through the Docker API the runner can already use. The containment
+that matters is unchanged: the agent has no network listener, serves
+only an authenticated Unix socket, `cap_drop: ALL`,
+`no-new-privileges`, an allowlist with full re-validation, and the
+production guard. The panel still never receives the Docker socket.
+
+### Honest notes / limitations
+
+- The systemd unit remains in the repo as a deprecated alternative;
+  it is exercised by neither CI nor the deploy workflow anymore, and
+  its sandboxing (ProtectSystem etc.) is not re-validated here.
+- The compose agent and the panel both mount the host
+  `/run/own-hpanel` directory; its creation/permissions are owned by
+  the workflow's "Prepare host state" step (a manual `install.sh
+  --apply` creates it as root, which also works). If the directory is
+  deleted while containers run, the socket disappears until the agent
+  container restarts — same failure mode as with the systemd
+  RuntimeDirectory, no worse.
+- As before, none of this could be run against a live Docker daemon in
+  this VM; validation is static (YAML parse, bash -n on all run
+  scripts, structural compose assertions, go test) plus the production
+  runs recorded above. The first zero-sudo production run is the real
+  end-to-end test, and it remains protected by the before/after
+  container-ID diff.

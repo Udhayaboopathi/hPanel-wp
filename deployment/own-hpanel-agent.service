@@ -1,3 +1,12 @@
+# DEPRECATED ALTERNATIVE - not used by the deploy workflow or install.sh.
+# The provisioning agent normally runs as the `agent` Docker Compose
+# service in compose.yaml (container own-hpanel-agent): the deploy was
+# redesigned to need no host privilege escalation at all, which a host
+# systemd service cannot offer (installing/restarting it needs root).
+# This unit remains only for manual installs that deliberately prefer a
+# host process. If you use it, do NOT also start the compose `agent`
+# service - both would try to bind /run/own-hpanel/agent.sock.
+
 [Unit]
 Description=Own hPanel provisioning agent (privileged, local socket only)
 After=docker.service

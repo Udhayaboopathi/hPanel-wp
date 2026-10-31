@@ -1,5 +1,6 @@
 # Own hPanel stack. Deploys ONLY panel-owned resources: the `own-hpanel`
-# panel container and the dedicated `wordpress-mariadb` database container.
+# panel container, the `own-hpanel-agent` provisioning-agent container and
+# the dedicated `wordpress-mariadb` database container.
 #
 # DATABASE: this stack runs its OWN MariaDB container (service
 # `wordpress-mariadb` below) - the image is pulled and the container is
@@ -23,9 +24,14 @@
 # the deploy (see the panel service comments) - the host secrets directory
 # is never mounted into the panel container.
 #
-# The provisioning agent runs on the host via systemd
-# (deployment/own-hpanel-agent.service) because it needs
-# /var/run/docker.sock + host paths - it is never exposed.
+# The provisioning agent is the `agent` service below: a container that
+# holds /var/run/docker.sock (the ONLY container that does) plus the host
+# site/backup directories, and serves the panel over a Unix socket in the
+# shared /run/own-hpanel directory. It is never network-exposed. (It used
+# to run as a host systemd service; the container form needs exactly the
+# same privilege - Docker socket access is host-root equivalent - and
+# lets the whole deploy run without any host privilege escalation. The
+# old unit is kept, deprecated, at deployment/own-hpanel-agent.service.)
 # Existing production containers are not referenced or modified here.
 services:
   wordpress-mariadb:
@@ -174,6 +180,69 @@ services:
       driver: json-file
       options: { max-size: "10m", max-file: "3" }
     # No published ports: Traefik routes all public traffic.
+
+  agent:
+    build:
+      context: .
+      target: agent
+    image: own-hpanel-agent:latest
+    container_name: own-hpanel-agent
+    restart: unless-stopped
+    environment:
+      AGENT_SOCKET: /run/own-hpanel/agent.sock
+      AGENT_TOKEN_FILE: /opt/own-hpanel/secrets/agent.token
+      # Dedicated MariaDB of this stack (see the wordpress-mariadb service
+      # above): the agent connects as the common admin user, execs the SQL
+      # client in that container only (via the Docker socket), and
+      # connects it to per-site networks. The external DB_HOST/PORT values
+      # describe the outside endpoint for status reporting; provisioning
+      # itself happens over the Docker socket, never over TCP.
+      DB_CONTAINER: wordpress-mariadb
+      DB_HOST: db.krwebsolution.com
+      DB_EXTERNAL_PORT: "3024"
+      DB_ADMIN_USER: ${DB_ADMIN_USER:-WordPress_common_DB}
+      # Password from a 0600 file in the read-only secrets mount below -
+      # never a unit/compose literal, never interpolated.
+      DB_ADMIN_PASSWORD_FILE: /opt/own-hpanel/secrets/db_admin_password.txt
+      DOCKER_SOCKET: /var/run/docker.sock
+      SITES_DIR: /opt/own-hpanel/websites
+      BACKUPS_DIR: /opt/own-hpanel/backups
+    volumes:
+      # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+      # !!! THE DOCKER SOCKET - AGENT ONLY !!!
+      # This mount gives the agent full control of the host's Docker
+      # daemon (equivalent to host root). It belongs to the agent service
+      # ONLY: NEVER add it to the panel service, to wordpress-mariadb, or
+      # to any WordPress site container. The panel talks to the agent
+      # over the authenticated Unix socket in /run/own-hpanel instead.
+      # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Shared socket directory: the agent binds agent.sock here; the
+      # panel mounts the same host directory and connects to it. The
+      # panel's copy of the agent token also lives here
+      # (/run/own-hpanel/agent.token, 640 root:10001, staged by the
+      # deploy workflow - the agent itself reads the original from the
+      # secrets mount below and never uses this copy).
+      - /run/own-hpanel:/run/own-hpanel
+      - /opt/own-hpanel/secrets:/opt/own-hpanel/secrets:ro
+      - /opt/own-hpanel/websites:/opt/own-hpanel/websites
+      - /opt/own-hpanel/backups:/opt/own-hpanel/backups
+    networks:
+      - panel-db
+    labels:
+      own-hpanel.managed: "true"
+      own-hpanel.component: "agent"
+    # No Traefik labels and no published ports: the agent is reachable
+    # ONLY through its Unix socket - it has no network listener at all.
+    mem_limit: 128m
+    cpus: 0.25
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
 
 networks:
   traefik:
