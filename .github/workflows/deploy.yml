@@ -3,7 +3,11 @@ name: Deploy Own hPanel
 # Production deployment. The self-hosted runner runs ON the target server
 # itself (see docs/CICD.md), so this workflow deploys locally on that host:
 # there are NO SSH steps and no SSH secrets. All configuration comes from
-# GitHub Secrets (repository or the `production` environment).
+# GitHub Secrets (repository or the `production` environment) - primarily
+# ONE secret, HPANEL_ENV, holding a whole .env-style blob; individual
+# secrets (PANEL_DOMAIN, DB_ADMIN_PASSWORD, ...) are the fallback. The DB
+# admin password is handled file-only: it never enters the compose .env,
+# because its `$` characters would be corrupted by Compose interpolation.
 #
 # Safety contract:
 #   - only panel-owned resources are created/updated (own-hpanel container,
@@ -84,12 +88,76 @@ jobs:
           [ "$((avail_kb / 1024))" -gt 5120 ] || { echo "::error::less than 5 GB free disk - aborting"; exit 1; }
           echo "Prerequisites OK: network, Traefik, shared MariaDB, >5 GB free disk"
 
-      - name: Resolve deploy directory
+      - name: Load configuration (HPANEL_ENV secret, or individual secrets)
         env:
-          DEPLOY_DIR_SECRET: ${{ secrets.DEPLOY_DIR }}
+          HPANEL_ENV: ${{ secrets.HPANEL_ENV }}
+          S_PANEL_DOMAIN: ${{ secrets.PANEL_DOMAIN }}
+          S_SERVER_IP: ${{ secrets.SERVER_IP }}
+          S_DB_HOST: ${{ secrets.DB_HOST }}
+          S_DB_EXTERNAL_PORT: ${{ secrets.DB_EXTERNAL_PORT }}
+          S_DB_ADMIN_USER: ${{ secrets.DB_ADMIN_USER }}
+          S_DB_ADMIN_PASSWORD: ${{ secrets.DB_ADMIN_PASSWORD }}
+          S_PANEL_DB_NAME: ${{ secrets.PANEL_DB_NAME }}
+          S_DEPLOY_DIR: ${{ secrets.DEPLOY_DIR }}
         run: |
           set -euo pipefail
-          dir="${DEPLOY_DIR_SECRET:-/opt/own-hpanel/app}"
+          # The DB admin password is FILE-ONLY: it is written straight to
+          # /opt/own-hpanel/secrets/db_admin_password.txt (0600) and never
+          # exported, never put in the compose .env (its `$` characters
+          # would be corrupted by Docker Compose interpolation) and never
+          # printed - only key NAMES are ever echoed.
+          pwfile=/opt/own-hpanel/secrets/db_admin_password.txt
+          write_pw() {
+            $SUDO install -d -m 750 /opt/own-hpanel/secrets
+            printf '%s' "$1" | $SUDO tee "$pwfile" >/dev/null
+            $SUDO chmod 600 "$pwfile"
+          }
+          if [ -n "${HPANEL_ENV:-}" ]; then
+            echo "HPANEL_ENV detected - parsing it (values are never printed)"
+            found=""
+            pw_found=""
+            while IFS= read -r line || [ -n "$line" ]; do
+              line="${line%$'\r'}"
+              case "$line" in ''|'#'*) continue ;; esac
+              case "$line" in *=*) ;; *) echo "::warning::ignoring a malformed HPANEL_ENV line (no '=' in it)"; continue ;; esac
+              key="${line%%=*}"
+              value="${line#*=}"
+              case "$key" in
+                PANEL_DOMAIN|SERVER_IP|DB_HOST|DB_EXTERNAL_PORT|DB_ADMIN_USER|PANEL_DB_NAME|DEPLOY_DIR)
+                  printf '%s=%s\n' "$key" "$value" >> "$GITHUB_ENV"
+                  found="${found} ${key}"
+                  ;;
+                DB_ADMIN_PASSWORD)
+                  write_pw "$value"
+                  pw_found=1
+                  found="${found} DB_ADMIN_PASSWORD(file-only)"
+                  ;;
+                *)
+                  echo "::warning::ignoring unknown HPANEL_ENV key: ${key}"
+                  ;;
+              esac
+            done <<< "$HPANEL_ENV"
+            echo "HPANEL_ENV keys loaded:${found}"
+            [ -n "$pw_found" ] || { echo "::error::HPANEL_ENV has no DB_ADMIN_PASSWORD line - the DB admin password is required"; exit 1; }
+          else
+            echo "HPANEL_ENV secret is empty - falling back to individual secrets"
+            [ -n "${S_DB_ADMIN_PASSWORD:-}" ] || { echo "::error::no DB admin password available: set the HPANEL_ENV secret (with a DB_ADMIN_PASSWORD= line) or the DB_ADMIN_PASSWORD secret"; exit 1; }
+            write_pw "$S_DB_ADMIN_PASSWORD"
+            if [ -n "${S_PANEL_DOMAIN:-}" ]; then echo "PANEL_DOMAIN=$S_PANEL_DOMAIN" >> "$GITHUB_ENV"; fi
+            if [ -n "${S_SERVER_IP:-}" ]; then echo "SERVER_IP=$S_SERVER_IP" >> "$GITHUB_ENV"; fi
+            if [ -n "${S_DB_HOST:-}" ]; then echo "DB_HOST=$S_DB_HOST" >> "$GITHUB_ENV"; fi
+            if [ -n "${S_DB_EXTERNAL_PORT:-}" ]; then echo "DB_EXTERNAL_PORT=$S_DB_EXTERNAL_PORT" >> "$GITHUB_ENV"; fi
+            if [ -n "${S_DB_ADMIN_USER:-}" ]; then echo "DB_ADMIN_USER=$S_DB_ADMIN_USER" >> "$GITHUB_ENV"; fi
+            if [ -n "${S_PANEL_DB_NAME:-}" ]; then echo "PANEL_DB_NAME=$S_PANEL_DB_NAME" >> "$GITHUB_ENV"; fi
+            if [ -n "${S_DEPLOY_DIR:-}" ]; then echo "DEPLOY_DIR=$S_DEPLOY_DIR" >> "$GITHUB_ENV"; fi
+            echo "individual secrets loaded; DB admin password written file-only"
+          fi
+          echo "DB admin password file ready at $pwfile (0600, value never printed)"
+
+      - name: Resolve deploy directory
+        run: |
+          set -euo pipefail
+          dir="${DEPLOY_DIR:-/opt/own-hpanel/app}"
           echo "DEPLOY_DIR=$dir" >> "$GITHUB_ENV"
           echo "Deploy directory: $dir"
 
@@ -104,35 +172,30 @@ jobs:
             "${GITHUB_WORKSPACE}/" "${DEPLOY_DIR}/"
           echo "Source synced to $DEPLOY_DIR (.env preserved - it is rewritten from Secrets in the next step)"
 
-      - name: Write .env from GitHub Secrets (never printed)
-        env:
-          PANEL_DOMAIN: ${{ secrets.PANEL_DOMAIN }}
-          SERVER_IP: ${{ secrets.SERVER_IP }}
-          DB_HOST: ${{ secrets.DB_HOST }}
-          DB_EXTERNAL_PORT: ${{ secrets.DB_EXTERNAL_PORT }}
-          DB_ADMIN_USER: ${{ secrets.DB_ADMIN_USER }}
-          DB_ADMIN_PASSWORD: ${{ secrets.DB_ADMIN_PASSWORD }}
-          PANEL_DB_NAME: ${{ secrets.PANEL_DB_NAME }}
+      - name: Write compose .env (never printed, NO DB password in it)
         run: |
           set -euo pipefail
-          [ -n "${PANEL_DOMAIN:-}" ] || { echo "::error::GitHub Secret PANEL_DOMAIN is empty - set it before deploying"; exit 1; }
-          [ -n "${DB_ADMIN_PASSWORD:-}" ] || { echo "::error::GitHub Secret DB_ADMIN_PASSWORD is empty - set it before deploying"; exit 1; }
+          # Values come from the "Load configuration" step ($GITHUB_ENV).
+          [ -n "${PANEL_DOMAIN:-}" ] || { echo "::error::PANEL_DOMAIN is not configured - set it in the HPANEL_ENV secret (PANEL_DOMAIN=...) or as an individual PANEL_DOMAIN secret"; exit 1; }
           cd "$DEPLOY_DIR"
           umask 077
+          # DB_ADMIN_PASSWORD is deliberately NOT written here, in either
+          # mode: the password contains `$`, which Docker Compose would
+          # interpolate/corrupt when reading .env. It exists only in
+          # /opt/own-hpanel/secrets/db_admin_password.txt (see compose.yaml:
+          # DB_ADMIN_PASSWORD_FILE + the read-only secrets mount).
           {
             printf 'PANEL_DOMAIN=%s\n' "$PANEL_DOMAIN"
             printf 'SERVER_IP=%s\n' "${SERVER_IP:-130.210.42.20}"
-            printf 'DB_CONTAINER=%s\n' "$DB_CONTAINER"
             printf 'DB_HOST=%s\n' "${DB_HOST:-db.krwebsolution.com}"
             printf 'DB_EXTERNAL_PORT=%s\n' "${DB_EXTERNAL_PORT:-3024}"
             printf 'DB_ADMIN_USER=%s\n' "${DB_ADMIN_USER:-WordPress_common_DB}"
-            printf 'DB_ADMIN_PASSWORD=%s\n' "$DB_ADMIN_PASSWORD"
-            printf 'PANEL_STORE_DRIVER=mysql\n'
             printf 'PANEL_DB_NAME=%s\n' "${PANEL_DB_NAME:-hpanel_panel}"
+            printf 'PANEL_STORE_DRIVER=mysql\n'
           } > .env.tmp
           mv .env.tmp .env
           chmod 600 .env
-          echo ".env written from Secrets (PANEL_DOMAIN=$PANEL_DOMAIN, DB host ${DB_HOST:-db.krwebsolution.com}:${DB_EXTERNAL_PORT:-3024}, password: ***)"
+          echo ".env written (keys: PANEL_DOMAIN SERVER_IP DB_HOST DB_EXTERNAL_PORT DB_ADMIN_USER PANEL_DB_NAME PANEL_STORE_DRIVER) - DB password intentionally excluded (file-only)"
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -151,11 +214,13 @@ jobs:
           CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "${RUNNER_TEMP}/hpanel-bin/panel" ./cmd/panel
           ls -lh "${RUNNER_TEMP}/hpanel-bin"
 
-      - name: Install agent binary, host secrets and systemd unit
-        env:
-          DB_ADMIN_PASSWORD: ${{ secrets.DB_ADMIN_PASSWORD }}
+      - name: Install agent binary and systemd unit
         run: |
           set -euo pipefail
+          # The DB admin password file was already written (0600) by the
+          # "Load configuration" step, before this step and before the
+          # ensure-panel-DB step - this step never handles the password.
+          $SUDO test -s /opt/own-hpanel/secrets/db_admin_password.txt || { echo "::error::DB admin password file is missing - the Load configuration step did not run or failed"; exit 1; }
           $SUDO install -d -m 750 /opt/own-hpanel/bin /opt/own-hpanel/secrets /opt/own-hpanel/websites /opt/own-hpanel/backups /opt/own-hpanel/logs
           $SUDO install -m 755 "${RUNNER_TEMP}/hpanel-bin/agent" /opt/own-hpanel/bin/agent
           # Agent token: generated once, never overwritten, never printed.
@@ -164,9 +229,6 @@ jobs:
             $SUDO chmod 600 /opt/own-hpanel/secrets/agent.token
             echo "agent token generated"
           fi
-          # Shared-DB admin password as a 0600 file for the agent (value never printed).
-          printf '%s' "$DB_ADMIN_PASSWORD" | $SUDO tee /opt/own-hpanel/secrets/db_admin_password.txt >/dev/null
-          $SUDO chmod 600 /opt/own-hpanel/secrets/db_admin_password.txt
           $SUDO install -m 644 "${DEPLOY_DIR}/deployment/own-hpanel-agent.service" /etc/systemd/system/own-hpanel-agent.service
           $SUDO systemctl daemon-reload
           $SUDO systemctl enable own-hpanel-agent >/dev/null
@@ -182,32 +244,41 @@ jobs:
           $SUDO chmod 640 /run/own-hpanel/agent.token
           echo "agent installed and running (panel-owned service only)"
 
-      - name: Ensure the panel database exists on the shared MariaDB
-        env:
-          DB_HOST: ${{ secrets.DB_HOST }}
-          DB_EXTERNAL_PORT: ${{ secrets.DB_EXTERNAL_PORT }}
-          DB_ADMIN_USER: ${{ secrets.DB_ADMIN_USER }}
-          DB_ADMIN_PASSWORD: ${{ secrets.DB_ADMIN_PASSWORD }}
-          PANEL_DB_NAME: ${{ secrets.PANEL_DB_NAME }}
+      - name: Ensure the panel database exists on the shared MariaDB (inside the DB container)
         run: |
           set -euo pipefail
-          host="${DB_HOST:-db.krwebsolution.com}"
-          port="${DB_EXTERNAL_PORT:-3024}"
           user="${DB_ADMIN_USER:-WordPress_common_DB}"
           dbname="${PANEL_DB_NAME:-hpanel_panel}"
-          # One-shot client container; MYSQL_PWD keeps the password out of argv.
-          if ! docker run --rm -e MYSQL_PWD="$DB_ADMIN_PASSWORD" mariadb:11.4 \
-                 mariadb -h "$host" -P "$port" -u "$user" \
-                 -e "CREATE DATABASE IF NOT EXISTS \`${dbname}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"; then
-            echo "::error::could not create database ${dbname} on ${host}:${port} as ${user}. The common DB account needs CREATE DATABASE privilege - or create the database manually as a privileged user, grant the common account ALL PRIVILEGES on ${dbname}.*, and re-run."
+          pwfile=/opt/own-hpanel/secrets/db_admin_password.txt
+          $SUDO test -s "$pwfile" || { echo "::error::DB admin password file $pwfile is missing/empty - the Load configuration step should have written it"; exit 1; }
+          # This check runs INSIDE the DB container via docker exec - it
+          # deliberately does NOT connect to the external DB endpoint:
+          # DB_HOST is Cloudflare-proxied (Cloudflare does not forward
+          # MariaDB TCP) and the host publishes a different port than the
+          # external one, so an external connection is unreliable by design.
+          # The password is loaded silently from the 0600 file (no echo, no
+          # set -x) and passed to docker exec by name only, never in argv.
+          MYSQL_PWD="$($SUDO cat "$pwfile")"
+          export MYSQL_PWD
+          if ! docker exec -e MYSQL_PWD "$DB_CONTAINER" mariadb -u"$user" \
+                 -e "CREATE DATABASE IF NOT EXISTS \`${dbname}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci; SELECT 1;" >/dev/null; then
+            echo "::error::could not create/use database ${dbname} inside container ${DB_CONTAINER} as ${user}. The common DB account needs privileges for this: it must be able to CREATE DATABASE (or the database must already exist) and to use it. Fix as a privileged user, e.g.: CREATE DATABASE IF NOT EXISTS ${dbname}; GRANT ALL PRIVILEGES ON ${dbname}.* TO '${user}'@'%'; - then re-run this workflow."
+            unset MYSQL_PWD
             exit 1
           fi
-          if ! docker run --rm -e MYSQL_PWD="$DB_ADMIN_PASSWORD" mariadb:11.4 \
-                 mariadb -h "$host" -P "$port" -u "$user" "$dbname" -e "SELECT 1;" >/dev/null; then
-            echo "::error::database ${dbname} exists but ${user} cannot use it. Grant it: GRANT ALL PRIVILEGES ON \`${dbname}\`.* TO '${user}'@'%'; (run as a privileged user), then re-run this workflow."
-            exit 1
+          unset MYSQL_PWD
+          echo "panel database ${dbname} exists and is usable by ${user} (verified inside ${DB_CONTAINER} via docker exec)"
+          # WARNING-ONLY: external endpoint reachability. The external
+          # endpoint exists for testing/admin access only - the panel and
+          # WordPress sites connect internally and do NOT use it, so a
+          # failure here never fails the deploy.
+          host="${DB_HOST:-db.krwebsolution.com}"
+          port="${DB_EXTERNAL_PORT:-3024}"
+          if timeout 3 bash -c "exec 3<>/dev/tcp/${host}/${port}" 2>/dev/null; then
+            echo "external DB endpoint ${host}:${port} is reachable over TCP (testing/admin access)"
+          else
+            echo "::warning::external DB endpoint ${host}:${port} is not reachable over TCP. Expected while the Cloudflare record for ${host} is Proxied (Cloudflare does not forward MariaDB traffic) or while the host publishes a different port. This does NOT affect the deploy, the panel, or the WordPress sites (they connect internally). For direct external MariaDB access, set the ${host} DNS record to DNS-only (grey cloud)."
           fi
-          echo "panel database ${dbname} exists and is usable by ${user}"
 
       - name: Build and start the panel container (panel-owned only)
         working-directory: ${{ env.DEPLOY_DIR }}
@@ -218,8 +289,9 @@ jobs:
           docker ps --filter 'name=own-hpanel' --format '{{.Names}} {{.Status}}'
 
       - name: Verify panel health
-        env:
-          PANEL_DOMAIN: ${{ secrets.PANEL_DOMAIN }}
+        # PANEL_DOMAIN comes from the Load configuration step ($GITHUB_ENV),
+        # not from an individual secret - do NOT re-add a secrets.* env here,
+        # it would shadow the parsed HPANEL_ENV value with an empty one.
         run: |
           set -euo pipefail
           healthy=""
@@ -281,6 +353,3 @@ jobs:
             echo ""
             echo "Rollback: re-run this workflow from a previous commit, or git revert + push. See docs/CICD.md."
           } >> "$GITHUB_STEP_SUMMARY"
-        env:
-          PANEL_DOMAIN: ${{ secrets.PANEL_DOMAIN }}
-          PANEL_DB_NAME: ${{ secrets.PANEL_DB_NAME }}

@@ -32,8 +32,11 @@ services:
       BACKUPS_DIR: /opt/own-hpanel/backups
       # Panel metadata store: the shared MariaDB (PANEL_STORE_DRIVER=mysql),
       # its own database PANEL_DB_NAME, via the external DB endpoint and the
-      # common admin account. The password arrives ONLY via the .env file
-      # (written by CI from GitHub Secrets, chmod 600) - never a literal here.
+      # common admin account. The password arrives ONLY as a file on the
+      # read-only secrets mount below - it is deliberately NOT passed via
+      # the .env file or a ${...} substitution: the password contains `$`,
+      # which Docker Compose would interpolate and corrupt (and the same
+      # applies to the .env file itself, so CI never writes it there).
       PANEL_STORE_DRIVER: ${PANEL_STORE_DRIVER:-mysql}
       PANEL_DB_NAME: ${PANEL_DB_NAME:-hpanel_panel}
       PANEL_STORE_DSN: ${PANEL_STORE_DSN:-}
@@ -41,11 +44,14 @@ services:
       DB_HOST: ${DB_HOST:-db.krwebsolution.com}
       DB_EXTERNAL_PORT: ${DB_EXTERNAL_PORT:-3024}
       DB_ADMIN_USER: ${DB_ADMIN_USER:-WordPress_common_DB}
-      DB_ADMIN_PASSWORD: ${DB_ADMIN_PASSWORD:?set DB_ADMIN_PASSWORD in .env (sourced from GitHub Secrets)}
+      DB_ADMIN_PASSWORD_FILE: /opt/own-hpanel/secrets/db_admin_password.txt
     volumes:
       - panel-data:/data
       # Agent socket directory (socket + token are provisioned by install.sh / CI).
       - /run/own-hpanel:/run/own-hpanel
+      # Host secrets (agent token is under /run; the DB admin password file
+      # lives here). Read-only: the panel never writes secrets.
+      - /opt/own-hpanel/secrets:/opt/own-hpanel/secrets:ro
       # Site files for the file manager and backup downloads. NOT the Docker socket.
       - /opt/own-hpanel/websites:/opt/own-hpanel/websites
       - /opt/own-hpanel/backups:/opt/own-hpanel/backups:ro

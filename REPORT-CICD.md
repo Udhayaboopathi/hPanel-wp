@@ -192,3 +192,115 @@ in the tree** — the DB credential exists only as secret/env *names*
    requires giving the panel an internal DB route.
 5. Pinned image tags and the full live provisioning path remain
    unverified against a real Docker host, exactly as in REPORT.md.
+
+## HPANEL_ENV + internal-DB fix (2026-10-31)
+
+Follow-up to match how the GitHub repo was actually configured: all values
+live in ONE repository secret, `HPANEL_ENV` (a whole `.env` blob), the
+individual secrets do not exist, and the external DB endpoint
+`db.krwebsolution.com` is Cloudflare-proxied while the host publishes a
+different port — so no deploy step may depend on external DB TCP.
+
+### Changes
+
+- **`.github/workflows/deploy.yml`**
+  - New early step **"Load configuration (HPANEL_ENV secret, or individual
+    secrets)"** (after checkout/prerequisites, before the compose `.env`
+    write). Blob mode: each line is split on the **first** `=` only
+    (values may contain `$`, `=`, `)`, `+`); known keys
+    (`PANEL_DOMAIN`, `SERVER_IP`, `DB_HOST`, `DB_EXTERNAL_PORT`,
+    `DB_ADMIN_USER`, `PANEL_DB_NAME`, `DEPLOY_DIR`) are exported via
+    `$GITHUB_ENV`; unknown keys and malformed lines warn and are skipped;
+    only key **names** are printed. `DB_ADMIN_PASSWORD` is handled
+    file-only: `printf '%s'` into
+    `/opt/own-hpanel/secrets/db_admin_password.txt` (`install -d` + sudo,
+    chmod 600) — never exported, never echoed. A blob without a password
+    line fails the step with a clear error.
+  - Fallback mode (empty `HPANEL_ENV`): the same known keys are exported
+    from individual secrets and the password file is written from
+    `secrets.DB_ADMIN_PASSWORD`; if neither source has a password the
+    step fails naming both options.
+  - **Step order:** the password file is written in the load step — before
+    the agent install/restart step and before the ensure-panel-DB step.
+    The agent step no longer handles the password at all (it only asserts
+    the file exists) — its now-obsolete `secrets.DB_ADMIN_PASSWORD`
+    write was removed.
+  - **Compose `.env` write:** no longer contains `DB_ADMIN_PASSWORD` (nor
+    `DB_CONTAINER`, which compose defaults). It contains exactly:
+    `PANEL_DOMAIN`, `SERVER_IP` (default `130.210.42.20`), `DB_HOST`,
+    `DB_EXTERNAL_PORT`, `DB_ADMIN_USER`, `PANEL_DB_NAME`,
+    `PANEL_STORE_DRIVER=mysql`.
+  - **Ensure-panel-DB step:** the external one-shot client containers
+    (`docker run … mariadb -h $DB_HOST -P $DB_EXTERNAL_PORT`) were
+    replaced by `docker exec -e MYSQL_PWD $DB_CONTAINER mariadb -u… -e
+    "CREATE DATABASE IF NOT EXISTS …; SELECT 1;"`. `MYSQL_PWD` is loaded
+    silently from the 0600 password file (command substitution, no echo,
+    no `set -x`; passed to `docker exec` by name, not in argv). Failure
+    prints the actionable privilege/GRANT error and fails the step. A new
+    **warning-only** external reachability check (`timeout 3` `/dev/tcp`
+    to `DB_HOST:DB_EXTERNAL_PORT`) explains that external exposure is for
+    testing/admin only and never fails the deploy.
+  - The `Verify panel health` and `Deploy summary` steps dropped their
+    `secrets.*` `env:` blocks for `PANEL_DOMAIN`/`PANEL_DB_NAME` — those
+    secrets do not exist in this setup and an empty `env:` value would
+    have shadowed the parsed `HPANEL_ENV` values from `$GITHUB_ENV`.
+  - No panel domain is hardcoded anywhere in the workflow; it comes from
+    the secret. The unused `SERVER_IP`/`SERVER_USERNAME`/`SEVER_KEY`
+    repository secrets are not referenced (no SSH by design).
+- **`compose.yaml`** — panel service: `DB_ADMIN_PASSWORD: ${...}` removed;
+  now `DB_ADMIN_PASSWORD_FILE: /opt/own-hpanel/secrets/db_admin_password.txt`
+  plus a read-only volume `/opt/own-hpanel/secrets:/opt/own-hpanel/secrets:ro`.
+  Panel code path verified: `cmd/panel` `openStore` (mysql) builds its DSN
+  from `internal/dbconfig.FromEnv()`, which reads `DB_ADMIN_PASSWORD_FILE`
+  before any env var — so the file-only password reaches the panel store
+  unchanged (no Compose interpolation anywhere on the path). Everything
+  else in compose is identical.
+- **`docs/CICD.md`** — secrets section rewritten: primary = single
+  `HPANEL_ENV` secret with the exact key template (placeholder password);
+  file-only password handling and the `$`-interpolation rationale;
+  individual-secrets fallback; explicit note that
+  `SERVER_IP`/`SERVER_USERNAME`/`SEVER_KEY` secrets are unused; new
+  Cloudflare notes (panel record Proxied is fine, use Full (strict) once
+  the origin cert exists; the DB record must be DNS-only for direct
+  MariaDB TCP because Cloudflare does not forward it; internal panel/site
+  traffic does not use that record); "What a deploy does" list updated to
+  the new step order and the docker-exec DB check.
+
+### Validation (actual runs in this VM, fake values only)
+
+- `python3` PyYAML parse: `deploy.yml`, `ci.yml`, `compose.yaml` — all OK.
+- `bash -n` on every embedded `run:` script (after `${{ }}` substitution):
+  **20 scripts, all clean** (14 deploy + 6 CI).
+- **Functional parsing test** — the workflow's own extracted "Load
+  configuration" and "Write compose .env" scripts were executed locally
+  against a FAKE blob whose dummy password contains `$`, `=`, `)` and
+  `+`:
+  - password file content matches the fake password **byte-for-byte**,
+    mode `600`;
+  - `PANEL_DOMAIN` and `DEPLOY_DIR` parsed correctly into `$GITHUB_ENV`;
+    unknown key ignored with a warning;
+  - generated compose `.env` contains the correct `PANEL_DOMAIN`,
+    `PANEL_STORE_DRIVER=mysql`, default `SERVER_IP`, and **no
+    `DB_ADMIN_PASSWORD` key and no password value**;
+  - fallback mode (empty blob + individual secret) also verified:
+    password file byte-for-byte, `PANEL_DOMAIN` exported.
+  Result: **ALL PARSING TESTS PASSED** (both modes).
+- `go test ./...` — all packages pass (Go code untouched by this fix);
+  `go vet ./...` and `go vet -tags integration ./...` clean.
+- Tree scanned: no real password or token string anywhere; the
+  only password-like strings are the previously documented placeholders
+  in examples/docs and the run-time fake values used in /tmp test files
+  (outside the tree; the local test password file under /opt was removed
+  after the test).
+
+### Limitations / unchanged risks
+
+- The docker-exec DB check, agent restart and compose bring-up still
+  cannot be exercised in this VM (no Docker); they are validated by
+  YAML/bash syntax checks and the parsing test only. First real run is
+  still the production runner — the workflow's guard + before/after
+  protected-container diff remain the safety net.
+- The panel's own MySQL store connection at runtime still uses
+  `DB_HOST:DB_EXTERNAL_PORT` (documented in the previous section); this
+  fix only changed how the *deploy* verifies/creates the panel database
+  and how the password is delivered, per scope.
