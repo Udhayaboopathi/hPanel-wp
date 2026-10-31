@@ -1,0 +1,28 @@
+[Unit]
+Description=Own hPanel provisioning agent (privileged, local socket only)
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+ExecStart=/opt/own-hpanel/bin/agent
+Environment=AGENT_SOCKET=/run/own-hpanel/agent.sock
+Environment=AGENT_TOKEN_FILE=/opt/own-hpanel/secrets/agent.token
+Environment=AGENT_MARIADB_ROOT_PASSWORD_FILE=/opt/own-hpanel/secrets/mariadb_root_password.txt
+Environment=DOCKER_SOCKET=/var/run/docker.sock
+Environment=SITES_DIR=/opt/own-hpanel/websites
+Environment=BACKUPS_DIR=/opt/own-hpanel/backups
+RuntimeDirectory=own-hpanel
+RuntimeDirectoryMode=0750
+Restart=on-failure
+RestartSec=3
+# The agent is host-privileged by necessity (Docker access). It is confined
+# as far as systemd allows without breaking Docker socket access, listens
+# only on a Unix socket, and validates an allowlist of operations.
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/own-hpanel /run/own-hpanel
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

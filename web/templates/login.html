@@ -1,0 +1,11 @@
+{{template "header" .}}
+<section class="card auth-card">
+<h1>Login to Own hPanel</h1>
+<form method="post" action="/login">
+  <label>Username <input name="username" required autocomplete="username" autofocus></label>
+  <label>Password <input name="password" type="password" required autocomplete="current-password"></label>
+  <button class="btn primary big" type="submit">Login</button>
+</form>
+<p class="muted">Lost your authenticator? <a href="/login/recover">Use a recovery code</a>.</p>
+</section>
+{{template "footer" .}}

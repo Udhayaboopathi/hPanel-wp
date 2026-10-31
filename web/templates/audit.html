@@ -1,0 +1,9 @@
+{{template "header" .}}
+<h1>Audit Logs</h1>
+<p class="muted">Security-sensitive actions are recorded here. Secrets are redacted and never appear in audit entries.</p>
+{{if .Data.Entries}}<table><thead><tr><th>When</th><th>Admin</th><th>Action</th><th>Target</th><th>Detail</th><th>IP</th></tr></thead><tbody>
+{{range .Data.Entries}}<tr><td>{{since .CreatedAt}}</td><td>{{.AdminID}}</td><td>{{.Action}}</td><td>{{.Target}}</td><td>{{.Detail}}</td><td>{{.IP}}</td></tr>{{end}}
+</tbody></table>
+{{if gt .Data.Page 1}}<a href="/audit?page={{sub .Data.Page 1}}">← Prev</a>{{end}} <a href="/audit?page={{add .Data.Page 1}}">Next →</a>
+{{else}}<section class="card"><p class="muted">No audit entries yet.</p></section>{{end}}
+{{template "footer" .}}

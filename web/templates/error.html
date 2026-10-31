@@ -1,0 +1,7 @@
+{{template "header" .}}
+<section class="card">
+<h1>{{.Title}}</h1>
+<p>{{if .Error}}{{.Error}}{{else}}Something went wrong.{{end}}</p>
+<p><a class="btn" href="/">Back to dashboard</a></p>
+</section>
+{{template "footer" .}}

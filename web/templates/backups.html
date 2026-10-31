@@ -1,0 +1,7 @@
+{{template "header" .}}
+<h1>Backups</h1>
+{{if .Data}}<table><thead><tr><th>Site</th><th>File</th><th>Size</th><th>Status</th><th>Storage</th><th>Created</th><th></th></tr></thead><tbody>
+{{range .Data}}<tr><td>{{.SiteID}}</td><td>{{.Filename}}</td><td>{{humanBytes .SizeBytes}}</td><td><span class="badge">{{.Status}}</span></td><td>{{.Storage}}</td><td>{{since .CreatedAt}}</td>
+<td>{{if eq .Status "ready"}}<a class="btn small" href="/websites/{{.SiteID}}?tab=backups">Manage / download / restore</a>{{end}}</td></tr>{{end}}
+</tbody></table>{{else}}<section class="card"><p class="muted">No backups yet. Open a website and choose Backup.</p></section>{{end}}
+{{template "footer" .}}

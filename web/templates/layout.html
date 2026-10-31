@@ -1,0 +1,40 @@
+{{define "header"}}<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{.Title}} · Own hPanel</title>
+<link rel="stylesheet" href="/static/app.css">
+<script src="/static/htmx.min.js" defer></script>
+<script src="/static/app.js" defer></script>
+</head>
+<body>
+{{if .Admin}}
+<header class="topbar">
+  <a class="brand" href="/">Own <strong>hPanel</strong></a>
+  <nav>
+    <a href="/">Dashboard</a><a href="/websites">Websites</a><a href="/jobs">Jobs</a>
+    <a href="/backups">Backups</a><a href="/monitoring">Monitoring</a><a href="/audit">Audit</a>
+    <a href="/settings">Settings</a><a href="/account">Account</a>
+  </nav>
+  <span class="spacer"></span>
+  <button type="button" class="btn small" data-theme-toggle>🌙 / ☀️</button>
+  <span class="muted">{{.Admin.Username}}</span>
+  <form method="post" action="/logout" class="inline"><input type="hidden" name="csrf_token" value="{{.CSRF}}"><button class="btn small" type="submit">Logout</button></form>
+</header>
+<main class="wrap">
+{{if .Flash}}<div class="flash">{{.Flash}}</div>{{end}}
+{{if .Error}}<div class="error-box">{{.Error}}</div>{{end}}
+{{else}}
+<main class="wrap auth-wrap">
+{{if .Flash}}<div class="flash">{{.Flash}}</div>{{end}}
+{{if .Error}}<div class="error-box">{{.Error}}</div>{{end}}
+{{end}}
+{{end}}
+
+{{define "footer"}}</main>
+<footer class="foot muted">Own hPanel · self-hosted WordPress control panel · all metrics on this page are read from the live system</footer>
+</body>
+</html>{{end}}
+
+{{define "csrf"}}<input type="hidden" name="csrf_token" value="{{.}}">{{end}}

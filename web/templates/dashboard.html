@@ -1,0 +1,25 @@
+{{template "header" .}}
+{{$d := .Data}}
+<div class="row-between"><h1>Dashboard</h1><a class="btn primary big" href="/websites/new">+ Create New WordPress Site</a></div>
+{{range $d.Alerts}}<div class="error-box">⚠ {{.}}</div>{{end}}
+<section class="grid">
+  <div class="card stat"><span class="muted">Total websites</span><strong>{{$d.Total}}</strong></div>
+  <div class="card stat"><span class="muted">Running</span><strong>{{$d.Running}}</strong></div>
+  <div class="card stat"><span class="muted">Stopped</span><strong>{{$d.Stopped}}</strong></div>
+  <div class="card stat"><span class="muted">Failed</span><strong>{{$d.Failed}}</strong></div>
+  <div class="card stat"><span class="muted">CPU usage</span><strong id="m-cpu">{{printf "%.0f" $d.Host.CPUPercent}}%</strong></div>
+  <div class="card stat"><span class="muted">RAM used / total</span><strong id="m-mem">{{humanBytes $d.Host.MemUsed}} / {{humanBytes $d.Host.MemTotal}}</strong></div>
+  <div class="card stat"><span class="muted">RAM available</span><strong>{{humanBytes $d.Host.MemAvail}}</strong></div>
+  <div class="card stat"><span class="muted">Disk used / total</span><strong id="m-disk">{{humanBytes $d.Host.DiskUsed}} / {{humanBytes $d.Host.DiskTotal}}</strong></div>
+  <div class="card stat"><span class="muted">Disk free</span><strong>{{humanBytes $d.Host.DiskFree}}</strong></div>
+  <div class="card stat"><span class="muted">Load (1m)</span><strong>{{printf "%.2f" $d.Host.Load1}}</strong></div>
+  <div class="card stat"><span class="muted">Provisioning agent</span><strong>{{if $d.AgentUp}}Connected{{else}}Not available — provisioning is paused{{end}}</strong></div>
+  <div class="card stat"><span class="muted">Verified backups</span><strong>{{$d.BackupCount}}</strong></div>
+</section>
+<p class="muted">Database (shared wordpress-mariadb) and Traefik status are verified by the provisioning agent during site operations and shown on each website page; the panel itself has no Docker access, so it never guesses these.</p>
+<section class="card">
+<h2>Recent deployment activity</h2>
+{{if $d.Recent}}<ul class="events">{{range $d.Recent}}<li><span class="muted">{{since .CreatedAt}}</span> <span class="badge {{.Level}}">{{.Level}}</span> {{.Message}} <a href="/jobs/{{.JobID}}">job</a></li>{{end}}</ul>
+{{else}}<p class="muted">No deployments yet. Create your first WordPress site to get started.</p>{{end}}
+</section>
+{{template "footer" .}}

@@ -1,0 +1,52 @@
+{{template "header" .}}
+<h1>Create New WordPress Site</h1>
+<p class="muted">Three steps. Creating the site really provisions the container, database, storage and Traefik route — nothing here is a mock-up.</p>
+<form method="post" action="/websites/create" id="create-form">
+{{template "csrf" .CSRF}}
+<div class="wizard-step" data-step="1">
+<h2>Step 1 — Basic information</h2>
+<label>Website Domain * <input name="domain" id="f-domain" required placeholder="example.com"></label>
+<label>Website Title <input name="title" id="f-title" placeholder="Defaults to the domain"></label>
+<label>WordPress Database Name <span class="muted">(optional — generated automatically, must be unique)</span> <input name="db_name" id="f-dbname" placeholder="auto"></label>
+<label>WordPress Admin Username * <input name="admin_user" id="f-adminuser" required value="admin"> <span class="muted">Tip: a less predictable username is safer than “admin”.</span></label>
+<label>WordPress Admin Email * <input name="admin_email" id="f-adminemail" type="email" required></label>
+<label>WordPress Admin Password *
+  <span class="row"><input name="admin_password" id="f-adminpw" type="password" required minlength="12">
+  <button type="button" class="btn" data-generate-pw="#f-adminpw">Generate Secure Password</button>
+  <button type="button" class="btn" data-toggle-pw="#f-adminpw">Show/Hide</button></span>
+</label>
+<label>WordPress Admin Domain <input name="admin_domain" id="f-admindomain" placeholder="wpadmin.example.com">
+<span class="muted">Redirect-only: it sends visitors to <code>https://your-domain/wp-admin/</code>. The WordPress login is not hosted on a separate hostname in v1 (avoids cookie/redirect problems).</span></label>
+<label>PHP Version
+  <select name="php_version" id="f-php"><option value="8.3" selected>PHP 8.3 (WordPress 6.7.2, verified)</option><option value="8.2">PHP 8.2 (WordPress 6.7.2, verified)</option></select>
+</label>
+<label>Resource Profile
+  <select name="resource_profile" id="f-profile"><option value="lightweight" selected>Lightweight — 0.5 CPU, 512 MB RAM</option><option value="standard">Standard — 1 CPU, 768 MB RAM</option><option value="custom">Custom</option></select>
+</label>
+<div id="custom-resources" hidden>
+  <label>CPU limit (0.1 – 4) <input name="cpu_limit" type="number" step="0.1" min="0.1" max="4" value="0.5"></label>
+  <label>Memory limit MB (256 – 4096) <input name="mem_limit_mb" type="number" min="256" max="4096" value="512"></label>
+</div>
+<button type="button" class="btn primary" data-next-step="2">Continue to preview →</button>
+</div>
+
+<div class="wizard-step" data-step="2" hidden>
+<h2>Step 2 — Preview</h2>
+<div id="preview-box" class="card"><p class="muted">Fill in step 1, then return here — the preview is validated by the server.</p></div>
+<h3>Required Cloudflare DNS records (manual, DNS-only recommended at first)</h3>
+<pre id="dns-records">Type: A    Name: @        Value: {{.ServerIP}}
+Type: A    Name: wpadmin  Value: {{.ServerIP}}</pre>
+<button type="button" class="btn" data-copy="#dns-records">Copy DNS Records</button>
+<p class="muted">Point DNS only when ready: the site is installed locally first and shows “DNS Pending” until these records resolve.</p>
+<button type="button" class="btn" data-next-step="1">← Back</button>
+<button type="button" class="btn primary" data-next-step="3">Continue →</button>
+</div>
+
+<div class="wizard-step" data-step="3" hidden>
+<h2>Step 3 — Create website</h2>
+<p>This will create the database and user, per-site network, persistent storage, WordPress container, Traefik route and then install WordPress with WP-CLI. Progress is tracked as a durable job — if the panel restarts, the job is marked interrupted instead of being lost silently.</p>
+<button type="button" class="btn" data-next-step="2">← Back</button>
+<button class="btn primary big" type="submit">Create WordPress Website</button>
+</div>
+</form>
+{{template "footer" .}}

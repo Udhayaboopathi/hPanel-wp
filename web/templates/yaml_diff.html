@@ -1,0 +1,10 @@
+{{template "header" .}}
+<h1>Configuration change preview</h1>
+<section class="card">
+<p>The new configuration passed policy validation and was saved as a new version for <strong>{{.Data.Site.Domain}}</strong>. Nothing has been applied yet.</p>
+<pre class="diff">{{.Data.Diff}}</pre>
+<form method="post" action="/websites/{{.Data.Site.SiteID}}/apply-config">{{template "csrf" .CSRF}}
+<button class="btn primary" type="submit" data-confirm="Apply this configuration and rebuild the site's container?">Apply Configuration</button>
+<a class="btn" href="/websites/{{.Data.Site.SiteID}}?tab=yaml">Back to YAML editor</a></form>
+</section>
+{{template "footer" .}}

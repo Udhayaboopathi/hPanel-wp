@@ -1,0 +1,22 @@
+{{template "header" .}}
+{{$d := .Data}}{{$h := $d.Host}}
+<h1>Resource Monitoring</h1>
+{{range $d.Alerts}}<div class="error-box">⚠ {{.}}</div>{{end}}
+<section class="grid">
+<div class="card stat"><span class="muted">CPU</span><strong>{{printf "%.1f" $h.CPUPercent}}%</strong></div>
+<div class="card stat"><span class="muted">RAM used</span><strong>{{humanBytes $h.MemUsed}} / {{humanBytes $h.MemTotal}}</strong></div>
+<div class="card stat"><span class="muted">RAM available</span><strong>{{humanBytes $h.MemAvail}}</strong></div>
+<div class="card stat"><span class="muted">Disk used</span><strong>{{humanBytes $h.DiskUsed}} / {{humanBytes $h.DiskTotal}}</strong></div>
+<div class="card stat"><span class="muted">Disk free</span><strong>{{humanBytes $h.DiskFree}}</strong></div>
+<div class="card stat"><span class="muted">Load (1m)</span><strong>{{printf "%.2f" $h.Load1}}</strong></div>
+<div class="card stat"><span class="muted">Uptime</span><strong>{{$h.UptimeSec}}s</strong></div>
+<div class="card stat"><span class="muted">Agent</span><strong>{{if $d.AgentUp}}connected{{else}}not available{{end}}</strong></div>
+</section>
+<section class="card"><h2>Websites</h2>
+<table><thead><tr><th>Site</th><th>Status</th><th>Configured CPU max</th><th>Configured RAM max</th></tr></thead><tbody>
+{{range $d.Sites}}<tr><td>{{.Domain}} <span class="muted">({{.SiteID}})</span></td><td><span class="badge status-{{.Status}}">{{.Status}}</span></td><td>{{printf "%.2f" .CPULimit}}</td><td>{{.MemLimitMB}} MB</td></tr>{{end}}
+</tbody></table>
+<h3>Live per-container stats (from the provisioning agent)</h3>
+{{if $d.Discovery}}<pre>{{$d.Discovery}}</pre>{{else}}<p class="muted">Unavailable — the provisioning agent is not connected, so no container statistics are shown rather than invented.</p>{{end}}
+</section>
+{{template "footer" .}}

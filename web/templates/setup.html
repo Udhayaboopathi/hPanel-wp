@@ -1,0 +1,14 @@
+{{template "header" .}}
+<section class="card auth-card">
+<h1>First-run setup</h1>
+<p class="muted">Create the single administrator account. There is no public registration.</p>
+<form method="post" action="/setup">
+  <label>Username <input name="username" required autocomplete="username"></label>
+  <label>Email <input name="email" type="email" required autocomplete="email"></label>
+  <label>Password (min. 10 characters) <input name="password" type="password" required autocomplete="new-password"></label>
+  <label>Confirm password <input name="password_confirm" type="password" required autocomplete="new-password"></label>
+  <label class="check"><input type="checkbox" name="enable_totp" value="1" checked> Enable two-factor authentication (TOTP)</label>
+  <button class="btn primary big" type="submit">Create administrator</button>
+</form>
+</section>
+{{template "footer" .}}

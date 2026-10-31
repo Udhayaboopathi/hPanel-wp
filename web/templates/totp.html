@@ -1,0 +1,10 @@
+{{template "header" .}}
+<section class="card auth-card">
+<h1>Two-factor authentication</h1>
+<form method="post" action="/login/totp">
+  <label>6-digit code <input name="code" inputmode="numeric" autocomplete="one-time-code" required autofocus></label>
+  <button class="btn primary big" type="submit">Verify</button>
+</form>
+<p class="muted"><a href="/login/recover">Use a recovery code instead</a></p>
+</section>
+{{template "footer" .}}

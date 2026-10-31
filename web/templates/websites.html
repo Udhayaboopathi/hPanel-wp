@@ -1,0 +1,37 @@
+{{template "header" .}}
+{{$d := .Data}}
+<div class="row-between"><h1>Websites</h1><a class="btn primary big" href="/websites/new">+ Create New WordPress Site</a></div>
+<form method="get" action="/websites" class="toolbar">
+  <input name="q" value="{{$d.Q}}" placeholder="Search domain, name or site id">
+  <select name="status">
+    <option value="all">All statuses</option>
+    {{range $s := list "ready" "dns_pending" "provisioning" "installing" "stopped" "failed" "deleting"}}<option value="{{$s}}" {{if eq $d.Status $s}}selected{{end}}>{{$s}}</option>{{end}}
+  </select>
+  <select name="sort"><option value="">Newest first</option><option value="domain">Domain A–Z</option></select>
+  <button class="btn" type="submit">Filter</button>
+</form>
+{{if $d.Sites}}
+<table>
+<thead><tr><th>Website</th><th>Domain</th><th>WordPress</th><th>PHP</th><th>Status</th><th>Database</th><th>Resources</th><th>Actions</th></tr></thead>
+<tbody>
+{{range $d.Sites}}
+<tr>
+  <td>{{if .Name}}{{.Name}}{{else}}{{.SiteID}}{{end}}<br><span class="muted">{{.SiteID}}</span></td>
+  <td>{{.Domain}}</td><td>{{if .WPVersion}}{{.WPVersion}}{{else}}—{{end}}</td><td>{{.PHPVersion}}</td>
+  <td><span class="badge status-{{.Status}}">{{.Status}}</span></td>
+  <td>{{.DBName}}</td><td>{{printf "%.2f" .CPULimit}} CPU · {{.MemLimitMB}} MB</td>
+  <td class="actions">
+    <a class="btn small" href="https://{{.Domain}}" target="_blank" rel="noopener">Open Website</a>
+    <a class="btn small" href="https://{{.Domain}}/wp-admin/" target="_blank" rel="noopener">Open Admin</a>
+    <a class="btn small" href="/websites/{{.SiteID}}">Manage</a>
+    <form method="post" action="/websites/{{.SiteID}}/restart" class="inline">{{template "csrf" $.CSRF}}<button class="btn small" type="submit">Restart</button></form>
+    <form method="post" action="/websites/{{.SiteID}}/backup" class="inline">{{template "csrf" $.CSRF}}<button class="btn small" type="submit">Backup</button></form>
+  </td>
+</tr>
+{{end}}
+</tbody></table>
+<p class="muted">Page {{$d.Page}} of {{if $d.Pages}}{{$d.Pages}}{{else}}1{{end}} · {{$d.Total}} websites
+{{if gt $d.Page 1}}<a href="/websites?page={{sub $d.Page 1}}&q={{$d.Q}}&status={{$d.Status}}">← Prev</a>{{end}}
+{{if lt $d.Page $d.Pages}}<a href="/websites?page={{add $d.Page 1}}&q={{$d.Q}}&status={{$d.Status}}">Next →</a>{{end}}</p>
+{{else}}<section class="card"><p>No websites found. <a href="/websites/new">Create your first WordPress site</a>.</p></section>{{end}}
+{{template "footer" .}}

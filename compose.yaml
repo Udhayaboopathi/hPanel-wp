@@ -1,0 +1,123 @@
+# Own hPanel stack. Deploys ONLY panel-owned resources:
+#   wordpress-mariadb (new, dedicated), own-hpanel (panel UI)
+# The provisioning agent runs on the host via systemd (deployment/agent.service)
+# because it needs /var/run/docker.sock + host paths - it is never exposed.
+# Existing production containers are not referenced or modified here.
+services:
+  wordpress-mariadb:
+    image: mariadb:11.4
+    container_name: wordpress-mariadb
+    restart: unless-stopped
+    environment:
+      MARIADB_ROOT_PASSWORD_FILE: /run/secrets/mariadb_root_password
+    secrets:
+      - mariadb_root_password
+    command:
+      - --innodb-buffer-pool-size=256M
+      - --max-connections=100
+      - --skip-name-resolve
+    volumes:
+      - wordpress-mariadb-data:/var/lib/mysql
+    networks:
+      - panel-db
+    labels:
+      own-hpanel.managed: "true"
+      own-hpanel.component: "mariadb"
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    mem_limit: 512m
+    cpus: 0.50
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+    # No published ports: MariaDB is reachable only on Docker networks.
+
+  panel:
+    build:
+      context: .
+      target: panel
+    image: own-hpanel:latest
+    container_name: own-hpanel
+    restart: unless-stopped
+    environment:
+      PANEL_ADDR: ":8080"
+      PANEL_DATA_DIR: /data
+      PANEL_DOMAIN: ${PANEL_DOMAIN:?set PANEL_DOMAIN in .env}
+      PANEL_SECURE_COOKIES: "true"
+      SERVER_IP: ${SERVER_IP:-130.210.42.20}
+      AGENT_SOCKET: /run/own-hpanel/agent.sock
+      AGENT_TOKEN_FILE: /run/own-hpanel/agent.token
+      SITES_DIR: /opt/own-hpanel/websites
+      BACKUPS_DIR: /opt/own-hpanel/backups
+    volumes:
+      - panel-data:/data
+      # Agent socket directory (socket + token are provisioned by install.sh).
+      - /run/own-hpanel:/run/own-hpanel
+      # Site files for the file manager and backup downloads. NOT the Docker socket.
+      - /opt/own-hpanel/websites:/opt/own-hpanel/websites
+      - /opt/own-hpanel/backups:/opt/own-hpanel/backups:ro
+    networks:
+      - traefik
+    labels:
+      own-hpanel.managed: "true"
+      own-hpanel.component: "panel"
+      traefik.enable: "true"
+      traefik.docker.network: "redberyl-internal"
+      traefik.http.routers.own-hpanel.rule: "Host(`${PANEL_DOMAIN:?set PANEL_DOMAIN}`)"
+      traefik.http.routers.own-hpanel.entrypoints: "websecure"
+      traefik.http.routers.own-hpanel.tls: "true"
+      traefik.http.routers.own-hpanel.tls.certresolver: "letsencrypt"
+      traefik.http.routers.own-hpanel.service: "own-hpanel"
+      traefik.http.services.own-hpanel.loadbalancer.server.port: "8080"
+    mem_limit: 256m
+    mem_reservation: 64m
+    cpus: 0.50
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+    # No published ports: Traefik routes all public traffic.
+
+networks:
+  traefik:
+    name: redberyl-internal
+    external: true
+  panel-db:
+    name: own-hpanel-db
+    labels:
+      own-hpanel.managed: "true"
+
+volumes:
+  wordpress-mariadb-data:
+    name: own-hpanel-wordpress-mariadb-data
+    labels:
+      own-hpanel.managed: "true"
+  panel-data:
+    name: own-hpanel-panel-data
+    labels:
+      own-hpanel.managed: "true"
+
+secrets:
+  mariadb_root_password:
+    file: ./secrets/mariadb_root_password.txt

@@ -1,0 +1,25 @@
+{{template "header" .}}
+{{$v := .Data.Values}}
+<h1>Server Settings</h1>
+<section class="card">
+<table class="kv">
+<tr><th>Server public IP</th><td>{{.Data.ServerIP}}</td></tr>
+<tr><th>Panel domain</th><td>{{if .Data.PanelDomain}}{{.Data.PanelDomain}}{{else}}set with PANEL_DOMAIN at deploy time{{end}}</td></tr>
+<tr><th>Provisioning agent</th><td>{{if .Data.AgentUp}}connected{{else}}not available{{end}}</td></tr>
+<tr><th>Reverse proxy</th><td>Existing Traefik (redberyl-traefik) on network redberyl-internal — reused, never modified by normal provisioning</td></tr>
+<tr><th>WordPress database</th><td>Shared wordpress-mariadb (MariaDB 11.4) — separate from all existing production databases</td></tr>
+</table>
+</section>
+<section class="card"><h2>Panel settings</h2>
+<form method="post" action="/settings">{{template "csrf" .CSRF}}
+<label>Backup retention (number of verified backups kept per site, 1–90) <input name="backup_retention" type="number" min="1" max="90" value="{{$v.backup_retention}}"></label>
+<label>Default resource profile <select name="default_profile"><option value="lightweight" {{if eq $v.default_profile "lightweight"}}selected{{end}}>Lightweight</option><option value="standard" {{if eq $v.default_profile "standard"}}selected{{end}}>Standard</option></select></label>
+<label>Alert email <input name="alert_email" type="email" value="{{$v.alert_email}}"></label>
+<h3>External S3-compatible backup destination</h3>
+<p class="muted">Endpoint/region/bucket are stored here. Credentials are read by the agent from secret files on the server and are never typed into or stored by the panel.</p>
+<label>S3 endpoint <input name="s3_endpoint" value="{{$v.s3_endpoint}}" placeholder="https://s3.example.com"></label>
+<label>S3 region <input name="s3_region" value="{{$v.s3_region}}" placeholder="us-east-1"></label>
+<label>S3 bucket <input name="s3_bucket" value="{{$v.s3_bucket}}"></label>
+<button class="btn primary" type="submit">Save settings</button></form>
+</section>
+{{template "footer" .}}

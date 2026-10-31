@@ -1,0 +1,35 @@
+{{template "header" .}}
+<h1>Account &amp; Security</h1>
+<section class="card"><h2>Profile</h2>
+<table class="kv"><tr><th>Username</th><td>{{.Admin.Username}}</td></tr><tr><th>Email</th><td>{{.Admin.Email}}</td></tr>
+<tr><th>Two-factor</th><td>{{if .Admin.TOTPEnabled}}Enabled{{else}}Disabled{{end}}</td></tr>
+<tr><th>Member since</th><td>{{since .Admin.CreatedAt}}</td></tr></table>
+<form method="post" action="/logout-all">{{template "csrf" .CSRF}}<button class="btn" type="submit" data-confirm="Log out from all sessions, including this one?">Logout from all sessions</button></form>
+</section>
+{{if .Data.Recovery}}<section class="card"><h2>New recovery codes — save them now (shown once)</h2>
+<ul class="codes">{{range .Data.Recovery}}<li><code>{{.}}</code></li>{{end}}</ul></section>{{end}}
+<section class="card"><h2>Change password</h2>
+<form method="post" action="/account/password">{{template "csrf" .CSRF}}
+<label>Current password <input name="current_password" type="password" required></label>
+<label>New password (min. 10) <input name="new_password" type="password" required></label>
+<label>Confirm new password <input name="confirm_password" type="password" required></label>
+<button class="btn primary" type="submit">Change password (revokes all sessions)</button></form>
+</section>
+<section class="card"><h2>Two-factor authentication (TOTP)</h2>
+{{if .Admin.TOTPEnabled}}
+<form method="post" action="/account/totp/disable">{{template "csrf" .CSRF}}
+<label>Current password <input name="current_password" type="password" required></label>
+<button class="btn" type="submit">Disable two-factor</button></form>
+{{else}}
+<form method="post" action="/account/totp/setup">{{template "csrf" .CSRF}}<button class="btn" type="submit">Generate a new TOTP secret</button></form>
+{{if .Data.TOTPSecret}}<p>Secret: <code>{{.Data.TOTPSecret}}</code><br><a href="{{.Data.TOTPURL}}">{{.Data.TOTPURL}}</a></p>
+<form method="post" action="/account/totp/enable">{{template "csrf" .CSRF}}
+<label>Enter the 6-digit code from your authenticator <input name="code" required inputmode="numeric"></label>
+<button class="btn primary" type="submit">Enable two-factor</button></form>{{end}}
+{{end}}
+</section>
+<section class="card"><h2>Recovery codes</h2>
+<p class="muted">Regenerating invalidates all previous codes.</p>
+<form method="post" action="/account/recovery/regenerate">{{template "csrf" .CSRF}}<button class="btn" type="submit">Regenerate recovery codes</button></form>
+</section>
+{{template "footer" .}}

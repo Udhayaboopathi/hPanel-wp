@@ -1,0 +1,9 @@
+/bin/
+/data/
+.env
+*.db
+*.db-wal
+*.db-shm
+secrets/
+*.tar.gz
+.DS_Store

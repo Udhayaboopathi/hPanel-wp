@@ -1,0 +1,8 @@
+# Reference only: the shared WordPress MariaDB definition lives in the root
+# compose.yaml (service wordpress-mariadb). It is a NEW, dedicated instance:
+#   - image mariadb:11.4 (pinned)
+#   - no published ports, private networking only
+#   - own named volume own-hpanel-wordpress-mariadb-data
+#   - innodb_buffer_pool_size=256M, max_connections=100
+# It must never be confused with the existing construction-mariadb, which
+# Own hPanel does not touch in any way.

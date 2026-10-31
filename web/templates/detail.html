@@ -1,0 +1,196 @@
+{{template "header" .}}
+{{$d := .Data}}{{$s := $d.Site}}{{$csrf := .CSRF}}
+<div class="row-between"><h1>{{$s.Domain}}</h1><span class="badge status-{{$s.Status}}">{{$s.Status}}</span></div>
+<nav class="tabs">
+{{range $t := list "overview" "env" "yaml" "files" "wp" "db" "domain" "backups" "jobs" "danger"}}
+<a href="/websites/{{$s.SiteID}}?tab={{$t}}" {{if eq $d.Tab $t}}class="active"{{end}}>{{$t}}</a>{{end}}
+</nav>
+
+{{if eq $d.Tab "overview"}}
+<section class="card">
+<h2>Overview</h2>
+<table class="kv">
+<tr><th>Website URL</th><td><a href="https://{{$s.Domain}}" target="_blank" rel="noopener">https://{{$s.Domain}}</a></td></tr>
+<tr><th>WordPress Admin</th><td><a href="https://{{$s.Domain}}/wp-admin/" target="_blank" rel="noopener">https://{{$s.Domain}}/wp-admin/</a></td></tr>
+<tr><th>Admin alias</th><td>{{if $s.AdminDomain}}https://{{$s.AdminDomain}} → redirects to the admin URL above{{else}}—{{end}}</td></tr>
+<tr><th>WordPress version</th><td>{{if $s.WPVersion}}{{$s.WPVersion}}{{else}}not recorded yet (check WordPress tab){{end}}</td></tr>
+<tr><th>PHP version</th><td>{{$s.PHPVersion}}</td></tr>
+<tr><th>Database</th><td>{{$s.DBName}} (user {{$s.DBUser}}){{if $d.DBSize}} · {{humanBytes $d.DBSize}}{{end}}</td></tr>
+<tr><th>Container</th><td>{{$s.ContainerName}}{{if $s.ContainerID}} · {{slice $s.ContainerID 0 12}}{{end}}</td></tr>
+<tr><th>Resources</th><td>{{$s.ResourceProfile}} · {{printf "%.2f" $s.CPULimit}} CPU max · {{$s.MemLimitMB}} MB RAM max</td></tr>
+<tr><th>SSL</th><td>{{if $d.SSL}}{{if $d.SSL.OK}}Valid · {{$d.SSL.Issuer}} · expires {{$d.SSL.ExpiresAt}} ({{$d.SSL.DaysLeft}} days){{else}}Not verified — {{$d.SSL.Detail}}{{end}}{{else}}Not checked yet — use the Domain tab.{{end}}</td></tr>
+<tr><th>Created</th><td>{{since $s.CreatedAt}}</td></tr>
+</table>
+<div class="actions">
+<a class="btn" href="https://{{$s.Domain}}" target="_blank" rel="noopener">Open Website</a>
+<a class="btn" href="https://{{$s.Domain}}/wp-admin/" target="_blank" rel="noopener">Open WordPress Admin</a>
+<form method="post" action="/websites/{{$s.SiteID}}/start" class="inline">{{template "csrf" $csrf}}<button class="btn" type="submit">Start website</button></form>
+<form method="post" action="/websites/{{$s.SiteID}}/stop" class="inline">{{template "csrf" $csrf}}<button class="btn" type="submit" data-confirm="Stop this website? Its files and database are kept.">Stop website</button></form>
+<form method="post" action="/websites/{{$s.SiteID}}/restart" class="inline">{{template "csrf" $csrf}}<button class="btn" type="submit">Restart website</button></form>
+<form method="post" action="/websites/{{$s.SiteID}}/backup" class="inline">{{template "csrf" $csrf}}<button class="btn" type="submit">Backup website</button></form>
+<a class="btn" href="/websites/{{$s.SiteID}}/logs/view">View logs &amp; events</a>
+</div>
+<p class="muted">Provisioning agent: {{if $d.AgentUp}}connected{{else}}not available — lifecycle actions will queue jobs that fail with a clear “agent unavailable” reason until the agent is deployed{{end}}.</p>
+</section>
+{{end}}
+
+{{if eq $d.Tab "env"}}
+<section class="card">
+<h2>Environment Variables</h2>
+<p class="muted">Only approved settings can be edited. Database name, user and host are shown for reference; the database password is stored encrypted, is never displayed, and can only be changed from the Database tab. Changes are saved as a new config version and take effect when you Apply Configuration.</p>
+<table class="kv">
+<tr><th>Website domain</th><td>{{$s.Domain}}</td></tr>
+<tr><th>Database host</th><td>wordpress-mariadb</td></tr>
+<tr><th>Database name</th><td>{{$s.DBName}}</td></tr>
+<tr><th>Database username</th><td>{{$s.DBUser}}</td></tr>
+<tr><th>Database password</th><td>•••••••• (masked)</td></tr>
+<tr><th>Resource limits</th><td>{{printf "%.2f" $s.CPULimit}} CPU · {{$s.MemLimitMB}} MB</td></tr>
+</table>
+<form method="post" action="/websites/{{$s.SiteID}}/env">
+{{template "csrf" $csrf}}
+{{range $k := list "PHP_MEMORY_LIMIT" "UPLOAD_MAX_FILESIZE" "POST_MAX_SIZE" "WORDPRESS_DEBUG" "SITE_TITLE"}}
+<label>{{$k}} <input name="env_{{$k}}" value="{{index $d.EnvMap $k}}"></label>
+{{end}}
+<button class="btn primary" type="submit">Save environment (new version)</button>
+</form>
+<form method="post" action="/websites/{{$s.SiteID}}/apply-config">{{template "csrf" $csrf}}<button class="btn" type="submit" data-confirm="Apply the latest saved configuration and rebuild this site's container?">Apply Configuration</button></form>
+</section>
+{{end}}
+
+{{if eq $d.Tab "yaml"}}
+<section class="card">
+<h2>Docker Compose Configuration</h2>
+<p class="muted">Generated from the approved template. Editing is validated against a strict security policy — privileged mode, host networking, Docker socket mounts, host bind mounts outside this site's directory, published ports and unapproved images are rejected by both the panel and the agent. Saving shows a diff first; nothing runs until you Apply Configuration.</p>
+{{if $d.Latest}}
+<form method="post" action="/websites/{{$s.SiteID}}/yaml">
+{{template "csrf" $csrf}}
+<label>Compose YAML (version {{$d.Latest.Version}}) <textarea name="compose_yaml" rows="28" spellcheck="false">{{$d.Latest.ComposeYAML}}</textarea></label>
+<button class="btn primary" type="submit">Validate &amp; save draft</button>
+</form>
+<form method="post" action="/websites/{{$s.SiteID}}/apply-config">{{template "csrf" $csrf}}<button class="btn" type="submit" data-confirm="Apply the latest saved configuration and rebuild this site's container?">Apply Configuration</button></form>
+<h3>Configuration history</h3>
+<ul>{{range $d.Configs}}<li>v{{.Version}} · {{since .CreatedAt}} · {{.Note}}
+<form method="post" action="/websites/{{$s.SiteID}}/yaml-rollback" class="inline">{{template "csrf" $csrf}}<input type="hidden" name="version" value="{{.Version}}"><button class="btn small" type="submit">Rollback to v{{.Version}}</button></form></li>{{end}}</ul>
+{{else}}<p class="muted">No configuration saved yet.</p>{{end}}
+</section>
+{{end}}
+
+{{if eq $d.Tab "files"}}
+<section class="card">
+<h2>File Manager</h2>
+<p class="muted">Rooted at this website's own storage only. Sensitive files (.env, wp-config.php) are hidden from viewing and download. Current path: <code>{{$d.FilePath}}</code></p>
+{{if $d.FileView}}
+<h3>Viewing {{$d.FileView}}</h3>
+<form method="post" action="/websites/{{$s.SiteID}}/files/save">{{template "csrf" $csrf}}
+<input type="hidden" name="path" value="{{$d.FileView}}">
+<textarea name="content" rows="20" spellcheck="false">{{$d.FileContent}}</textarea>
+<button class="btn primary" type="submit">Save file</button></form>
+{{end}}
+<table><thead><tr><th>Name</th><th>Size</th><th>Actions</th></tr></thead><tbody>
+{{if $d.FilePath}}<tr><td><a href="/websites/{{$s.SiteID}}?tab=files">.. (site root)</a></td><td></td><td></td></tr>{{end}}
+{{range $d.Files}}<tr>
+<td>{{if .IsDir}}📁 <a href="/websites/{{$s.SiteID}}?tab=files&amp;path={{.Path}}">{{.Name}}</a>{{else}}📄 {{.Name}}{{if .Sensitive}} <span class="badge">sensitive — hidden</span>{{end}}{{end}}</td>
+<td>{{humanBytes .Size}}</td>
+<td class="actions">
+{{if and (not .IsDir) .Editable}}<a class="btn small" href="/websites/{{$s.SiteID}}?tab=files&amp;path={{$d.FilePath}}&amp;view={{.Path}}">View / Edit</a>{{end}}
+{{if and (not .IsDir) (not .Sensitive)}}<a class="btn small" href="/websites/{{$s.SiteID}}/files/download?path={{.Path}}">Download</a>{{end}}
+<form method="post" action="/websites/{{$s.SiteID}}/files/rename" class="inline">{{template "csrf" $csrf}}<input type="hidden" name="path" value="{{.Path}}"><input name="new_name" placeholder="new name" required><button class="btn small" type="submit">Rename</button></form>
+<form method="post" action="/websites/{{$s.SiteID}}/files/delete" class="inline">{{template "csrf" $csrf}}<input type="hidden" name="path" value="{{.Path}}"><input name="confirm" placeholder="type DELETE"><button class="btn small danger" type="submit">Delete</button></form>
+</td></tr>{{end}}
+</tbody></table>
+<form method="post" action="/websites/{{$s.SiteID}}/files/upload" enctype="multipart/form-data">{{template "csrf" $csrf}}
+<input type="hidden" name="path" value="{{$d.FilePath}}"><label>Upload file <input type="file" name="file" required></label><button class="btn" type="submit">Upload</button></form>
+<form method="post" action="/websites/{{$s.SiteID}}/files/mkdir">{{template "csrf" $csrf}}
+<input type="hidden" name="path" value="{{$d.FilePath}}"><label>New directory <input name="name" required></label><button class="btn" type="submit">Create directory</button></form>
+</section>
+{{end}}
+
+{{if eq $d.Tab "wp"}}
+<section class="card">
+<h2>WordPress Management (WP-CLI)</h2>
+<p class="muted">Each action runs as a real, tracked job through the provisioning agent. Take a backup before updates.</p>
+<form method="post" action="/websites/{{$s.SiteID}}/backup">{{template "csrf" $csrf}}<button class="btn" type="submit">Backup website first</button></form>
+{{range $a := list "core_version" "core_check_update" "core_update" "plugin_list" "plugin_update_all" "theme_list" "theme_update_all" "cache_flush" "health"}}
+<form method="post" action="/websites/{{$s.SiteID}}/wp" class="inline">{{template "csrf" $csrf}}<input type="hidden" name="action" value="{{$a}}"><button class="btn small" type="submit">{{$a}}</button></form>
+{{end}}
+<form method="post" action="/websites/{{$s.SiteID}}/wp">{{template "csrf" $csrf}}
+<label>Plugin action
+<select name="action"><option value="plugin_activate">Activate plugin</option><option value="plugin_deactivate">Deactivate plugin</option><option value="plugin_update">Update plugin</option></select>
+<input name="arg" placeholder="plugin-slug" required></label>
+<button class="btn" type="submit">Run</button></form>
+<h3>Reset WordPress admin password</h3>
+<form method="post" action="/websites/{{$s.SiteID}}/reset-admin-password">{{template "csrf" $csrf}}
+<label>New password for {{$s.AdminUsername}} (min. 12 characters)
+<span class="row"><input name="new_password" id="reset-pw" type="password" required minlength="12">
+<button type="button" class="btn" data-generate-pw="#reset-pw">Generate Secure Password</button>
+<button type="button" class="btn" data-toggle-pw="#reset-pw">Show/Hide</button></span></label>
+<button class="btn primary" type="submit">Reset admin password</button></form>
+</section>
+{{end}}
+
+{{if eq $d.Tab "db"}}
+<section class="card">
+<h2>Database Management</h2>
+<table class="kv">
+<tr><th>Host</th><td>wordpress-mariadb (private network only, no public port)</td></tr>
+<tr><th>Database</th><td>{{$s.DBName}}</td></tr>
+<tr><th>User</th><td>{{$s.DBUser}} — least-privilege, this database only</td></tr>
+<tr><th>Size</th><td>{{if $d.DBSize}}{{humanBytes $d.DBSize}}{{else}}not measured yet{{end}}</td></tr>
+<tr><th>Password</th><td>•••••••• (masked, stored encrypted)</td></tr>
+</table>
+<form method="post" action="/websites/{{$s.SiteID}}/db-rotate">{{template "csrf" $csrf}}
+<button class="btn" type="submit" data-confirm="Rotate the database password in MariaDB now? Restart the site afterwards to apply it.">Rotate database password</button></form>
+<p class="muted">Connection testing happens in the agent during provisioning and WP-CLI runs; a failed test shows up as a failed job with the MariaDB error.</p>
+</section>
+{{end}}
+
+{{if eq $d.Tab "domain"}}
+<section class="card">
+<h2>Domain &amp; SSL</h2>
+<table class="kv"><tr><th>Domain</th><td>{{$s.Domain}}</td></tr>
+<tr><th>Admin alias</th><td>{{$s.AdminDomain}} → https://{{$s.Domain}}/wp-admin/</td></tr></table>
+<h3>Cloudflare DNS records (manual)</h3>
+<pre id="dns-records-{{$s.SiteID}}">Type: A    Name: @        Value: {{$.ServerIP}}
+Type: A    Name: wpadmin  Value: {{$.ServerIP}}</pre>
+<button type="button" class="btn" data-copy="#dns-records-{{$s.SiteID}}">Copy DNS Records</button>
+<p class="muted">Use DNS-only mode first so the origin Let's Encrypt certificate can be issued, then switch Cloudflare SSL to Full (strict). A proxied domain resolves to Cloudflare addresses — the checker understands that and does not report it as an error.</p>
+<form method="post" action="/websites/{{$s.SiteID}}/check">{{template "csrf" $csrf}}<button class="btn primary" type="submit">Check DNS &amp; SSL now</button></form>
+{{if $d.SSL}}<p>Last check {{since $d.SSL.CreatedAt}}: DNS {{if $d.SSL.DNSOK}}OK{{else}}not ready{{end}} · SSL {{if $d.SSL.OK}}valid ({{$d.SSL.Issuer}}, {{$d.SSL.DaysLeft}} days left){{else}}not verified{{end}} · Cloudflare proxy {{if $d.SSL.Cloudflare}}detected{{else}}not detected{{end}}<br><span class="muted">{{$d.SSL.Detail}}</span></p>{{end}}
+<h3>Change domain</h3>
+<form method="post" action="/websites/{{$s.SiteID}}/change-domain">{{template "csrf" $csrf}}
+<label>New domain <input name="new_domain" required placeholder="newdomain.com"></label>
+<button class="btn" type="submit" data-confirm="Change the domain in the panel? You must also update DNS and Apply Configuration.">Change domain</button></form>
+</section>
+{{end}}
+
+{{if eq $d.Tab "backups"}}
+<section class="card">
+<h2>Backups</h2>
+<form method="post" action="/websites/{{$s.SiteID}}/backup">{{template "csrf" $csrf}}<button class="btn primary" type="submit">Create backup</button></form>
+{{if $d.Backups}}<table><thead><tr><th>File</th><th>Size</th><th>SHA-256</th><th>Status</th><th>Created</th><th>Actions</th></tr></thead><tbody>
+{{range $d.Backups}}<tr><td>{{.Filename}}</td><td>{{humanBytes .SizeBytes}}</td><td><code>{{if .SHA256}}{{slice .SHA256 0 12}}…{{end}}</code></td><td><span class="badge">{{.Status}}</span></td><td>{{since .CreatedAt}}</td>
+<td class="actions">{{if eq .Status "ready"}}<a class="btn small" href="/websites/{{$s.SiteID}}/backups/{{.ID}}/download">Download</a>
+<form method="post" action="/websites/{{$s.SiteID}}/backups/{{.ID}}/restore" class="inline">{{template "csrf" $csrf}}<input name="confirm" placeholder="type RESTORE"><button class="btn small danger" type="submit">Restore</button></form>{{end}}</td></tr>{{end}}
+</tbody></table>{{else}}<p class="muted">No backups yet.</p>{{end}}
+<p class="muted">Backups include the database dump and all site files, streamed to a .tar.gz and verified by SHA-256 before being marked ready. The on-server RustFS instance is not off-server storage — configure a genuinely external S3 destination in Settings for off-server copies.</p>
+</section>
+{{end}}
+
+{{if eq $d.Tab "jobs"}}
+<section class="card"><h2>Deployment Jobs</h2>
+{{if $d.Jobs}}<table><thead><tr><th>Job</th><th>Kind</th><th>Status</th><th>Progress</th><th>Message</th><th></th></tr></thead><tbody>
+{{range $d.Jobs}}<tr><td><a href="/jobs/{{.ID}}">{{slice .ID 0 12}}…</a></td><td>{{.Kind}}</td><td><span class="badge">{{.Status}}</span></td><td>{{.Progress}}%</td><td>{{.Message}}{{if .Error}}<br><span class="muted">{{.Error}}</span>{{end}}</td><td>{{since .CreatedAt}}</td></tr>{{end}}
+</tbody></table>{{else}}<p class="muted">No jobs yet for this website.</p>{{end}}
+</section>
+{{end}}
+
+{{if eq $d.Tab "danger"}}
+<section class="card danger-zone">
+<h2>Delete website</h2>
+<p>This permanently removes the container, this site's database and user, and this site's files. Other websites and all unrelated production applications are not touched. Take a backup first if you might need this site again.</p>
+<form method="post" action="/websites/{{$s.SiteID}}/delete">{{template "csrf" $csrf}}
+<label>Type the exact domain ({{$s.Domain}}) to confirm <input name="confirm_domain" required></label>
+<button class="btn danger big" type="submit">Delete website</button></form>
+</section>
+{{end}}
+{{template "footer" .}}

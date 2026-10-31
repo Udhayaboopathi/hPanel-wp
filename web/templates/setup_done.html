@@ -1,0 +1,13 @@
+{{template "header" .}}
+<section class="card">
+<h1>Setup complete — save these now</h1>
+<p><strong>Recovery codes</strong> (shown once; each can be used once). Store them somewhere safe and offline.</p>
+<ul class="codes">{{range .Data.RecoveryCodes}}<li><code>{{.}}</code></li>{{end}}</ul>
+{{if .Data.TOTPSecret}}
+<p><strong>Two-factor secret:</strong> add this to your authenticator app (or open the otpauth link on your phone):</p>
+<p><code>{{.Data.TOTPSecret}}</code></p>
+<p><a href="{{.Data.TOTPURL}}">{{.Data.TOTPURL}}</a></p>
+{{end}}
+<p><a class="btn primary" href="/">Continue to the dashboard</a></p>
+</section>
+{{template "footer" .}}
