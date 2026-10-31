@@ -105,23 +105,22 @@ jobs:
         run: |
           set -euo pipefail
           # The DB admin password is FILE-ONLY: it is written straight to
-          # /opt/own-hpanel/secrets/db_admin_password.txt (0640 root:10001) and never
-          # exported, never put in the compose .env (its `$` characters
-          # would be corrupted by Docker Compose interpolation) and never
-          # printed - only key NAMES are ever echoed.
+          # /opt/own-hpanel/secrets/db_admin_password.txt (0600, root) and
+          # never exported, never put in the compose .env (its `$`
+          # characters would be corrupted by Docker Compose
+          # interpolation) and never printed - only key NAMES are echoed.
+          # This host file serves the root agent and the MariaDB compose
+          # secret. The PANEL does not read it: it cannot (root-owned
+          # 0600 in a root-owned dir, and the runner's scoped sudoers
+          # reject the chown / install -o/-g forms that would group-share
+          # it - sudo asks for a password instead). A later step stages
+          # the panel its OWN copy inside its data volume, using a
+          # one-shot Docker container (no sudo).
           pwfile=/opt/own-hpanel/secrets/db_admin_password.txt
           write_pw() {
-            $SUDO install -d -m 750 -o root -g 10001 /opt/own-hpanel/secrets
-            # Write via a runner-owned temp file + `sudo install` (install
-            # is in the runner's scoped sudoers; chown is not). The panel
-            # container (fixed gid 10001) reads this file through its bind
-            # mount and the agent reads it as root: 640 root:10001, not
-            # 600 root-only (which crash-loops the panel - it cannot open
-            # its own DB credential).
-            tmp_pw="$(mktemp)"
-            printf '%s' "$1" > "$tmp_pw"
-            $SUDO install -m 640 -o root -g 10001 "$tmp_pw" "$pwfile"
-            rm -f "$tmp_pw"
+            $SUDO install -d -m 750 /opt/own-hpanel/secrets
+            printf '%s' "$1" | $SUDO tee "$pwfile" >/dev/null
+            $SUDO chmod 600 "$pwfile"
           }
           if [ -n "${HPANEL_ENV:-}" ]; then
             echo "HPANEL_ENV detected - parsing it (values are never printed)"
@@ -192,9 +191,10 @@ jobs:
           umask 077
           # DB_ADMIN_PASSWORD is deliberately NOT written here, in either
           # mode: the password contains `$`, which Docker Compose would
-          # interpolate/corrupt when reading .env. It exists only in
-          # /opt/own-hpanel/secrets/db_admin_password.txt (see compose.yaml:
-          # DB_ADMIN_PASSWORD_FILE + the read-only secrets mount).
+          # interpolate/corrupt when reading .env. On the host it exists
+          # only in /opt/own-hpanel/secrets/db_admin_password.txt; the
+          # panel reads a staged copy at /data/db_admin_password.txt
+          # (DB_ADMIN_PASSWORD_FILE in compose.yaml).
           {
             printf 'PANEL_DOMAIN=%s\n' "$PANEL_DOMAIN"
             printf 'SERVER_IP=%s\n' "${SERVER_IP:-130.210.42.20}"
@@ -232,13 +232,12 @@ jobs:
           # "Load configuration" step, before this step and before the
           # ensure-panel-DB step - this step never handles the password.
           $SUDO test -s /opt/own-hpanel/secrets/db_admin_password.txt || { echo "::error::DB admin password file is missing - the Load configuration step did not run or failed"; exit 1; }
-          $SUDO install -d -m 750 /opt/own-hpanel/bin /opt/own-hpanel/logs
-          $SUDO install -d -m 750 -o root -g 10001 /opt/own-hpanel/secrets
-          # websites/backups are bind-mounted into the panel container whose
-          # user has fixed gid 10001: group-share them (setgid) so the panel
-          # can use the file manager while they stay closed to other users.
-          $SUDO install -d -m 2770 -o root -g 10001 /opt/own-hpanel/websites
-          $SUDO install -d -m 2750 -o root -g 10001 /opt/own-hpanel/backups
+          # All host directories are created with the one plain
+          # `install -d` form the runner's scoped sudoers accept (any
+          # -o/-g/chown form makes sudo demand a password). The
+          # panel-visible ownership of websites/backups is fixed later by
+          # the docker staging step, without sudo.
+          $SUDO install -d -m 750 /opt/own-hpanel/bin /opt/own-hpanel/secrets /opt/own-hpanel/websites /opt/own-hpanel/backups /opt/own-hpanel/logs
           $SUDO install -m 755 "${RUNNER_TEMP}/hpanel-bin/agent" /opt/own-hpanel/bin/agent
           # Agent token: generated once, never overwritten, never printed.
           if ! $SUDO test -f /opt/own-hpanel/secrets/agent.token; then
@@ -294,8 +293,15 @@ jobs:
           systemctl is-active own-hpanel-agent
           # Panel reads the agent token through the shared /run/own-hpanel
           # mount. The panel image's user has the fixed gid 10001, so the
-          # token copy is group-owned by it (640): root + panel only.
-          $SUDO install -m 640 -o root -g 10001 /opt/own-hpanel/secrets/agent.token /run/own-hpanel/agent.token
+          # token copy must be group-owned by it (640): root + panel only.
+          # `sudo install -o root -g 10001` is NOT in the runner's scoped
+          # sudoers (sudo demands a password), so the copy is made by a
+          # one-shot Docker container instead - the runner is in the
+          # docker group and docker needs no sudo.
+          docker run --rm \
+            -v /run/own-hpanel:/run/own-hpanel \
+            -v /opt/own-hpanel/secrets:/secrets:ro \
+            alpine:3.20 sh -c 'install -m 640 -o 0 -g 10001 /secrets/agent.token /run/own-hpanel/agent.token'
           echo "agent installed and running (panel-owned service only)"
 
       - name: Generate the MariaDB root password file if missing (server-side only)
@@ -305,12 +311,48 @@ jobs:
           if $SUDO test -s "$rootpw_file"; then
             echo "MariaDB root password file already exists (never overwritten, value never printed)"
           else
-            $SUDO install -d -m 750 -o root -g 10001 /opt/own-hpanel/secrets
+            $SUDO install -d -m 750 /opt/own-hpanel/secrets
             openssl rand -hex 24 | $SUDO tee "$rootpw_file" >/dev/null
             $SUDO chmod 600 "$rootpw_file"
             echo "MariaDB root password generated into $rootpw_file (0600, value never printed)"
           fi
           echo "Note: this password becomes the root password of the dedicated wordpress-mariadb container on its FIRST initialization (empty data volume). If the volume was already initialized earlier, the file must match the root password set back then - the ensure step below fails loudly if it does not."
+
+      - name: Stage panel credentials and shared dirs (docker, no sudo)
+        run: |
+          set -euo pipefail
+          # PATTERN for everything in this step: the runner's scoped
+          # sudoers accept only a handful of exact sudo invocation forms
+          # (plain install -d, install -m, tee, chmod, test, systemctl
+          # verbs). Every ownership/mode operation beyond those - chown,
+          # install -o/-g for a foreign user/group - makes sudo demand a
+          # password and kills the deploy. Such operations are therefore
+          # done inside one-shot Docker containers: the runner is in the
+          # docker group, and docker needs no sudo.
+          #
+          # 1) The panel's OWN copy of the DB admin password, staged into
+          #    its data volume (own-hpanel-panel-data, the volume compose
+          #    declares for the panel). The host file in
+          #    /opt/own-hpanel/secrets is root-owned 0600 and the host
+          #    secrets directory is deliberately NOT mounted into the
+          #    panel, so without this staged copy the panel (uid/gid
+          #    10001) cannot open its DB credential. compose creates the
+          #    volume with the same name if it is missing; creating it
+          #    here first is idempotent and lets us stage into it.
+          docker volume create own-hpanel-panel-data >/dev/null
+          docker run --rm \
+            -v own-hpanel-panel-data:/data \
+            -v /opt/own-hpanel/secrets:/secrets:ro \
+            alpine:3.20 sh -c 'if [ ! -s /secrets/db_admin_password.txt ]; then echo "DB admin password file /opt/own-hpanel/secrets/db_admin_password.txt is missing or empty - the Load configuration step should have written it" >&2; exit 1; fi; install -m 600 -o 10001 -g 10001 /secrets/db_admin_password.txt /data/db_admin_password.txt'
+          echo "panel DB credential staged into the panel-data volume (/data/db_admin_password.txt, 0600, owned by the panel uid/gid 10001)"
+          # 2) websites/backups are bind-mounted into the panel container
+          #    (fixed gid 10001): group-share them (setgid) so the panel
+          #    can use the file manager while they stay closed to other
+          #    host users. mkdir -p is a no-op when they already exist.
+          docker run --rm \
+            -v /opt/own-hpanel:/o \
+            alpine:3.20 sh -c 'mkdir -p /o/websites /o/backups && chown 0:10001 /o/websites /o/backups && chmod 2770 /o/websites && chmod 2750 /o/backups'
+          echo "websites/backups group-shared with the panel gid 10001 (2770/2750)"
 
       - name: Build and start the hPanel stack (panel + dedicated MariaDB, panel-owned only)
         working-directory: ${{ env.DEPLOY_DIR }}
@@ -355,11 +397,19 @@ jobs:
           userpw_file=/opt/own-hpanel/secrets/db_admin_password.txt
           $SUDO test -s "$rootpw_file" || { echo "::error::MariaDB root password file $rootpw_file is missing/empty - the root-password generation step should have written it"; exit 1; }
           $SUDO test -s "$userpw_file" || { echo "::error::DB admin password file $userpw_file is missing/empty - the Load configuration step should have written it"; exit 1; }
-          # Load both passwords silently (no echo, no set -x). They reach
-          # the mariadb client via MYSQL_PWD passed by NAME only - never
-          # in argv, never printed.
-          root_pw="$($SUDO cat "$rootpw_file")"
-          user_pw="$($SUDO cat "$userpw_file")"
+          # Load both passwords silently (no echo, no set -x). They are
+          # read out of the dedicated MariaDB container's OWN compose
+          # secret mounts via `docker exec cat`: the host files are
+          # root-owned in a root-owned directory, the runner's scoped
+          # sudoers do not cover `sudo cat` for them (it demanded a
+          # password in a real run), and docker needs no sudo. An empty
+          # read fails loudly instead of sending an empty password to
+          # the SQL below. Passwords reach the mariadb client via
+          # MYSQL_PWD passed by NAME only - never in argv, never printed.
+          root_pw="$(docker exec "$DB_CONTAINER" cat /run/secrets/mariadb_root_password)"
+          user_pw="$(docker exec "$DB_CONTAINER" cat /run/secrets/db_admin_password)"
+          [ -n "$root_pw" ] || { echo "::error::could not read the MariaDB root password from ${DB_CONTAINER}:/run/secrets/mariadb_root_password (empty) - check the container is running and its compose secrets are mounted"; exit 1; }
+          [ -n "$user_pw" ] || { echo "::error::could not read the DB admin password from ${DB_CONTAINER}:/run/secrets/db_admin_password (empty) - check the container is running and its compose secrets are mounted"; exit 1; }
           # The user password is embedded in the generated SQL as a
           # single-quoted literal: escape it by doubling single quotes
           # (the SQL-standard escape) and refuse CR/LF outright - a line

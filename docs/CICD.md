@@ -65,11 +65,21 @@ Rules the workflow applies when parsing the blob:
 
 `DB_ADMIN_PASSWORD` is **never** exported to the job environment and
 **never** written into the compose `.env` file. The workflow writes its
-value directly (and only) to
-`/opt/own-hpanel/secrets/db_admin_password.txt` (0600, via sudo), before
-the agent is installed/restarted and before the panel-DB check runs. The
-panel container receives it through `DB_ADMIN_PASSWORD_FILE` and a
-read-only mount of `/opt/own-hpanel/secrets` (see `compose.yaml`).
+value directly to
+`/opt/own-hpanel/secrets/db_admin_password.txt` (0600, root-owned, via
+sudo), before the agent is installed/restarted and before the panel-DB
+check runs. That host file serves two readers: the agent (runs as root
+on the host) and the MariaDB container (via the compose `secrets:`
+mount).
+
+The **panel does not read the host file** — it runs as uid/gid 10001
+and cannot open a root-owned 0600 file, and the host secrets directory
+is deliberately **not** mounted into the panel container. Instead, a
+dedicated deploy step stages the panel its **own copy** at
+`/data/db_admin_password.txt` inside the panel-data volume
+(`own-hpanel-panel-data`), owned by 10001 with mode 0600; the panel's
+`DB_ADMIN_PASSWORD_FILE` points there (see `compose.yaml`). The staging
+runs on every deploy, so a rotated secret propagates on the next run.
 
 Why: the real password contains `$` characters. Docker Compose
 interpolates `$…` sequences in `.env` values and in compose `${...}`
@@ -113,7 +123,11 @@ container's root password on the data volume's **first initialization**
 and is used by the deploy's ensure step (root `docker exec`) to create
 the panel database and sync the common user's provisioning grants. Both
 passwords reach MariaDB only as file-based compose `secrets:`; neither is
-ever a compose literal or a `${...}` interpolation.
+ever a compose literal or a `${...}` interpolation. The ensure step
+reads both passwords back **out of the MariaDB container's own secret
+mounts** (`docker exec … cat /run/secrets/…`) instead of `sudo cat` on
+the host files — the runner's scoped sudo does not cover that (see the
+scoped-sudo section below).
 
 ## Cloudflare notes (panel + DB records)
 
@@ -136,6 +150,45 @@ ever a compose literal or a `${...}` interpolation.
   `docker exec` into that container. The external endpoint is only for
   testing/admin tools — exactly the traffic that needs the record to be
   DNS-only.
+
+## Scoped sudo on the runner — and the Docker-staging pattern
+
+The runner user's passwordless sudo on the production host is **scoped
+to specific command forms** (as granted in its sudoers drop-in). Real
+deploys proved that only these forms run without sudo demanding a
+password:
+
+- `sudo install -d -m <mode> <paths…>` (plain)
+- `sudo install -m 755 <file> <dest>` and `sudo install -m 644 <file> <dest>`
+- `sudo tee <file>`, `sudo chmod <mode> <file>`, `sudo test -f/-s <file>`
+- `sudo systemctl daemon-reload|enable|restart …`
+
+Forms that **fail** with `sudo: a password is required` include
+`sudo install … -o <user> -g <group> …` for a foreign user/group,
+`sudo chown …`, `sudo cat <root-owned file>` and
+`sudo systemctl status/show …` (read-only `systemctl` queries are run
+**without** sudo instead — they need no privilege).
+
+**Rule for the workflow: host-sudo calls use ONLY the proven forms
+above.** Every other privileged operation — changing ownership/mode for
+another uid/gid, copying between root-owned locations — is done inside
+a **one-shot Docker container** (`docker run --rm … alpine:3.20 sh -c
+'…'`): the runner is in the `docker` group, and Docker needs no sudo.
+This pattern is used for:
+
+- staging the panel's DB credential copy into its data volume
+  (`install -m 600 -o 10001 -g 10001 … /data/db_admin_password.txt`),
+- group-sharing `/opt/own-hpanel/websites` (2770) and `…/backups`
+  (2750) with the panel's gid 10001,
+- copying the agent token to `/run/own-hpanel/agent.token` as
+  `640 root:10001`,
+- reading the DB passwords in the ensure step, via
+  `docker exec wordpress-mariadb cat /run/secrets/…`.
+
+When editing the workflow, keep this rule: if a new step needs a
+privileged host operation that is not on the proven list, give it the
+Docker treatment — do not widen the sudoers and do not reach for an
+unproven sudo form.
 
 ## Runner setup (on the server, one time)
 
@@ -161,7 +214,7 @@ ever a compose literal or a `${...}` interpolation.
    containers (the protection baseline).
 3. Prerequisite checks: `redberyl-internal` network exists, Traefik
    running, >5 GB disk. Abort changes nothing. (No database prerequisite:
-   the stack creates its own DB container in step 10.)
+   the stack creates its own DB container in step 11.)
 4. Load configuration: parse the `HPANEL_ENV` secret (or the individual-
    secret fallback), export the known non-secret keys for later steps,
    and write the DB admin password file-only to
@@ -178,10 +231,22 @@ ever a compose literal or a `${...}` interpolation.
    agent token if missing (0600, never printed), install/refresh
    `own-hpanel-agent.service`, `daemon-reload`, restart **the agent
    only** (verifying the password file written in step 4 exists first).
+   The token is then copied to `/run/own-hpanel/agent.token` (640,
+   group 10001) for the panel by a one-shot Docker container — the
+   scoped sudoers reject the equivalent `sudo install -o/-g` form (see
+   the scoped-sudo section above).
 9. Generate the MariaDB **root** password file if missing
    (`/opt/own-hpanel/secrets/mariadb_root_password.txt`, 0600, never
    printed, never overwritten — see the root-password section above).
-10. `docker compose build` + `docker compose up -d` — the whole stack
+10. Stage the panel's credentials and shared directories — **Docker
+    only, no sudo** (see the scoped-sudo section): create the
+    `own-hpanel-panel-data` volume if needed and copy the DB admin
+    password into it as `/data/db_admin_password.txt` (0600, owned by
+    the panel's uid/gid 10001) — the copy the panel actually reads;
+    group-share `/opt/own-hpanel/websites` (2770) and `…/backups`
+    (2750) with the panel gid. Runs on every deploy, so secret
+    rotations propagate.
+11. `docker compose build` + `docker compose up -d` — the whole stack
     defined in compose.yaml, i.e. exactly two panel-owned services:
     `wordpress-mariadb` (image pulled by compose; on first boot of its
     empty volume the entrypoint creates the panel database and the
@@ -190,9 +255,12 @@ ever a compose literal or a `${...}` interpolation.
     provisioning admin of this container) and `own-hpanel` (starts once
     the DB is healthy). The step then waits until `wordpress-mariadb`
     reports healthy.
-11. Ensure the panel database and provisioning grants — **after** the
+12. Ensure the panel database and provisioning grants — **after** the
     stack is up: `docker exec` **into `wordpress-mariadb` as root**
-    (`MYSQL_PWD` loaded silently from the root password file) feeds it a
+    (`MYSQL_PWD` loaded silently — the root password is read out of the
+    container's own `/run/secrets/mariadb_root_password` mount via
+    `docker exec … cat`, because `sudo cat` on the host file is outside
+    the runner's scoped sudo) feeds it a
     generated SQL file (0600 temp file, shredded afterwards) that runs
     `CREATE DATABASE IF NOT EXISTS …`, `CREATE USER IF NOT EXISTS …` /
     `ALTER USER … IDENTIFIED BY …` (syncing the common user's password
@@ -205,12 +273,12 @@ ever a compose literal or a `${...}` interpolation.
     escaping); passwords containing CR/LF are refused outright. Nothing
     connects over external TCP for this — external endpoint reachability
     remains a warning-only note in the same step.
-12. Health: wait for the panel container to be running/healthy, then
+13. Health: wait for the panel container to be running/healthy, then
     `curl https://$PANEL_DOMAIN/healthz`. A non-200 here with a healthy
     container is reported as a **warning** (usually SSL-pending: Let's
     Encrypt not yet issued or DNS not yet pointing at the server), not a
     failed deploy.
-13. Snapshot again and diff the 10 protected container IDs — **the deploy
+14. Snapshot again and diff the 10 protected container IDs — **the deploy
     fails if any changed or disappeared**. Snapshots are uploaded as the
     `deploy-snapshots-<run>` artifact, and a summary is written to the run.
 

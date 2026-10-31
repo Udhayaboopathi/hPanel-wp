@@ -18,7 +18,10 @@
 # Secrets are FILE-based only (compose `secrets:` below, files under
 # /opt/own-hpanel/secrets/ with 0600 permissions). No password is ever a
 # literal in this file or interpolated via ${...}: the DB passwords contain
-# `$`, which Compose would corrupt during interpolation.
+# `$`, which Compose would corrupt during interpolation. The panel's own
+# copy of the DB admin password is staged into its panel-data volume by
+# the deploy (see the panel service comments) - the host secrets directory
+# is never mounted into the panel container.
 #
 # The provisioning agent runs on the host via systemd
 # (deployment/own-hpanel-agent.service) because it needs
@@ -110,10 +113,14 @@ services:
       BACKUPS_DIR: /opt/own-hpanel/backups
       # Panel metadata store: the dedicated wordpress-mariadb container
       # (PANEL_STORE_DRIVER=mysql), in its own database PANEL_DB_NAME. The
-      # password arrives ONLY as a file on the read-only secrets mount
-      # below - it is deliberately NOT passed via the .env file or a
-      # ${...} substitution: the password contains `$`, which Docker
-      # Compose would interpolate and corrupt.
+      # password arrives ONLY as a file staged into the panel-data volume
+      # by the deploy workflow / install.sh (a one-shot Docker container
+      # copies the host secret in as uid/gid 10001 - see docs/CICD.md):
+      # the host secrets directory is deliberately NOT mounted into the
+      # panel (its files are root-owned 0600 and the panel runs as
+      # 10001, so it could not read them anyway). Nor is the password
+      # passed via the .env file or a ${...} substitution: it contains
+      # `$`, which Docker Compose would interpolate and corrupt.
       PANEL_STORE_DRIVER: ${PANEL_STORE_DRIVER:-mysql}
       PANEL_DB_NAME: ${PANEL_DB_NAME:-hpanel_panel}
       PANEL_STORE_DSN: ${PANEL_STORE_DSN:-}
@@ -126,14 +133,14 @@ services:
       DB_HOST: wordpress-mariadb
       DB_EXTERNAL_PORT: "3306"
       DB_ADMIN_USER: ${DB_ADMIN_USER:-WordPress_common_DB}
-      DB_ADMIN_PASSWORD_FILE: /opt/own-hpanel/secrets/db_admin_password.txt
+      DB_ADMIN_PASSWORD_FILE: /data/db_admin_password.txt
     volumes:
       - panel-data:/data
       # Agent socket directory (socket + token are provisioned by install.sh / CI).
       - /run/own-hpanel:/run/own-hpanel
-      # Host secrets (agent token is under /run; the DB admin password file
-      # lives here). Read-only: the panel never writes secrets.
-      - /opt/own-hpanel/secrets:/opt/own-hpanel/secrets:ro
+      # NOTE: /opt/own-hpanel/secrets is NOT mounted here on purpose - see
+      # the DB_ADMIN_PASSWORD_FILE comment above. The agent token reaches
+      # the panel via /run/own-hpanel/agent.token.
       # Site files for the file manager and backup downloads. NOT the Docker socket.
       - /opt/own-hpanel/websites:/opt/own-hpanel/websites
       - /opt/own-hpanel/backups:/opt/own-hpanel/backups:ro

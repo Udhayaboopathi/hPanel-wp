@@ -92,6 +92,12 @@ fi
 
 echo "=== Applying (panel-owned resources only) ==="
 install -d -m 750 "$BASE"/{panel,state,secrets,logs,websites,backups}
+# This script runs as root directly (no scoped sudo involved), so it may
+# group-share the secrets directory with the panel's fixed gid 10001:
+# group members may traverse it, while the secret FILES inside stay 0600
+# root (agent token, MariaDB passwords) unless copied for the panel
+# explicitly (the staged /data copy and the /run token copy below).
+chgrp 10001 "$BASE/secrets"; chmod 750 "$BASE/secrets"
 install -d -m 750 /run/own-hpanel
 
 # Secrets: generated once, never overwritten, never printed.
@@ -112,8 +118,31 @@ if [[ ! -f "$BASE/secrets/db_admin_password.txt" && -z "${DB_ADMIN_PASSWORD:-}" 
   echo "WARNING: no DB admin credential found ($BASE/secrets/db_admin_password.txt missing and DB_ADMIN_PASSWORD unset)."
   echo "         The agent/panel will not be able to provision databases until it is provided (0600 file, never printed)."
 fi
-# Panel reads the agent token through the shared /run/own-hpanel mount.
-cp "$BASE/secrets/agent.token" /run/own-hpanel/agent.token; chmod 640 /run/own-hpanel/agent.token
+# Panel reads the agent token through the shared /run/own-hpanel mount;
+# the copy is group-owned by the panel's fixed gid 10001 (640).
+cp "$BASE/secrets/agent.token" /run/own-hpanel/agent.token; chgrp 10001 /run/own-hpanel/agent.token; chmod 640 /run/own-hpanel/agent.token
+
+# Stage the panel's OWN copy of the DB admin password into its data
+# volume - the same Docker one-shot pattern the deploy workflow uses
+# (docs/CICD.md, "Scoped sudo"). The panel (uid/gid 10001) reads
+# /data/db_admin_password.txt; the host secrets directory is NOT mounted
+# into the panel container, and the host file stays 0600 root. The
+# volume name matches the one compose.yaml declares for the panel, so
+# `docker compose up` below adopts it with the credential already in
+# place.
+if [[ -s "$BASE/secrets/db_admin_password.txt" ]]; then
+  docker volume create own-hpanel-panel-data >/dev/null
+  docker run --rm \
+    -v own-hpanel-panel-data:/data \
+    -v "$BASE/secrets":/secrets:ro \
+    alpine:3.20 sh -c 'install -m 600 -o 10001 -g 10001 /secrets/db_admin_password.txt /data/db_admin_password.txt'
+  echo "Panel DB credential staged into the panel-data volume (/data/db_admin_password.txt, 0600, uid/gid 10001)"
+  # Group-share the panel-mounted site/backup dirs with the panel gid
+  # (same as the workflow's docker staging step).
+  docker run --rm -v "$BASE":/o alpine:3.20 sh -c 'chown 0:10001 /o/websites /o/backups && chmod 2770 /o/websites && chmod 2750 /o/backups'
+else
+  echo "WARNING: skipping panel credential staging - $BASE/secrets/db_admin_password.txt is missing/empty (see the warning above). Provide it and re-run --apply before starting the panel with PANEL_STORE_DRIVER=mysql."
+fi
 
 # Agent systemd service (host process; the only Docker-socket holder).
 install -m 644 deployment/own-hpanel-agent.service /etc/systemd/system/own-hpanel-agent.service

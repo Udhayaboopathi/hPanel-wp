@@ -410,3 +410,99 @@ completely in `compose.yaml`:
   login fails because a pre-existing volume was initialized with a
   different root password, the step fails loudly with that exact
   remediation.
+
+## Scoped-sudo constraint + Docker staging (2026-10-31)
+
+### What the real server taught us
+
+The runner user's passwordless sudo on the production host is scoped to
+specific command **forms**. Across real deploys, these forms are proven
+to run: plain `sudo install -d -m <mode> <paths…>`,
+`sudo install -m 755/644 <file> <dest>`, `sudo tee`, `sudo chmod`,
+`sudo test -f/-s`, and `sudo systemctl daemon-reload|enable|restart`
+(the earlier DEPLOY_DIR `install -d` with `-o`/`-g` set to the runner's
+**own** user/group also worked). These forms **fail** with
+`sudo: a password is required`: `sudo systemctl status/show …`,
+`sudo install … -o root -g 10001 …`, and by extension `sudo chown …` /
+`sudo cat` on the root-owned secret files.
+
+The previous approach group-shared the host DB-password file with the
+panel's gid (`install -m 640 -o root -g 10001`) so the panel container
+could read it through a bind mount of `/opt/own-hpanel/secrets`. That
+sudo form is rejected on the real host, so the approach died in the
+"Load configuration" step even though every local validation passed —
+the sudoers file lives only on the server and cannot be inspected from
+here.
+
+### The pattern now used
+
+**Host-sudo calls in the workflow use ONLY the proven forms.** Every
+other privileged operation goes through a **one-shot Docker container**
+(`docker run --rm … alpine:3.20 sh -c '…'`): the runner is in the
+`docker` group, and Docker needs no sudo. Concretely:
+
+- `write_pw` reverted to the proven trio:
+  `install -d -m 750` (plain) + `tee` + `chmod 600`. The host file
+  `/opt/own-hpanel/secrets/db_admin_password.txt` is again 0600
+  root-only and serves exactly two readers: the root agent and the
+  MariaDB compose secret.
+- New workflow step **"Stage panel credentials and shared dirs
+  (docker, no sudo)"** (after source sync, before compose up):
+  creates the `own-hpanel-panel-data` volume (the exact name
+  compose.yaml declares for the panel, so compose adopts it) and
+  stages the panel's **own copy** of the credential into it as
+  `/data/db_admin_password.txt` (0600, uid/gid 10001) via
+  `docker run -v own-hpanel-panel-data:/data
+  -v /opt/own-hpanel/secrets:/secrets:ro alpine … install …`.
+  The same step group-shares `websites` (2770) and `backups` (2750)
+  with gid 10001. It runs on every deploy, so secret rotations
+  propagate to the panel's copy.
+- The agent-token copy to `/run/own-hpanel/agent.token` (640,
+  root:10001) likewise moved from `sudo install -o/-g` to a one-shot
+  Docker container.
+- The ensure-DB step no longer `sudo cat`s the host password files
+  (that form demanded a password in a real run). Both passwords are
+  read out of the dedicated MariaDB container's **own** compose-secret
+  mounts: `docker exec wordpress-mariadb cat
+  /run/secrets/mariadb_root_password` and `…/db_admin_password`, with a
+  loud failure on an empty read. The proven `$SUDO test -s` existence
+  checks on the host files stay.
+- **compose.yaml**: the panel's `DB_ADMIN_PASSWORD_FILE` is now
+  `/data/db_admin_password.txt`, and the
+  `/opt/own-hpanel/secrets` bind mount was **removed from the panel
+  service entirely** — the panel no longer reads host secrets at all.
+  (Its agent token still arrives via `/run/own-hpanel/agent.token`.)
+- **deployment/install.sh** mirrors this for manual installs: it runs
+  as root (no scoped sudo), so it may `chgrp 10001` the secrets
+  directory directly, and it now performs the same Docker one-shot
+  staging (volume create + credential install into `/data`,
+  websites/backups group-share, token copy group 10001) before
+  `docker compose up`.
+- **docs/CICD.md** documents the constraint and the pattern in a new
+  "Scoped sudo on the runner" section, and the deploy step list gained
+  the staging step (steps renumbered to 14).
+
+### Validation (actual runs in this VM)
+
+- Python YAML parse: deploy.yml, ci.yml, compose.yaml — all OK.
+- `bash -n` on every deploy/ci `run:` script after `${{ }}`
+  substitution (22 scripts) and on install.sh — all clean.
+- Grep proof over deploy.yml: no `$SUDO` line contains `chown`,
+  `-g 10001`, `status` or `show`; the remaining distinct `$SUDO` forms
+  are exactly the proven set (listed in the handoff for this change).
+- `go test ./...` — unchanged Go surface; still green.
+
+### Limitations / unchanged risks
+
+- The sudoers drop-in itself is still not visible from here; the
+  workflow now treats it as an opaque allowlist and stays inside the
+  forms that production runs have demonstrated. If a future form is
+  ever needed, it must be proven on the host first (or given the
+  Docker treatment).
+- The one-shot staging containers pull `alpine:3.20` on first use;
+  that is a small public image pull on the runner (already the case
+  for the MariaDB/Go images).
+- The staged copy in the panel-data volume and the host secret can
+  drift between deploys if the GitHub secret is rotated mid-cycle;
+  the next deploy re-stages. The agent always reads the host file,
+  so panel/agent credentials agree again after any deploy.
