@@ -166,7 +166,7 @@ func main() {
 	mux.HandleFunc("POST /logout", app.requireAuth(app.logout))
 	mux.HandleFunc("POST /logout-all", app.requireAuth(app.logoutAll))
 	mux.HandleFunc("GET /{$}", app.requireAuth(app.dashboard))
-	// RK Host canonical routes (Stitch UI). The legacy paths below
+	// KR Host canonical routes (Stitch UI). The legacy paths below
 	// them keep working; both spellings serve the same handlers.
 	mux.HandleFunc("GET /dashboard", app.requireAuth(app.dashboard))
 	mux.HandleFunc("GET /deployments", app.requireAuth(app.jobsList))

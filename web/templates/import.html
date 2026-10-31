@@ -1,7 +1,7 @@
 {{template "header" .}}
 {{$d := .Data}}
 <h1>Migrate a WordPress Website</h1>
-<p class="muted">RK Host does not run a one-click importer — migrations use the same verified tools as everything else in the panel, so nothing is silently half-copied. Follow these steps; each one is a real, working feature.</p>
+<p class="muted">KR Host does not run a one-click importer — migrations use the same verified tools as everything else in the panel, so nothing is silently half-copied. Follow these steps; each one is a real, working feature.</p>
 
 <section class="card">
 <h2>Step 1 — Create the new website</h2>
@@ -10,7 +10,7 @@
 
 <section class="card">
 <h2>Step 2 — Bring the files over</h2>
-<p>Upload the old site's <code>wp-content</code> (uploads, themes, plugins) into the new site with the File Manager. For a site that already exists in RK Host, pick it here:</p>
+<p>Upload the old site's <code>wp-content</code> (uploads, themes, plugins) into the new site with the File Manager. For a site that already exists in KR Host, pick it here:</p>
 <form method="get" class="toolbar" onsubmit="if(this.site.value){location='/websites/'+this.site.value+'/files';}return false;">
   <select name="site" aria-label="Website">{{range $d.Sites}}<option value="{{.SiteID}}">{{.Domain}}</option>{{end}}</select>
   <button class="btn" type="submit">Open File Manager</button>
@@ -33,7 +33,7 @@
 </section>
 
 <section class="card">
-<h2>Moving between RK Host servers?</h2>
-<p>Use the same steps above: export the database from the source site's Database page, copy the files with the File Manager, and import both into the new site here. Restoring a backup archive taken on a different RK Host server is not supported yet — backups are tied to the site that created them. This limitation is tracked in RK-HOST-REMAINING-ISSUES.md.</p>
+<h2>Moving between KR Host servers?</h2>
+<p>Use the same steps above: export the database from the source site's Database page, copy the files with the File Manager, and import both into the new site here. Restoring a backup archive taken on a different KR Host server is not supported yet — backups are tied to the site that created them. This limitation is tracked in KR-HOST-REMAINING-ISSUES.md.</p>
 </section>
 {{template "footer" .}}

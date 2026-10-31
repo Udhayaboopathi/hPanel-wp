@@ -918,7 +918,7 @@ func boolInt(b bool) int {
 	return 0
 }
 
-// ---------- resource samples (read side; RK Host performance/server pages) ----------
+// ---------- resource samples (read side; KR Host performance/server pages) ----------
 
 // ResourceSample is one recorded host or per-site resource sample.
 type ResourceSample struct {

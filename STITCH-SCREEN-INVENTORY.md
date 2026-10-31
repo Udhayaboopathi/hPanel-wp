@@ -1,4 +1,4 @@
-# Stitch Screen Inventory — RK Host
+# Stitch Screen Inventory — KR Host
 
 Source: Google Stitch project **"NexHost WordPress Control Panel"**
 (`projects/9139544689105612440`), retrieved 2026-10-31 through the
@@ -47,7 +47,7 @@ screenshot. Raw downloads are kept outside the repository under
 Notes:
 
 - The Stitch designs are Tailwind-CDN mockups with demo content
-  (fictional "cluster", tenants and people). Per the RK Host brief
+  (fictional "cluster", tenants and people). Per the KR Host brief
   §6–§7 they are used as *design reference only*: the implementation
   reproduces the visual system in the application's existing vanilla
   CSS and connects every element to real backend data. Demo-only
@@ -58,4 +58,4 @@ Notes:
   Migration (19) — were implemented against existing backend
   capabilities (agent stats/samples, agent logs, agent discovery,
   lifecycle/repair/delete, file/database tooling); see
-  RK-HOST-BACKEND-INTEGRATION.md and RK-HOST-REMAINING-ISSUES.md.
+  KR-HOST-BACKEND-INTEGRATION.md and KR-HOST-REMAINING-ISSUES.md.

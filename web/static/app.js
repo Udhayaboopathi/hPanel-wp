@@ -1,4 +1,4 @@
-// RK Host - minimal vanilla JS: shell, wizard, password helpers, copy, confirms, metric polling.
+// KR Host - minimal vanilla JS: shell, wizard, password helpers, copy, confirms, metric polling.
 (function () {
   // Sidebar: mobile toggle + active nav state.
   var sidebar = document.getElementById("sidebar");

@@ -1,14 +1,14 @@
-# Stitch → RK Host UI Mapping
+# Stitch → KR Host UI Mapping
 
 How each Stitch screen maps onto the application. "Shell" means the
-shared RK Host layout (252 px sidebar, topbar with breadcrumbs,
+shared KR Host layout (252 px sidebar, topbar with breadcrumbs,
 content ceiling 1440 px) defined once in `web/templates/layout.html`
 and styled by the token system in `web/static/app.css`.
 
 ## Global mapping decisions
 
 - **Branding:** every visible "NexHost"/"Own hPanel" becomes
-  **RK Host**. Internal identifiers (Docker labels
+  **KR Host**. Internal identifiers (Docker labels
   `own-hpanel.*`, container names, DB names, env vars) are unchanged.
 - **Theme:** white/light only, brief tokens (primary `#2563EB`,
   background `#F8FAFC`, card `#FFFFFF`, text `#0F172A`, secondary

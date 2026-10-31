@@ -125,7 +125,7 @@ func (a *App) siteDetail(w http.ResponseWriter, r *http.Request) {
 	if tab == "" {
 		tab = r.URL.Query().Get("tab")
 		if tab != "" {
-			// Legacy ?tab= URL -> canonical RK Host subroute.
+			// Legacy ?tab= URL -> canonical KR Host subroute.
 			if dest, ok := canonicalTabPath(site.SiteID, tab, r.URL.Query()); ok {
 				http.Redirect(w, r, dest, http.StatusFound)
 				return
@@ -662,7 +662,7 @@ var _ = auth.GenerateSecurePassword
 // tabCtxKey carries the forced detail tab for canonical subroutes.
 type tabCtxKey struct{}
 
-// canonicalTabPath maps a legacy ?tab= value to its RK Host path,
+// canonicalTabPath maps a legacy ?tab= value to its KR Host path,
 // preserving the extra query parameters the tab needs (files path).
 func canonicalTabPath(siteID, tab string, q url.Values) (string, bool) {
 	paths := map[string]string{
@@ -688,7 +688,7 @@ func canonicalTabPath(siteID, tab string, q url.Values) (string, bool) {
 }
 
 // siteDetailTab serves the detail page with a fixed tab, for the
-// canonical RK Host subroutes (/websites/{id}/files, /compose, ...).
+// canonical KR Host subroutes (/websites/{id}/files, /compose, ...).
 func (a *App) siteDetailTab(tab string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx := context.WithValue(r.Context(), tabCtxKey{}, tab)

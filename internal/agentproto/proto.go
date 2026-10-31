@@ -110,7 +110,7 @@ type Response struct {
 
 // ProtectedContainers is the display copy of the deployment guard
 // list (.github/workflows/deploy.yml): pre-existing production
-// containers on the host that RK Host must never modify. The agent's
+// containers on the host that KR Host must never modify. The agent's
 // real protection is label-based (it refuses every container without
 // the managed label); this set exists so the UI can badge the known
 // production workloads as protected/read-only.

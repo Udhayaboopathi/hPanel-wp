@@ -1,7 +1,7 @@
 {{template "header" .}}
 {{$d := .Data}}
 <h1>Docker Containers</h1>
-<p class="muted">Live inventory from the provisioning agent. Containers marked <strong>protected</strong> belong to other production applications on this server — RK Host never starts, stops or modifies them. RK Host sites are managed; open one to operate it.</p>
+<p class="muted">Live inventory from the provisioning agent. Containers marked <strong>protected</strong> belong to other production applications on this server — KR Host never starts, stops or modifies them. KR Host sites are managed; open one to operate it.</p>
 
 {{if $d.Error}}<div class="error-box">{{$d.Error}}</div>{{end}}
 
@@ -14,7 +14,7 @@
 <td><code>{{.Name}}</code></td>
 <td>{{.Image}}</td>
 <td><span class="badge {{if eq .State "running"}}status-running{{else}}status-{{.State}}{{end}}">{{.State}}</span></td>
-<td>{{if .Protected}}<span class="badge warn">protected · read-only</span>{{else if eq .Class "managed"}}<span class="badge info">RK Host site</span>{{else}}<span class="badge">other</span>{{end}}</td>
+<td>{{if .Protected}}<span class="badge warn">protected · read-only</span>{{else if eq .Class "managed"}}<span class="badge info">KR Host site</span>{{else}}<span class="badge">other</span>{{end}}</td>
 <td>{{if .SiteID}}<a class="btn small" href="/websites/{{.SiteID}}">Open site</a>{{end}}</td>
 </tr>
 {{end}}
