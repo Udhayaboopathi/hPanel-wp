@@ -8,6 +8,7 @@ import (
 
 	"github.com/Udhayaboopathi/hPanel-wp/internal/auth"
 	"github.com/Udhayaboopathi/hPanel-wp/internal/security"
+	"github.com/Udhayaboopathi/hPanel-wp/internal/store"
 )
 
 func (a *App) setupForm(w http.ResponseWriter, r *http.Request) {
@@ -15,7 +16,7 @@ func (a *App) setupForm(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/login", http.StatusSeeOther)
 		return
 	}
-	a.render(w, "setup.html", pageData{Title: "First-run setup"})
+	a.render(w, "setup.html", pageData{Title: "First-run setup", CSRF: a.preCSRF(w, r)})
 }
 
 func (a *App) setupSubmit(w http.ResponseWriter, r *http.Request) {
@@ -24,6 +25,10 @@ func (a *App) setupSubmit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_ = r.ParseForm()
+	if !a.validPreCSRF(r) {
+		http.Error(w, "invalid CSRF token; reload the setup page and try again", http.StatusForbidden)
+		return
+	}
 	username := strings.TrimSpace(r.FormValue("username"))
 	email := strings.TrimSpace(r.FormValue("email"))
 	password := r.FormValue("password")
@@ -54,7 +59,13 @@ func (a *App) setupSubmit(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	id, err := a.store.CreateAdmin(username, email, hash, totpSecret, enableTOTP)
+	storedTOTPSecret := totpSecret
+	if enableTOTP && a.box != nil {
+		if enc, err := a.box.Encrypt(totpSecret); err == nil {
+			storedTOTPSecret = enc // the seed is displayed once below, stored encrypted
+		}
+	}
+	id, err := a.store.CreateAdmin(username, email, hash, storedTOTPSecret, enableTOTP)
 	if err != nil {
 		a.render(w, "setup.html", pageData{Title: "First-run setup", Error: "Could not create administrator: " + err.Error()})
 		return
@@ -85,26 +96,46 @@ func (a *App) loginForm(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/setup", http.StatusSeeOther)
 		return
 	}
-	a.render(w, "login.html", pageData{Title: "Login"})
+	a.render(w, "login.html", pageData{Title: "Login", CSRF: a.preCSRF(w, r)})
 }
 
 const maxFailedLogins = 10
 
+// totpSecret returns the admin's TOTP seed in usable (plaintext)
+// form. Seeds are stored encrypted with the panel's secrets box;
+// Decrypt transparently passes through legacy plaintext rows written
+// before encryption was introduced.
+func (a *App) totpSecret(admin *store.Admin) string {
+	if admin == nil || admin.TOTPSecret == "" {
+		return ""
+	}
+	if a.box != nil {
+		if dec, err := a.box.Decrypt(admin.TOTPSecret); err == nil {
+			return dec
+		}
+	}
+	return admin.TOTPSecret
+}
+
 func (a *App) loginSubmit(w http.ResponseWriter, r *http.Request) {
 	_ = r.ParseForm()
+	if !a.validPreCSRF(r) {
+		a.render(w, "login.html", pageData{Title: "Login", CSRF: a.preCSRF(w, r), Error: "Your form session expired. Please try again."})
+		return
+	}
 	username := strings.TrimSpace(r.FormValue("username"))
 	password := r.FormValue("password")
 	ip := clientIP(r)
 	if n, _ := a.store.RecentFailedLogins(username, ip, 15*time.Minute); n >= maxFailedLogins {
 		_ = a.store.AddAudit(0, "auth.rate_limited", username, "too many failed logins", ip)
-		a.render(w, "login.html", pageData{Title: "Login", Error: "Too many failed login attempts. Try again in 15 minutes."})
+		a.render(w, "login.html", pageData{Title: "Login", CSRF: a.preCSRF(w, r), Error: "Too many failed login attempts. Try again in 15 minutes."})
 		return
 	}
 	admin, err := a.store.GetAdminByUsername(username)
 	if err != nil || !auth.VerifyPassword(admin.PasswordHash, password) {
 		_ = a.store.RecordLoginAttempt(username, ip, false)
 		_ = a.store.AddAudit(0, "auth.login_failed", username, "invalid credentials", ip)
-		a.render(w, "login.html", pageData{Title: "Login", Error: "Invalid username or password."})
+		a.render(w, "login.html", pageData{Title: "Login", CSRF: a.preCSRF(w, r), Error: "Invalid username or password."})
 		return
 	}
 	_ = a.store.RecordLoginAttempt(username, ip, true)
@@ -126,7 +157,7 @@ func (a *App) totpForm(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/login", http.StatusSeeOther)
 		return
 	}
-	a.render(w, "totp.html", pageData{Title: "Two-factor authentication"})
+	a.render(w, "totp.html", pageData{Title: "Two-factor authentication", CSRF: a.preCSRF(w, r)})
 }
 
 func (a *App) totpSubmit(w http.ResponseWriter, r *http.Request) {
@@ -136,14 +167,27 @@ func (a *App) totpSubmit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_ = r.ParseForm()
+	if !a.validPreCSRF(r) {
+		a.render(w, "totp.html", pageData{Title: "Two-factor authentication", CSRF: a.preCSRF(w, r), Error: "Your form session expired. Please try again."})
+		return
+	}
 	admin, err := a.store.GetAdminByID(adminID)
 	if err != nil {
 		http.Redirect(w, r, "/login", http.StatusSeeOther)
 		return
 	}
-	if !auth.ValidateTOTP(admin.TOTPSecret, r.FormValue("code")) {
+	// The second factor gets the SAME throttling as the password:
+	// without it, a known password buys unlimited guesses at the
+	// 6-digit code inside every 10-minute pending window.
+	if n, _ := a.store.RecentFailedLogins(admin.Username, clientIP(r), 15*time.Minute); n >= maxFailedLogins {
+		_ = a.store.AddAudit(0, "auth.rate_limited", admin.Username, "too many failed TOTP attempts", clientIP(r))
+		a.clearPending(w, r)
+		a.render(w, "login.html", pageData{Title: "Login", CSRF: a.preCSRF(w, r), Error: "Too many failed attempts. Try again in 15 minutes."})
+		return
+	}
+	if !auth.ValidateTOTP(a.totpSecret(admin), r.FormValue("code")) {
 		_ = a.store.RecordLoginAttempt(admin.Username, clientIP(r), false)
-		a.render(w, "totp.html", pageData{Title: "Two-factor authentication", Error: "Invalid code. Check your authenticator app and try again."})
+		a.render(w, "totp.html", pageData{Title: "Two-factor authentication", CSRF: a.preCSRF(w, r), Error: "Invalid code. Check your authenticator app and try again."})
 		return
 	}
 	a.clearPending(w, r)
@@ -156,22 +200,31 @@ func (a *App) totpSubmit(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) recoverForm(w http.ResponseWriter, r *http.Request) {
-	a.render(w, "recover.html", pageData{Title: "Account recovery"})
+	a.render(w, "recover.html", pageData{Title: "Account recovery", CSRF: a.preCSRF(w, r)})
 }
 
 func (a *App) recoverSubmit(w http.ResponseWriter, r *http.Request) {
 	_ = r.ParseForm()
+	if !a.validPreCSRF(r) {
+		a.render(w, "recover.html", pageData{Title: "Account recovery", CSRF: a.preCSRF(w, r), Error: "Your form session expired. Please try again."})
+		return
+	}
 	username := strings.TrimSpace(r.FormValue("username"))
 	code := r.FormValue("code")
+	if n, _ := a.store.RecentFailedLogins(username, clientIP(r), 15*time.Minute); n >= maxFailedLogins {
+		_ = a.store.AddAudit(0, "auth.rate_limited", username, "too many failed recovery attempts", clientIP(r))
+		a.render(w, "recover.html", pageData{Title: "Account recovery", CSRF: a.preCSRF(w, r), Error: "Too many failed attempts. Try again in 15 minutes."})
+		return
+	}
 	admin, err := a.store.GetAdminByUsername(username)
 	if err != nil {
-		a.render(w, "recover.html", pageData{Title: "Account recovery", Error: "Recovery failed. Check the username and code."})
+		a.render(w, "recover.html", pageData{Title: "Account recovery", CSRF: a.preCSRF(w, r), Error: "Recovery failed. Check the username and code."})
 		return
 	}
 	ok, err := a.store.ConsumeRecoveryCode(admin.ID, auth.RecoveryCodeHash(code))
 	if err != nil || !ok {
 		_ = a.store.RecordLoginAttempt(username, clientIP(r), false)
-		a.render(w, "recover.html", pageData{Title: "Account recovery", Error: "Recovery failed. That code is invalid or already used."})
+		a.render(w, "recover.html", pageData{Title: "Account recovery", CSRF: a.preCSRF(w, r), Error: "Recovery failed. That code is invalid or already used."})
 		return
 	}
 	// Recovery sign-in also disables TOTP until the admin re-enables it, and

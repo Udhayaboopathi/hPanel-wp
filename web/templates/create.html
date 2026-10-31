@@ -1,27 +1,29 @@
 {{template "header" .}}
 <h1>Create New WordPress Site</h1>
 <p class="muted">Three steps. Creating the site really provisions the container, database, storage and Traefik route — nothing here is a mock-up.</p>
+<ol class="steps"><li class="current"><span class="n">1</span>Details &amp; WordPress admin</li><li><span class="n">2</span>Preview &amp; DNS</li><li><span class="n">3</span>Create website</li></ol>
 <form method="post" action="/websites/create" id="create-form">
 {{template "csrf" .CSRF}}
 <div class="wizard-step" data-step="1">
 <h2>Step 1 — Basic information</h2>
-<label>Website Domain * <input name="domain" id="f-domain" required placeholder="example.com"></label>
-<label>Website Title <input name="title" id="f-title" placeholder="Defaults to the domain"></label>
-<label>WordPress Database Name <span class="muted">(optional — generated automatically, must be unique)</span> <input name="db_name" id="f-dbname" placeholder="auto"></label>
-<label>WordPress Admin Username * <input name="admin_user" id="f-adminuser" required value="admin"> <span class="muted">Tip: a less predictable username is safer than “admin”.</span></label>
-<label>WordPress Admin Email * <input name="admin_email" id="f-adminemail" type="email" required></label>
+<label>Website Domain * <input name="domain" id="f-domain" required placeholder="example.com" value="{{.Data.Input.Domain}}"></label>
+<label>Website Title <input name="title" id="f-title" placeholder="Defaults to the domain" value="{{.Data.Input.Title}}"></label>
+<label>WordPress Database Name <span class="muted">(optional — generated automatically, must be unique)</span> <input name="db_name" id="f-dbname" placeholder="auto" value="{{.Data.Input.DBName}}"></label>
+<label>WordPress Admin Username * <input name="admin_user" id="f-adminuser" required value="{{if .Data.Input.AdminUser}}{{.Data.Input.AdminUser}}{{else}}admin{{end}}"> <span class="muted">Tip: a less predictable username is safer than “admin”.</span></label>
+<label>WordPress Admin Email * <input name="admin_email" id="f-adminemail" type="email" required value="{{.Data.Input.AdminEmail}}"></label>
 <label>WordPress Admin Password *
   <span class="row"><input name="admin_password" id="f-adminpw" type="password" required minlength="12">
   <button type="button" class="btn" data-generate-pw="#f-adminpw">Generate Secure Password</button>
   <button type="button" class="btn" data-toggle-pw="#f-adminpw">Show/Hide</button></span>
 </label>
-<label>WordPress Admin Domain <input name="admin_domain" id="f-admindomain" placeholder="wpadmin.example.com">
+<label>WordPress Admin Domain <input name="admin_domain" id="f-admindomain" placeholder="wpadmin.example.com" value="{{.Data.Input.AdminDomain}}">
 <span class="muted">Redirect-only: it sends visitors to <code>https://your-domain/wp-admin/</code>. The WordPress login is not hosted on a separate hostname in v1 (avoids cookie/redirect problems).</span></label>
 <label>PHP Version
-  <select name="php_version" id="f-php"><option value="8.3" selected>PHP 8.3 (WordPress 6.7.2, verified)</option><option value="8.2">PHP 8.2 (WordPress 6.7.2, verified)</option></select>
+  <select name="php_version" id="f-php"><option value="8.3" {{if eq .Data.Input.PHPVersion "8.3"}}selected{{end}}>PHP 8.3 (WordPress 7.1.4)</option><option value="8.2" {{if eq .Data.Input.PHPVersion "8.2"}}selected{{end}}>PHP 8.2 (WordPress 7.1.4)</option></select>
 </label>
+{{$prof := .Data.Input.Profile}}{{if not $prof}}{{$prof = .Data.DefaultProfile}}{{end}}
 <label>Resource Profile
-  <select name="resource_profile" id="f-profile"><option value="lightweight" selected>Lightweight — 0.5 CPU, 512 MB RAM</option><option value="standard">Standard — 1 CPU, 768 MB RAM</option><option value="custom">Custom</option></select>
+  <select name="resource_profile" id="f-profile"><option value="lightweight" {{if eq $prof "lightweight"}}selected{{end}}>Lightweight — 0.5 CPU, 512 MB RAM</option><option value="standard" {{if eq $prof "standard"}}selected{{end}}>Standard — 1 CPU, 768 MB RAM</option><option value="custom" {{if eq $prof "custom"}}selected{{end}}>Custom</option></select>
 </label>
 <div id="custom-resources" hidden>
   <label>CPU limit (0.1 – 4) <input name="cpu_limit" type="number" step="0.1" min="0.1" max="4" value="0.5"></label>

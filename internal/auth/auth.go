@@ -124,12 +124,15 @@ func GenerateRecoveryCodes(n int) ([]string, []string, error) {
 	plains := make([]string, 0, n)
 	hashes := make([]string, 0, n)
 	for i := 0; i < n; i++ {
-		b := make([]byte, 5)
+		// 10 random bytes = 80 bits of entropy per code (the previous
+		// 5-byte codes carried only ~40 bits, below modern norms for
+		// a credential that bypasses both password and TOTP).
+		b := make([]byte, 10)
 		if _, err := rand.Read(b); err != nil {
 			return nil, nil, err
 		}
 		code := strings.ToUpper(hex.EncodeToString(b))
-		code = code[:5] + "-" + code[5:]
+		code = code[:5] + "-" + code[5:10] + "-" + code[10:15] + "-" + code[15:]
 		plains = append(plains, code)
 		hashes = append(hashes, HashToken(normalizeRecovery(code)))
 	}

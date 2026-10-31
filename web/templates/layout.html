@@ -1,40 +1,103 @@
 {{define "header"}}<!DOCTYPE html>
-<html lang="en" data-theme="light">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{{.Title}} · Own hPanel</title>
+<title>{{.Title}} · RK Host</title>
+<meta name="description" content="RK Host — self-hosted WordPress hosting control panel">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="/static/app.css">
-<script src="/static/htmx.min.js" defer></script>
 <script src="/static/app.js" defer></script>
 </head>
 <body>
 {{if .Admin}}
-<header class="topbar">
-  <a class="brand" href="/">Own <strong>hPanel</strong></a>
-  <nav>
-    <a href="/">Dashboard</a><a href="/websites">Websites</a><a href="/jobs">Jobs</a>
-    <a href="/backups">Backups</a><a href="/monitoring">Monitoring</a><a href="/audit">Audit</a>
-    <a href="/settings">Settings</a><a href="/account">Account</a>
-  </nav>
-  <span class="spacer"></span>
-  <button type="button" class="btn small" data-theme-toggle>🌙 / ☀️</button>
-  <span class="muted">{{.Admin.Username}}</span>
-  <form method="post" action="/logout" class="inline"><input type="hidden" name="csrf_token" value="{{.CSRF}}"><button class="btn small" type="submit">Logout</button></form>
-</header>
-<main class="wrap">
+<div class="shell">
+  <div class="scrim" data-sidebar-scrim></div>
+  <aside class="sidebar" id="sidebar">
+    <div class="brand-block">
+      <div class="logo-badge">RK</div>
+      <div><div class="brand-name">RK Host</div><div class="brand-sub">WordPress Hosting</div></div>
+    </div>
+    <a class="btn-create" href="/websites/new"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>Create Website</a>
+    <nav class="side-nav" aria-label="Main">
+      <div class="nav-label">Manage</div>
+      <a href="/dashboard" data-nav="/dashboard"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="9" rx="1"/><rect x="14" y="3" width="7" height="5" rx="1"/><rect x="14" y="12" width="7" height="9" rx="1"/><rect x="3" y="16" width="7" height="5" rx="1"/></svg>Dashboard</a>
+      <a href="/websites" data-nav="/websites"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.5 2.6 3.9 5.7 3.9 9S14.5 18.4 12 21c-2.5-2.6-3.9-5.7-3.9-9S9.5 5.6 12 3z"/></svg>Websites</a>
+      <a href="/deployments" data-nav="/deployments"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 15c5-3.5 7-8 7-12-4 0-8.5 2-12 7l-3 7 7-2z"/><circle cx="15" cy="9" r="1.6"/><path d="M9 12l-4.5 1L3 21l8-1.5L12 15"/></svg>Deployments</a>
+      <a href="/backups" data-nav="/backups"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5.5" rx="8" ry="2.8"/><path d="M4 5.5V12c0 1.6 3.6 2.8 8 2.8s8-1.2 8-2.8V5.5M4 12v6.5c0 1.6 3.6 2.8 8 2.8s8-1.2 8-2.8V12"/></svg>Backups</a>
+      <div class="nav-label">System</div>
+      <a href="/server" data-nav="/server"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 16.5h.01"/></svg>Server</a>
+      <a href="/server/containers" data-nav="/server/containers"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 8l-9-5-9 5v8l9 5 9-5V8z"/><path d="M3 8l9 5 9-5M12 13v8"/></svg>Containers</a>
+      <a href="/logs" data-nav="/logs"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 17l6-5-6-5M12 19h8"/><rect x="2" y="3" width="20" height="18" rx="2"/></svg>Logs</a>
+      <a href="/audit-logs" data-nav="/audit"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M8 6h13M8 12h13M8 18h13M3.5 6h.01M3.5 12h.01M3.5 18h.01"/></svg>Audit Logs</a>
+      <div class="nav-label">Configure</div>
+      <a href="/settings" data-nav="/settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3.2"/><path d="M19.4 15a1.7 1.7 0 00.34 1.87l.06.06a2 2 0 11-2.83 2.83l-.06-.06A1.7 1.7 0 0015 19.4a1.7 1.7 0 00-1 1.55V21a2 2 0 11-4 0v-.09A1.7 1.7 0 009 19.4a1.7 1.7 0 00-1.87.34l-.06.06a2 2 0 11-2.83-2.83l.06-.06A1.7 1.7 0 004.6 15a1.7 1.7 0 00-1.55-1H3a2 2 0 110-4h.09A1.7 1.7 0 004.6 9a1.7 1.7 0 001-1.55V3a2 2 0 114 0v.09a1.7 1.7 0 001 1.51 1.7 1.7 0 001.87-.34l.06-.06a2 2 0 112.83 2.83l-.06.06A1.7 1.7 0 0019.4 9c.24.6.86 1 1.51 1H21a2 2 0 110 4h-.09a1.7 1.7 0 00-1.51 1z"/></svg>Settings</a>
+      <a href="/settings/security" data-nav="/account"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7 3v5c0 4.5-3 8.5-7 10-4-1.5-7-5.5-7-10V6l7-3z"/><path d="M9.5 12l2 2 3.5-4"/></svg>Account &amp; Security</a>
+    </nav>
+    <div class="side-foot">
+      <div class="avatar">{{slice .Admin.Username 0 1}}</div>
+      <div class="who"><strong>{{.Admin.Username}}</strong><span>Administrator</span></div>
+      <span class="spacer"></span>
+      <form method="post" action="/logout" class="inline"><input type="hidden" name="csrf_token" value="{{.CSRF}}"><button class="btn small" type="submit" title="Log out">Logout</button></form>
+    </div>
+  </aside>
+  <div class="main">
+    <header class="topbar">
+      <button type="button" class="menu-btn" data-sidebar-toggle aria-label="Open menu">☰</button>
+      <span class="page-title">{{.Title}}</span>
+      <span class="spacer"></span>
+      <span class="crumb">RK Host Control Panel</span>
+    </header>
+    <main class="content">
 {{if .Flash}}<div class="flash">{{.Flash}}</div>{{end}}
 {{if .Error}}<div class="error-box">{{.Error}}</div>{{end}}
 {{else}}
-<main class="wrap auth-wrap">
+<div class="auth-shell">
+  <div class="auth-brand">
+    <div class="logo-badge">RK</div>
+    <div><div class="brand-name">RK Host</div><div class="brand-sub">WordPress Hosting Control Panel</div></div>
+  </div>
+  <main class="wrap auth-wrap">
 {{if .Flash}}<div class="flash">{{.Flash}}</div>{{end}}
 {{if .Error}}<div class="error-box">{{.Error}}</div>{{end}}
 {{end}}
 {{end}}
 
 {{define "footer"}}</main>
-<footer class="foot muted">Own hPanel · self-hosted WordPress control panel · all metrics on this page are read from the live system</footer>
+{{if .Admin}}
+    <footer class="foot">RK Host · self-hosted WordPress control panel · all metrics on this page are read from the live system</footer>
+  </div>
+</div>
+{{else}}
+</div>
+{{end}}
 </body>
 </html>{{end}}
 
 {{define "csrf"}}<input type="hidden" name="csrf_token" value="{{.}}">{{end}}
+
+{{define "sitenav"}}{{$s := .Site}}{{$tab := .Tab}}
+<div class="site-head">
+  <div>
+    <div class="domain">{{$s.Domain}}</div>
+    <div class="muted">{{$s.Title}} · PHP {{$s.PHPVersion}} · {{$s.ResourceProfile}} profile</div>
+  </div>
+  <span class="badge status-{{$s.Status}}">{{$s.Status}}</span>
+</div>
+<nav class="subnav" aria-label="Website">
+  <a href="/websites/{{$s.SiteID}}" {{if eq $tab "overview"}}class="active"{{end}}>Overview</a>
+  <a href="/websites/{{$s.SiteID}}/wordpress" {{if eq $tab "wp"}}class="active"{{end}}>WordPress</a>
+  <a href="/websites/{{$s.SiteID}}/domains" {{if eq $tab "domain"}}class="active"{{end}}>Domains &amp; SSL</a>
+  <a href="/websites/{{$s.SiteID}}/performance" {{if eq $tab "performance"}}class="active"{{end}}>Performance</a>
+  <a href="/websites/{{$s.SiteID}}/files" {{if eq $tab "files"}}class="active"{{end}}>Files</a>
+  <a href="/websites/{{$s.SiteID}}/environment" {{if eq $tab "env"}}class="active"{{end}}>Environment</a>
+  <a href="/websites/{{$s.SiteID}}/compose" {{if eq $tab "yaml"}}class="active"{{end}}>Compose</a>
+  <a href="/websites/{{$s.SiteID}}/database" {{if eq $tab "db"}}class="active"{{end}}>Database</a>
+  <a href="/websites/{{$s.SiteID}}/backups" {{if eq $tab "backups"}}class="active"{{end}}>Backups</a>
+  <a href="/websites/{{$s.SiteID}}/restore" {{if eq $tab "restore"}}class="active"{{end}}>Restore</a>
+  <a href="/websites/{{$s.SiteID}}/jobs" {{if eq $tab "jobs"}}class="active"{{end}}>Jobs</a>
+  <a href="/websites/{{$s.SiteID}}/settings" {{if eq $tab "settings"}}class="active"{{end}}>Settings</a>
+</nav>
+{{end}}

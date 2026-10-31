@@ -41,6 +41,7 @@ type dashData struct {
 	TraefikOK   bool
 	Alerts      []string
 	BackupCount int
+	Bars        []sampleBar
 }
 
 func (a *App) agentUp() bool { return a.agent != nil && a.agent.Available() }
@@ -57,8 +58,10 @@ func (a *App) dashboard(w http.ResponseWriter, r *http.Request) {
 			backupOK++
 		}
 	}
+	dsamples, _ := a.store.ListResourceSamples("host", "", 120)
 	d := dashData{
 		Host: host, Counts: counts, Total: total,
+		Bars:    makeBars(dsamples, float64(host.MemTotal)),
 		Running: counts["ready"] + counts["dns_pending"],
 		Stopped: counts["stopped"], Failed: counts["failed"],
 		Recent: recent, AgentUp: a.agentUp(), BackupCount: backupOK,
@@ -90,7 +93,7 @@ func (a *App) websitesList(w http.ResponseWriter, r *http.Request) {
 	}
 	a.render(w, "websites.html", pageData{Title: "Websites", Admin: adminFrom(r), CSRF: sessionFrom(r).CSRFToken, Data: map[string]any{
 		"Sites": sites, "Total": total, "Page": page, "Pages": (total + perPage - 1) / perPage,
-		"Q": q, "Status": status,
+		"Q": q, "Status": status, "Sort": r.URL.Query().Get("sort"),
 	}, Flash: r.URL.Query().Get("flash")})
 }
 
@@ -98,7 +101,7 @@ func (a *App) websitesList(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) createForm(w http.ResponseWriter, r *http.Request) {
 	a.render(w, "create.html", pageData{Title: "Create New WordPress Site", Admin: adminFrom(r), CSRF: sessionFrom(r).CSRFToken,
-		Data: map[string]any{"ServerIP": a.cfg.ServerIP}})
+		Data: map[string]any{"ServerIP": a.cfg.ServerIP, "Input": websites.CreateInput{}, "DefaultProfile": a.store.GetSetting("default_profile", "")}})
 }
 
 func parseCreateInput(r *http.Request) websites.CreateInput {
@@ -160,7 +163,7 @@ func (a *App) createSubmit(w http.ResponseWriter, r *http.Request) {
 	in := parseCreateInput(r)
 	fail := func(msg string) {
 		a.render(w, "create.html", pageData{Title: "Create New WordPress Site", Admin: adminFrom(r), CSRF: sessionFrom(r).CSRFToken,
-			Error: msg, Data: map[string]any{"ServerIP": a.cfg.ServerIP, "Input": in}})
+			Error: msg, Data: map[string]any{"ServerIP": a.cfg.ServerIP, "Input": in, "DefaultProfile": a.store.GetSetting("default_profile", "")}})
 	}
 	if err := in.Validate(); err != nil {
 		fail(err.Error())
@@ -174,6 +177,22 @@ func (a *App) createSubmit(w http.ResponseWriter, r *http.Request) {
 	if _, err := a.store.GetWebsiteByDomain(in.Domain); err == nil {
 		fail("A website with domain " + in.Domain + " already exists in the panel.")
 		return
+	}
+	// Domain/alias collisions in EVERY direction must fail loudly:
+	// previously an admin-domain collision was silently swallowed by
+	// an INSERT OR IGNORE while the site still published a Traefik
+	// router for the alias, so two sites could fight over one Host().
+	if all, _, _ := a.store.ListWebsites("", "all", 1000, 0); all != nil {
+		for _, s := range all {
+			if s.Domain == in.AdminDomain || s.AdminDomain == in.AdminDomain {
+				fail("The admin domain " + in.AdminDomain + " is already used by " + s.Domain + ". Choose a different admin alias.")
+				return
+			}
+			if s.AdminDomain == in.Domain {
+				fail("Domain " + in.Domain + " is already used as the admin alias of " + s.Domain + ".")
+				return
+			}
+		}
 	}
 	// Capacity checks against real host state.
 	host := monitoring.Sample("/")
@@ -310,6 +329,39 @@ func (a *App) siteAction(kind, op string) http.HandlerFunc {
 	}
 }
 
+// siteRepair enqueues a repair_site job: the agent verifies the
+// site's database and files still exist, then recreates only the
+// missing container against them. The operator may supply a NEW
+// WordPress admin password (used only if WordPress was never
+// installed - the original is never stored); leaving it blank leaves
+// the browser setup wizard for an uninstalled site.
+func (a *App) siteRepair(w http.ResponseWriter, r *http.Request) {
+	site := a.getSiteOr404(w, r)
+	if site == nil {
+		return
+	}
+	_ = r.ParseForm()
+	spec, err := a.agentSpec(site, true)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	if pw := r.FormValue("admin_password"); pw != "" {
+		if len(pw) < 12 {
+			http.Redirect(w, r, "/websites/"+site.SiteID+"?flash=The new WordPress admin password must be at least 12 characters (or leave it blank).", http.StatusSeeOther)
+			return
+		}
+		spec.AdminPassword = pw
+	}
+	a.audit(r, "website.repair_site", site.SiteID, "domain="+site.Domain)
+	job, err := a.runner.EnqueueSimple(site, "repair_site", agentproto.Request{Op: agentproto.OpRepairSite, Site: spec})
+	if err != nil {
+		http.Redirect(w, r, "/websites/"+site.SiteID+"?flash=Error: "+err.Error(), http.StatusSeeOther)
+		return
+	}
+	http.Redirect(w, r, "/jobs/"+job.ID, http.StatusSeeOther)
+}
+
 func (a *App) siteDelete(w http.ResponseWriter, r *http.Request) {
 	site := a.getSiteOr404(w, r)
 	if site == nil {
@@ -343,8 +395,11 @@ func (a *App) siteDelete(w http.ResponseWriter, r *http.Request) {
 				_ = a.store.DeleteWebsite(siteID)
 				return
 			}
-			if err == nil && (j.Status == "failed" || j.Status == "cancelled") {
-				_ = a.store.UpdateWebsite(siteID, map[string]any{"status": "ready"})
+			if err == nil && (j.Status == "failed" || j.Status == "cancelled" || j.Status == "interrupted") {
+				// Deletion did not complete: the site still exists.
+				// 'failed' is the honest status (NOT 'ready' - its
+				// container state did not change and may be anything).
+				_ = a.store.UpdateWebsite(siteID, map[string]any{"status": "failed"})
 				return
 			}
 			time.Sleep(2 * time.Second)
@@ -395,6 +450,9 @@ func (a *App) reconcileBackup(jobID string, backupID int64) {
 			b, err := a.store.GetBackup(backupID)
 			if err != nil {
 				return
+			}
+			if b.Status == "ready" && b.Path != "" {
+				return // the runner already recorded the agent's authoritative path+checksum
 			}
 			entries, _ := filepath.Glob(filepath.Join(a.cfg.BackupsDir, b.SiteID+"-*.tar.gz"))
 			sort.Strings(entries)
@@ -449,19 +507,52 @@ func (a *App) siteRestore(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/websites/"+site.SiteID+"?tab=backups&flash=Type RESTORE to confirm restoring this backup.", http.StatusSeeOther)
 		return
 	}
-	// Safety: always take a fresh backup before a restore.
+	// Safety: ALWAYS take a fresh backup before a restore, and only
+	// start the restore once that backup has succeeded - a restore
+	// overwrites the site's files and database, so the pre-restore
+	// state must exist as a fallback artifact first. (An earlier
+	// version of this handler carried this comment but never actually
+	// created the backup.)
 	spec, err := a.agentSpec(site, true)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	a.audit(r, "website.restore", site.SiteID, fmt.Sprintf("backup_id=%d", id))
-	job, err := a.runner.EnqueueSimple(site, "restore_site", agentproto.Request{Op: agentproto.OpRestoreSite, Site: spec, BackupID: id, BackupPath: backup.Path})
+	a.audit(r, "website.restore", site.SiteID, fmt.Sprintf("backup_id=%d safety_backup_first=true", id))
+	b := &store.Backup{SiteID: site.SiteID, Filename: "pending", Status: "creating", Storage: "local"}
+	b.WebsiteID.Int64 = site.ID
+	b.WebsiteID.Valid = true
+	safetyID, err := a.store.CreateBackup(b)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	http.Redirect(w, r, "/jobs/"+job.ID, http.StatusSeeOther)
+	backupJob, err := a.runner.EnqueueSimple(site, "backup_site", agentproto.Request{Op: agentproto.OpBackupSite, Site: spec, BackupID: safetyID})
+	if err != nil {
+		_ = a.store.UpdateBackup(safetyID, "failed", "", 0, false)
+		http.Redirect(w, r, "/websites/"+site.SiteID+"?tab=backups&flash=Restore not started: the safety backup could not be queued ("+err.Error()+").", http.StatusSeeOther)
+		return
+	}
+	go a.reconcileBackup(backupJob.ID, safetyID)
+	// Chain the restore behind the safety backup.
+	go func() {
+		for i := 0; i < 360; i++ {
+			j, err := a.store.GetJob(backupJob.ID)
+			if err == nil && j.Status == "succeeded" {
+				_, rerr := a.runner.EnqueueSimple(site, "restore_site", agentproto.Request{Op: agentproto.OpRestoreSite, Site: spec, BackupID: id, BackupPath: backup.Path, ExpectedSHA256: backup.SHA256})
+				if rerr != nil {
+					_ = a.store.AddAudit(0, "website.restore_enqueue_failed", site.SiteID, rerr.Error(), "")
+				}
+				return
+			}
+			if err == nil && (j.Status == "failed" || j.Status == "cancelled" || j.Status == "interrupted") {
+				_ = a.store.AddAudit(0, "website.restore_aborted", site.SiteID, "safety backup did not succeed; restore was NOT started", "")
+				return
+			}
+			time.Sleep(2 * time.Second)
+		}
+	}()
+	http.Redirect(w, r, "/jobs/"+backupJob.ID+"?flash=Safety backup started. The restore begins automatically when the backup completes - watch the Jobs page.", http.StatusSeeOther)
 }
 
 func (a *App) backupDownload(w http.ResponseWriter, r *http.Request) {
@@ -499,7 +590,9 @@ func (a *App) siteWP(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/websites/"+site.SiteID+"?tab=wp&flash="+err.Error(), http.StatusSeeOther)
 		return
 	}
-	// Potentially disruptive updates get a backup first (operator can watch both jobs).
+	// NOTE: no automatic backup is taken here - the WordPress tab
+	// instructs the operator to use its "Backup website first" button
+	// before disruptive updates.
 	spec, err := a.agentSpec(site, true)
 	if err != nil {
 		http.Error(w, err.Error(), 500)

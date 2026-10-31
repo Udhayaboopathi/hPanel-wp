@@ -50,6 +50,12 @@ func (in *CreateInput) Validate() error {
 	if in.Title == "" {
 		in.Title = in.Domain
 	}
+	// The title is interpolated into generated files (site .env as
+	// WORDPRESS_TITLE, compose labels, the WP install): a newline in
+	// it would inject extra lines/keys into those files.
+	if strings.ContainsAny(in.Title, "\r\n") {
+		return fmt.Errorf("site title must not contain line breaks")
+	}
 	if in.DBName != "" {
 		if err := security.ValidateDBName(in.DBName); err != nil {
 			return err

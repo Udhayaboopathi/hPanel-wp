@@ -1,22 +1,34 @@
 {{template "header" .}}
 {{$d := .Data}}{{$s := $d.Site}}{{$csrf := .CSRF}}
-<div class="row-between"><h1>{{$s.Domain}}</h1><span class="badge status-{{$s.Status}}">{{$s.Status}}</span></div>
-{{if ne $d.Tab "overview"}}<p><a href="/websites/{{$s.SiteID}}">← Back to {{$s.Domain}}</a></p>{{end}}
+{{template "sitenav" $d}}
 
 {{if eq $d.Tab "overview"}}
 {{if $d.LatestJob}}{{if eq $d.LatestJob.Status "failed"}}
 <section class="card">
 <h2>⚠ Last job failed — {{$d.LatestJob.Kind}}</h2>
 <p>{{if $d.LatestJob.Error}}{{$d.LatestJob.Error}}{{else}}{{$d.LatestJob.Message}}{{end}}</p>
-<p><a class="btn" href="/jobs/{{$d.LatestJob.ID}}">View job &amp; retry</a></p>
+<p><a class="btn" href="/deployments/{{$d.LatestJob.ID}}">View job &amp; retry</a></p>
 </section>
 {{else if or (eq $d.LatestJob.Status "queued") (eq $d.LatestJob.Status "running")}}
 <section class="card">
 <h2>{{$d.LatestJob.Kind}} — {{$d.LatestJob.Status}} ({{$d.LatestJob.Progress}}%)</h2>
 <p>{{$d.LatestJob.Message}}</p>
-<p><a class="btn" href="/jobs/{{$d.LatestJob.ID}}">View job</a></p>
+<p><a class="btn" href="/deployments/{{$d.LatestJob.ID}}">View job</a></p>
 </section>
 {{end}}{{end}}
+
+{{if or (eq $s.Status "failed") (eq $s.Status "missing")}}
+<section class="card">
+<h2>Repair website</h2>
+<p>The site's container is missing, but its database and files are kept. Repair first verifies both still exist, then recreates <strong>only the container</strong> against them. Nothing is overwritten.</p>
+<form method="post" action="/websites/{{$s.SiteID}}/repair">
+{{template "csrf" $csrf}}
+<label>New WordPress admin password (optional — only used if WordPress was never installed; the original password is never stored)
+<input type="password" name="admin_password" minlength="12" placeholder="Leave blank to finish setup in the browser instead"></label>
+<button class="btn primary" type="submit" data-confirm="Repair this website? The container is recreated; the database and files are verified first and kept.">Repair website (recreate container)</button>
+</form>
+</section>
+{{end}}
 
 <section class="card">
 <h2>Your website</h2>
@@ -55,25 +67,11 @@
 <form method="post" action="/websites/{{$s.SiteID}}/stop" class="inline">{{template "csrf" $csrf}}<button class="btn small" type="submit" data-confirm="Stop this website? Its files and database are kept.">Stop</button></form>
 <form method="post" action="/websites/{{$s.SiteID}}/restart" class="inline">{{template "csrf" $csrf}}<button class="btn small" type="submit">Restart</button></form>
 <form method="post" action="/websites/{{$s.SiteID}}/backup" class="inline">{{template "csrf" $csrf}}<button class="btn small" type="submit">Backup</button></form>
-<a class="btn small" href="/websites/{{$s.SiteID}}/logs/view">Logs &amp; events</a>
-<a class="btn small" href="/monitoring">Server monitoring</a>
+<a class="btn small" href="/logs?site={{$s.SiteID}}">Logs &amp; events</a>
+<a class="btn small" href="/server">Server overview</a>
 </div>
 </section>
 
-<details class="card">
-<summary>Advanced tools (rarely needed — most editing happens in WordPress Admin)</summary>
-<ul>
-<li><a href="/websites/{{$s.SiteID}}?tab=wp">WordPress tools (WP-CLI, reset admin password)</a></li>
-<li><a href="/websites/{{$s.SiteID}}?tab=backups">Backups</a></li>
-<li><a href="/websites/{{$s.SiteID}}?tab=jobs">Jobs for this website</a></li>
-<li><a href="/websites/{{$s.SiteID}}?tab=domain">Domain &amp; SSL</a></li>
-<li><a href="/websites/{{$s.SiteID}}?tab=db">Database</a></li>
-<li><a href="/websites/{{$s.SiteID}}?tab=env">Environment</a></li>
-<li><a href="/websites/{{$s.SiteID}}?tab=files">File manager</a></li>
-<li><a href="/websites/{{$s.SiteID}}?tab=yaml">Compose YAML</a></li>
-<li><a href="/websites/{{$s.SiteID}}?tab=danger">Delete website</a></li>
-</ul>
-</details>
 {{end}}
 
 {{if eq $d.Tab "env"}}
@@ -129,12 +127,12 @@
 <button class="btn primary" type="submit">Save file</button></form>
 {{end}}
 <table><thead><tr><th>Name</th><th>Size</th><th>Actions</th></tr></thead><tbody>
-{{if $d.FilePath}}<tr><td><a href="/websites/{{$s.SiteID}}?tab=files">.. (site root)</a></td><td></td><td></td></tr>{{end}}
+{{if $d.FilePath}}<tr><td><a href="/websites/{{$s.SiteID}}/files">.. (site root)</a></td><td></td><td></td></tr>{{end}}
 {{range $d.Files}}<tr>
-<td>{{if .IsDir}}📁 <a href="/websites/{{$s.SiteID}}?tab=files&amp;path={{.Path}}">{{.Name}}</a>{{else}}📄 {{.Name}}{{if .Sensitive}} <span class="badge">sensitive — hidden</span>{{end}}{{end}}</td>
+<td>{{if .IsDir}}📁 <a href="/websites/{{$s.SiteID}}/files?path={{.Path}}">{{.Name}}</a>{{else}}📄 {{.Name}}{{if .Sensitive}} <span class="badge">sensitive — hidden</span>{{end}}{{end}}</td>
 <td>{{humanBytes .Size}}</td>
 <td class="actions">
-{{if and (not .IsDir) .Editable}}<a class="btn small" href="/websites/{{$s.SiteID}}?tab=files&amp;path={{$d.FilePath}}&amp;view={{.Path}}">View / Edit</a>{{end}}
+{{if and (not .IsDir) .Editable}}<a class="btn small" href="/websites/{{$s.SiteID}}/files?path={{$d.FilePath}}&amp;view={{.Path}}">View / Edit</a>{{end}}
 {{if and (not .IsDir) (not .Sensitive)}}<a class="btn small" href="/websites/{{$s.SiteID}}/files/download?path={{.Path}}">Download</a>{{end}}
 <form method="post" action="/websites/{{$s.SiteID}}/files/rename" class="inline">{{template "csrf" $csrf}}<input type="hidden" name="path" value="{{.Path}}"><input name="new_name" placeholder="new name" required><button class="btn small" type="submit">Rename</button></form>
 <form method="post" action="/websites/{{$s.SiteID}}/files/delete" class="inline">{{template "csrf" $csrf}}<input type="hidden" name="path" value="{{.Path}}"><input name="confirm" placeholder="type DELETE"><button class="btn small danger" type="submit">Delete</button></form>
@@ -214,14 +212,14 @@ Type: A    Name: wpadmin  Value: {{$.ServerIP}}</pre>
 <td class="actions">{{if eq .Status "ready"}}<a class="btn small" href="/websites/{{$s.SiteID}}/backups/{{.ID}}/download">Download</a>
 <form method="post" action="/websites/{{$s.SiteID}}/backups/{{.ID}}/restore" class="inline">{{template "csrf" $csrf}}<input name="confirm" placeholder="type RESTORE"><button class="btn small danger" type="submit">Restore</button></form>{{end}}</td></tr>{{end}}
 </tbody></table>{{else}}<p class="muted">No backups yet.</p>{{end}}
-<p class="muted">Backups include the database dump and all site files, streamed to a .tar.gz and verified by SHA-256 before being marked ready. The on-server RustFS instance is not off-server storage — configure a genuinely external S3 destination in Settings for off-server copies.</p>
+<p class="muted">Backups include the database dump and all site files, streamed to a .tar.gz and verified by SHA-256 before being marked ready. Backups are currently stored on this server only — keep your own off-server copies of anything you cannot afford to lose.</p>
 </section>
 {{end}}
 
 {{if eq $d.Tab "jobs"}}
 <section class="card"><h2>Deployment Jobs</h2>
 {{if $d.Jobs}}<table><thead><tr><th>Job</th><th>Kind</th><th>Status</th><th>Progress</th><th>Message</th><th></th></tr></thead><tbody>
-{{range $d.Jobs}}<tr><td><a href="/jobs/{{.ID}}">{{slice .ID 0 12}}…</a></td><td>{{.Kind}}</td><td><span class="badge">{{.Status}}</span></td><td>{{.Progress}}%</td><td>{{.Message}}{{if .Error}}<br><span class="muted">{{.Error}}</span>{{end}}</td><td>{{since .CreatedAt}}</td></tr>{{end}}
+{{range $d.Jobs}}<tr><td><a href="/deployments/{{.ID}}">{{slice .ID 0 12}}…</a></td><td>{{.Kind}}</td><td><span class="badge">{{.Status}}</span></td><td>{{.Progress}}%</td><td>{{.Message}}{{if .Error}}<br><span class="muted">{{.Error}}</span>{{end}}</td><td>{{since .CreatedAt}}</td></tr>{{end}}
 </tbody></table>{{else}}<p class="muted">No jobs yet for this website.</p>{{end}}
 </section>
 {{end}}

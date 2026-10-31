@@ -14,6 +14,10 @@ import (
 	"time"
 )
 
+// MaxExtractBytes caps the total decompressed size of a backup
+// archive during extraction (decompression-bomb guard).
+const MaxExtractBytes = 15 << 30
+
 type Metadata struct {
 	SiteID    string `json:"site_id"`
 	Domain    string `json:"domain"`
@@ -138,6 +142,7 @@ func ExtractTarGz(archivePath, destDir string) error {
 	}
 	tr := tar.NewReader(gz)
 	cleanDest, _ := filepath.Abs(destDir)
+	var extracted int64
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
@@ -163,6 +168,10 @@ func ExtractTarGz(archivePath, destDir string) error {
 				return err
 			}
 		case tar.TypeReg:
+			extracted += hdr.Size
+			if extracted > MaxExtractBytes {
+				return fmt.Errorf("archive extracts to more than %d bytes; refusing (possible decompression bomb)", MaxExtractBytes)
+			}
 			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 				return err
 			}

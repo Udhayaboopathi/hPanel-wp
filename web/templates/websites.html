@@ -5,9 +5,9 @@
   <input name="q" value="{{$d.Q}}" placeholder="Search domain, name or site id">
   <select name="status">
     <option value="all">All statuses</option>
-    {{range $s := list "ready" "dns_pending" "provisioning" "installing" "stopped" "failed" "deleting"}}<option value="{{$s}}" {{if eq $d.Status $s}}selected{{end}}>{{$s}}</option>{{end}}
+    {{range $s := list "ready" "dns_pending" "provisioning" "stopped" "failed" "missing" "deleting"}}<option value="{{$s}}" {{if eq $d.Status $s}}selected{{end}}>{{$s}}</option>{{end}}
   </select>
-  <select name="sort"><option value="">Newest first</option><option value="domain">Domain A–Z</option></select>
+  <select name="sort"><option value="" {{if not $d.Sort}}selected{{end}}>Newest first</option><option value="domain" {{if eq $d.Sort "domain"}}selected{{end}}>Domain A–Z</option></select>
   <button class="btn" type="submit">Filter</button>
 </form>
 {{if $d.Sites}}

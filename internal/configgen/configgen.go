@@ -49,15 +49,15 @@ func ValidateResources(cpu float64, memMB int) error {
 func PHPImage(php string) (string, error) {
 	switch php {
 	case "8.3":
-		return "wordpress:6.7.2-php8.3-apache", nil
+		return "wordpress:7.1.4-php8.3-apache", nil
 	case "8.2":
-		return "wordpress:6.7.2-php8.2-apache", nil
+		return "wordpress:7.1.4-php8.2-apache", nil
 	default:
 		return "", fmt.Errorf("PHP version %q is not verified compatible", php)
 	}
 }
 
-func WPVersion() string { return "6.7.2" }
+func WPVersion() string { return "7.1.4" }
 
 type SiteSpec struct {
 	SiteID        string
@@ -87,6 +87,7 @@ func TraefikLabels(s SiteSpec) map[string]string {
 	labels := map[string]string{
 		"own-hpanel.managed":                                            "true",
 		"own-hpanel.site-id":                                            s.SiteID,
+		"own-hpanel.resource":                                           "wordpress",
 		"own-hpanel.domain":                                             s.Domain,
 		"traefik.enable":                                                "true",
 		"traefik.docker.network":                                        "redberyl-internal",
@@ -145,6 +146,12 @@ func EnvMap(s SiteSpec) map[string]string {
 // GenerateEnv renders a .env file (0600 on disk; values are secrets - never log).
 func GenerateEnv(s SiteSpec) string {
 	m := EnvMap(s)
+	// Defence in depth: no value may ever inject extra lines into the
+	// generated file (a title with a newline would otherwise smuggle
+	// in attacker-chosen keys). Inputs are validated upstream too.
+	for k, v := range m {
+		m[k] = strings.ReplaceAll(strings.ReplaceAll(v, "\r", " "), "\n", " ")
+	}
 	keys := make([]string, 0, len(m))
 	for k := range m {
 		keys = append(keys, k)
@@ -234,7 +241,7 @@ networks:
 `, img, s.ContainerName, s.DBHost, s.DBName, s.DBUser, dataDir, lb.String(),
 		s.Profile.CPUs, s.Profile.MemMB, s.Profile.ReserveMB,
 		s.Profile.MemMB, s.Profile.ReserveMB, s.Profile.CPUs, s.Network)
-	if err := security.ValidateComposePolicy(yaml, s.SiteDir); err != nil {
+	if err := security.ValidateComposePolicy(yaml, s.SiteDir, s.Domain, s.AdminDomain); err != nil {
 		return "", fmt.Errorf("generated compose failed policy validation: %w", err)
 	}
 	return yaml, nil

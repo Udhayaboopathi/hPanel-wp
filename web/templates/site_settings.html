@@ -1,0 +1,52 @@
+{{template "header" .}}
+{{$d := .Data}}{{$s := $d.Site}}{{$csrf := .CSRF}}
+{{template "sitenav" $d}}
+
+<section class="card">
+<h2>Website settings</h2>
+<table class="kv">
+<tr><th>Domain</th><td>{{$s.Domain}}</td></tr>
+{{if $s.AdminDomain}}<tr><th>Admin alias</th><td>{{$s.AdminDomain}} → https://{{$s.Domain}}/wp-admin/</td></tr>{{end}}
+<tr><th>Title</th><td>{{$s.Title}}</td></tr>
+<tr><th>WordPress version</th><td>{{if $s.WPVersion}}{{$s.WPVersion}}{{else}}not recorded yet{{end}}</td></tr>
+<tr><th>PHP version</th><td>{{$s.PHPVersion}}</td></tr>
+<tr><th>Resource profile</th><td>{{$s.ResourceProfile}} · {{printf "%.2f" $s.CPULimit}} CPU max · {{$s.MemLimitMB}} MB RAM max</td></tr>
+<tr><th>Database</th><td>{{$s.DBName}} (user {{$s.DBUser}}){{if $d.DBSize}} · {{humanBytes $d.DBSize}}{{end}}</td></tr>
+<tr><th>SSL</th><td>{{if $d.SSL}}{{if $d.SSL.OK}}Valid · {{$d.SSL.Issuer}} · expires {{$d.SSL.ExpiresAt}} ({{$d.SSL.DaysLeft}} days){{else}}Not verified — {{$d.SSL.Detail}}{{end}}{{else}}Not checked yet — use the check on the <a href="/websites/{{$s.SiteID}}/domains">Domains &amp; SSL</a> page{{end}}</td></tr>
+<tr><th>Container</th><td>{{$s.ContainerName}}{{if $s.ContainerID}} · {{slice $s.ContainerID 0 12}}{{end}}</td></tr>
+<tr><th>Created</th><td>{{since $s.CreatedAt}}</td></tr>
+</table>
+<p class="muted">Site content and WordPress settings are edited in the <a href="https://{{$s.Domain}}/wp-admin/" target="_blank" rel="noopener">WordPress Admin</a>. Configuration that the server enforces — environment values and the Docker Compose definition — lives under <a href="/websites/{{$s.SiteID}}/environment">Environment</a> and <a href="/websites/{{$s.SiteID}}/compose">Compose</a>. Changing the domain is done from <a href="/websites/{{$s.SiteID}}/domains">Domains &amp; SSL</a>.</p>
+</section>
+
+<section class="card">
+<h2>Lifecycle</h2>
+<div class="actions">
+<form method="post" action="/websites/{{$s.SiteID}}/start" class="inline">{{template "csrf" $csrf}}<button class="btn" type="submit">Start</button></form>
+<form method="post" action="/websites/{{$s.SiteID}}/stop" class="inline">{{template "csrf" $csrf}}<button class="btn" type="submit" data-confirm="Stop this website? Its files and database are kept.">Stop</button></form>
+<form method="post" action="/websites/{{$s.SiteID}}/restart" class="inline">{{template "csrf" $csrf}}<button class="btn" type="submit">Restart</button></form>
+<form method="post" action="/websites/{{$s.SiteID}}/backup" class="inline">{{template "csrf" $csrf}}<button class="btn" type="submit">Create backup</button></form>
+</div>
+</section>
+
+{{if or (eq $s.Status "failed") (eq $s.Status "missing")}}
+<section class="card">
+<h2>Repair website</h2>
+<p>The site's container is missing, but its database and files are kept. Repair first verifies both still exist, then recreates <strong>only the container</strong> against them. Nothing is overwritten.</p>
+<form method="post" action="/websites/{{$s.SiteID}}/repair">
+{{template "csrf" $csrf}}
+<label>New WordPress admin password (optional — only used if WordPress was never installed; the original password is never stored)
+<input type="password" name="admin_password" minlength="12" placeholder="Leave blank to finish setup in the browser instead"></label>
+<button class="btn primary" type="submit" data-confirm="Repair this website? The container is recreated; the database and files are verified first and kept.">Repair website (recreate container)</button>
+</form>
+</section>
+{{end}}
+
+<section class="card danger-zone">
+<h2>Delete website</h2>
+<p>This permanently removes the container, this site's database and user, and this site's files. Other websites and all unrelated production applications are not touched. Take a backup first if you might need this site again.</p>
+<form method="post" action="/websites/{{$s.SiteID}}/delete">{{template "csrf" $csrf}}
+<label>Type the exact domain ({{$s.Domain}}) to confirm <input name="confirm_domain" required></label>
+<button class="btn danger big" type="submit">Delete website</button></form>
+</section>
+{{template "footer" .}}

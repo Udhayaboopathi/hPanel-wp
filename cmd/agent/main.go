@@ -25,6 +25,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -50,7 +51,12 @@ import (
 
 const (
 	traefikNetwork = "redberyl-internal"
-	serverIP       = "130.210.42.20"
+	// maxExtractBytes caps the total decompressed size of a backup
+	// archive during restore (decompression-bomb guard). 15 GiB is
+	// far above any single lightweight WordPress site's real size on
+	// this host while staying well under the disk's free headroom.
+	maxExtractBytes = 15 << 30
+	serverIP        = "130.210.42.20"
 )
 
 type Agent struct {
@@ -192,6 +198,8 @@ func (a *Agent) execute(w http.ResponseWriter, r *http.Request) {
 		resp, err = a.stats(ctx)
 	case agentproto.OpLogs:
 		resp, err = a.siteLogs(ctx, req)
+	case agentproto.OpRepairSite:
+		resp, err = a.repairSite(ctx, req)
 	}
 	if err != nil {
 		if resp == nil {
@@ -200,6 +208,16 @@ func (a *Agent) execute(w http.ResponseWriter, r *http.Request) {
 		resp.OK = false
 		if resp.Error == "" {
 			resp.Error = err.Error()
+		}
+		if resp.ErrorCategory == "" {
+			var oe *opError
+			if errors.As(err, &oe) {
+				resp.ErrorCategory = oe.category
+			}
+			var amb *docker.AmbiguousError
+			if errors.As(err, &amb) {
+				resp.ErrorCategory = agentproto.ErrCatAmbiguous
+			}
 		}
 		a.log.Warn("operation failed", "op", req.Op, "site", req.Site.SiteID, "err", resp.Error)
 		writeResp(w, 200, *resp) // operational failures are data, not transport errors
@@ -247,7 +265,12 @@ func (a *Agent) siteDirFor(s agentproto.SiteSpec) (string, error) {
 	return dir, nil
 }
 
-func (a *Agent) guardExisting(ctx context.Context, name string) error {
+// guardExisting refuses to let a create proceed when a container
+// already owns the target name but is not THIS site's container:
+// unmanaged squatters and other sites' containers alike. (A container
+// that IS this site's - matching site-id label - passes; createSite's
+// idempotency path reuses it.)
+func (a *Agent) guardExisting(ctx context.Context, name, siteID string) error {
 	c, err := a.docker.FindByName(ctx, name)
 	if err != nil {
 		return err
@@ -258,8 +281,8 @@ func (a *Agent) guardExisting(ctx context.Context, name string) error {
 	if c.Labels[docker.ManagedLabel] != "true" {
 		return fmt.Errorf("production guard: container %q exists and is not managed by Own hPanel; refusing", name)
 	}
-	if c.Labels["own-hpanel.site-id"] != "" {
-		// Caller checks the site id match where relevant.
+	if owner := c.Labels["own-hpanel.site-id"]; owner != "" && owner != siteID {
+		return fmt.Errorf("production guard: container %q belongs to site %s, not %s; refusing", name, owner, siteID)
 	}
 	return nil
 }
@@ -289,8 +312,12 @@ func (a *Agent) usesCommonUser(dbUser string) bool {
 // mariadbArgv builds the SQL-client argv used inside the dedicated DB
 // container. It always authenticates as the configured common admin user -
 // never as root.
-func mariadbArgv(adminUser, adminPassword, joinedSQL string) []string {
-	return []string{"mariadb", "-u" + adminUser, "-p" + adminPassword, "-e", joinedSQL}
+// mariadbArgv builds the SQL client argv WITHOUT the password: the
+// password travels as the MYSQL_PWD environment variable of the exec
+// instance (see mariadbExec), never in argv where the host process
+// list would expose the all-sites provisioning credential.
+func mariadbArgv(adminUser, joinedSQL string) []string {
+	return []string{"mariadb", "-u" + adminUser, "-e", joinedSQL}
 }
 
 func (a *Agent) mariadbExec(ctx context.Context, sqlStatements []string) (string, error) {
@@ -300,7 +327,7 @@ func (a *Agent) mariadbExec(ctx context.Context, sqlStatements []string) (string
 	joined := strings.Join(sqlStatements, " ")
 	// ExecDB is the exec-only path into the panel-managed DB container; it
 	// cannot start/stop/remove anything.
-	out, code, err := a.docker.ExecDB(ctx, a.db.Container, mariadbArgv(a.db.AdminUser, a.db.AdminPassword, joined))
+	out, code, err := a.docker.ExecDBEnv(ctx, a.db.Container, mariadbArgv(a.db.AdminUser, joined), []string{"MYSQL_PWD=" + a.db.AdminPassword})
 	if err != nil {
 		return "", err
 	}
@@ -394,13 +421,23 @@ func (a *Agent) createSite(ctx context.Context, req agentproto.Request) (*agentp
 	add := func(p int, msg string) {
 		resp.Events = append(resp.Events, agentproto.Event{Progress: p, Message: msg, Level: "info"})
 	}
-	if err := validateSite(s, true); err != nil {
+	if err := validateSite(s, false); err != nil {
 		return resp, err
+	}
+	// The DB password is always required (it is stored encrypted and
+	// the panel supplies it). The WP admin password is required for a
+	// fresh create, but not in RepairMode: it is never stored, and a
+	// repair of an already-installed site never needs it.
+	if s.DBPassword == "" {
+		return resp, fmt.Errorf("missing required secret material for provisioning (database password)")
+	}
+	if s.AdminPassword == "" && !req.RepairMode {
+		return resp, fmt.Errorf("missing required secret material for provisioning (WordPress admin password)")
 	}
 	if err := a.refuseDBContainer(s.ContainerName); err != nil {
 		return resp, err
 	}
-	if err := a.guardExisting(ctx, s.ContainerName); err != nil {
+	if err := a.guardExisting(ctx, s.ContainerName, s.SiteID); err != nil {
 		return resp, err
 	}
 	// Router/domain conflict check against existing Traefik-labelled containers.
@@ -518,8 +555,10 @@ func (a *Agent) createSite(ctx context.Context, req agentproto.Request) (*agentp
 	}
 	add(55, "site storage, .env and compose configuration written")
 
-	// Idempotency: if our own container already exists, reuse it.
-	existing, err := a.docker.FindByName(ctx, s.ContainerName)
+	// Idempotency: if this site's container already exists (resolved
+	// by ownership labels, not by name - a recreated container keeps
+	// its labels but may have a new name/ID), reuse it.
+	existing, err := a.docker.FindBySiteID(ctx, s.SiteID)
 	if err != nil {
 		return resp, err
 	}
@@ -609,11 +648,17 @@ func (a *Agent) createSite(ctx context.Context, req agentproto.Request) (*agentp
 		"WORDPRESS_DB_HOST=" + a.db.InternalHost(), "WORDPRESS_DB_NAME=" + s.DBName,
 		"WORDPRESS_DB_USER=" + effDBUser, "WORDPRESS_DB_PASSWORD=" + effDBPassword,
 	}
-	_, installedErr := a.runOneShot(ctx, s, "wordpress:cli-2.11.0-php8.3",
+	_, installedErr := a.runOneShot(ctx, s, "wordpress:cli-2.12.0-php8.3",
 		[]string{"wp", "core", "is-installed", "--allow-root"}, env, nil, network)
-	if installedErr != nil {
+	if installedErr != nil && s.AdminPassword == "" {
+		// Repair without an admin password: the container and site are
+		// fully provisioned; only the WordPress first-run install is
+		// left to the browser setup wizard, which is WordPress's own
+		// supported flow. Not a failure.
+		resp.Events = append(resp.Events, agentproto.Event{Progress: 90, Message: "WordPress is not installed yet and no admin password was supplied: open the website and complete the WordPress setup wizard in the browser to create the administrator account", Level: "warn"})
+	} else if installedErr != nil {
 		installArgs := wordpress.InstallArgs("https://"+s.Domain, s.Title, s.AdminUser, s.AdminPassword, s.AdminEmail)
-		out, err := a.runOneShot(ctx, s, "wordpress:cli-2.11.0-php8.3", installArgs, env, nil, network)
+		out, err := a.runOneShot(ctx, s, "wordpress:cli-2.12.0-php8.3", installArgs, env, nil, network)
 		if err != nil {
 			return resp, fmt.Errorf("WP-CLI install failed: %w", err)
 		}
@@ -635,6 +680,49 @@ func (a *Agent) createSite(ctx context.Context, req agentproto.Request) (*agentp
 	return resp, nil
 }
 
+// opError is an operational failure with a machine-readable category
+// (agentproto.ErrCat*) that the panel uses for retry policy, website
+// status updates and recovery hints.
+type opError struct {
+	category string
+	msg      string
+}
+
+func (e *opError) Error() string { return e.msg }
+
+func catErr(category, format string, args ...any) *opError {
+	return &opError{category: category, msg: fmt.Sprintf(format, args...)}
+}
+
+// resolveSiteContainer finds the site's WordPress container by its
+// ownership labels - never by name. Identity rules:
+//   - exactly one container carries the site's managed labels -> it,
+//     whatever its current name or ID (recreation-safe);
+//   - several -> ambiguous error (operator reconciles; never guess);
+//   - none, but a container with the expected NAME exists -> guard
+//     error: it is not panel-owned for this site and is never adopted
+//     on name similarity alone;
+//   - none at all -> not_found error with a recovery hint; the site's
+//     database and files are untouched by definition.
+func (a *Agent) resolveSiteContainer(ctx context.Context, s agentproto.SiteSpec) (*docker.Container, error) {
+	c, err := a.docker.FindBySiteID(ctx, s.SiteID)
+	if err != nil {
+		return nil, err // includes *docker.AmbiguousError
+	}
+	if c != nil {
+		return c, nil
+	}
+	if s.ContainerName != "" {
+		byName, nerr := a.docker.FindByName(ctx, s.ContainerName)
+		if nerr == nil && byName != nil {
+			return nil, catErr(agentproto.ErrCatGuard,
+				"a container named %q exists but does not carry own-hpanel ownership labels for site %s; refusing to adopt or modify it - reconcile it manually", s.ContainerName, s.SiteID)
+		}
+	}
+	return nil, catErr(agentproto.ErrCatNotFound,
+		"container for site %s is missing: no container carries the own-hpanel.site-id=%s ownership label (resolution is by label, not by name). The site's database and files were not touched. Use Repair Website to recreate the container from the existing database and files", s.SiteID, s.SiteID)
+}
+
 func (a *Agent) lifecycle(ctx context.Context, req agentproto.Request, action string) (*agentproto.Response, error) {
 	s := req.Site
 	if err := security.ValidateSiteID(s.SiteID); err != nil {
@@ -643,28 +731,113 @@ func (a *Agent) lifecycle(ctx context.Context, req agentproto.Request, action st
 	if err := a.refuseDBContainer(s.ContainerName); err != nil {
 		return nil, err
 	}
-	c, err := a.docker.FindByName(ctx, s.ContainerName)
+	c, err := a.resolveSiteContainer(ctx, s)
 	if err != nil {
 		return nil, err
 	}
-	if c == nil {
-		return nil, fmt.Errorf("container %q not found", s.ContainerName)
-	}
-	if c.Labels["own-hpanel.site-id"] != s.SiteID {
-		return nil, fmt.Errorf("production guard: container does not belong to site %s", s.SiteID)
-	}
+	running := c.State == "running"
+	done := ""
 	switch action {
 	case "start":
-		err = a.docker.Start(ctx, c.ID)
+		if running {
+			done = "container already running; nothing to do"
+		} else {
+			err = a.docker.Start(ctx, c.ID)
+			done = "container started"
+		}
 	case "stop":
-		err = a.docker.Stop(ctx, c.ID, 15)
+		if !running {
+			done = "container already stopped; nothing to do"
+		} else {
+			err = a.docker.Stop(ctx, c.ID, 15)
+			done = "container stopped"
+		}
 	case "restart":
-		err = a.docker.Restart(ctx, c.ID, 15)
+		if running {
+			err = a.docker.Restart(ctx, c.ID, 15)
+			done = "container restarted"
+		} else {
+			// Restart of a stopped container means "bring it back":
+			// start it (documented lifecycle semantics). Restart never
+			// recreates a missing container - that is Repair's job.
+			err = a.docker.Start(ctx, c.ID)
+			done = "container was stopped; started it"
+		}
 	}
 	if err != nil {
 		return nil, err
 	}
-	return &agentproto.Response{OK: true, ContainerID: c.ID, Events: []agentproto.Event{{Progress: 100, Message: "container " + action + " completed", Level: "info"}}}, nil
+	return &agentproto.Response{OK: true, ContainerID: c.ID, Events: []agentproto.Event{{Progress: 100, Message: done + " (" + c.ID[:12] + ")", Level: "info"}}}, nil
+}
+
+// repairSite is the explicit, controlled recovery for a site whose
+// container is missing: it first verifies that the site's files and
+// database still exist (repair never recreates lost data and never
+// silently provisions an empty replacement), then re-runs the
+// idempotent provisioning path, which reuses the existing database
+// and files and only recreates the container.
+func (a *Agent) repairSite(ctx context.Context, req agentproto.Request) (*agentproto.Response, error) {
+	s := req.Site
+	resp := &agentproto.Response{}
+	if err := validateSite(s, false); err != nil {
+		return resp, err
+	}
+	if s.DBPassword == "" {
+		return resp, fmt.Errorf("repair requires the site's database password (the panel supplies it from encrypted storage)")
+	}
+	if err := a.refuseDBContainer(s.ContainerName); err != nil {
+		return resp, err
+	}
+	// Already healthy? Nothing to repair.
+	if c, err := a.resolveSiteContainer(ctx, s); err == nil && c != nil {
+		resp.OK = true
+		resp.ContainerID = c.ID
+		resp.Events = append(resp.Events, agentproto.Event{Progress: 100, Message: "container already exists (" + c.ID[:12] + ", state " + c.State + "); nothing to repair", Level: "info"})
+		return resp, nil
+	} else if err != nil {
+		var oe *opError
+		if !errors.As(err, &oe) || oe.category != agentproto.ErrCatNotFound {
+			return resp, err // guard/ambiguous/daemon errors are not repairable by recreation
+		}
+	}
+	// Verify the site's files survived.
+	siteDir, err := a.siteDirFor(s)
+	if err != nil {
+		return resp, err
+	}
+	if st, serr := os.Stat(filepath.Join(siteDir, "data")); serr != nil || !st.IsDir() {
+		return resp, catErr(agentproto.ErrCatDataMissing,
+			"repair aborted: the site's files (%s/data) are missing, so there is nothing safe to recreate the container against. Restore a backup, or delete the site and create it again", siteDir)
+	}
+	resp.Events = append(resp.Events, agentproto.Event{Progress: 20, Message: "repair: site files verified present", Level: "info"})
+	// Verify the site's database survived.
+	out, err := a.mariadbExec(ctx, []string{"SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME='" + s.DBName + "';"})
+	if err != nil {
+		return resp, fmt.Errorf("repair: checking the site database: %w", err)
+	}
+	if !strings.Contains(out, s.DBName) {
+		return resp, catErr(agentproto.ErrCatDataMissing,
+			"repair aborted: database %s no longer exists in the dedicated MariaDB, so the site's content is gone. Restore a backup, or delete the site and create it again - repair will not silently create an empty replacement database", s.DBName)
+	}
+	resp.Events = append(resp.Events, agentproto.Event{Progress: 40, Message: "repair: database " + s.DBName + " verified present; recreating the container against the existing data", Level: "info"})
+	// Recreate through the normal idempotent provisioning path: it
+	// reuses the existing database/user and files, skips the WP
+	// install when WordPress is already installed, and only creates
+	// the missing container.
+	createReq := req
+	createReq.RepairMode = true
+	created, err := a.createSite(ctx, createReq)
+	if created != nil {
+		resp.Events = append(resp.Events, created.Events...)
+		resp.ContainerID = created.ContainerID
+		resp.DNSPending = created.DNSPending
+		resp.UsedCommonDBUser = created.UsedCommonDBUser
+	}
+	if err != nil {
+		return resp, err
+	}
+	resp.OK = true
+	return resp, nil
 }
 
 func (a *Agent) deleteSite(ctx context.Context, req agentproto.Request) (*agentproto.Response, error) {
@@ -676,14 +849,20 @@ func (a *Agent) deleteSite(ctx context.Context, req agentproto.Request) (*agentp
 	if err := a.refuseDBContainer(s.ContainerName); err != nil {
 		return resp, err
 	}
-	c, err := a.docker.FindByName(ctx, s.ContainerName)
+	// Resolve by ownership labels. A missing container must NOT block
+	// deletion (the database and files still need cleanup); guard and
+	// ambiguity errors must.
+	c, err := a.resolveSiteContainer(ctx, s)
 	if err != nil {
-		return resp, err
+		var oe *opError
+		if errors.As(err, &oe) && oe.category == agentproto.ErrCatNotFound {
+			resp.Events = append(resp.Events, agentproto.Event{Progress: 20, Message: "site container already missing; continuing with database and file cleanup", Level: "warn"})
+			c = nil
+		} else {
+			return resp, err
+		}
 	}
 	if c != nil {
-		if c.Labels["own-hpanel.site-id"] != s.SiteID {
-			return resp, fmt.Errorf("production guard: container does not belong to site %s", s.SiteID)
-		}
 		_ = a.docker.Stop(ctx, c.ID, 15)
 		if err := a.docker.Remove(ctx, c.ID, false); err != nil {
 			return resp, err
@@ -746,12 +925,14 @@ func (a *Agent) backupSite(ctx context.Context, req agentproto.Request) (*agentp
 	defer os.RemoveAll(stage)
 	// Dump via a one-shot MariaDB client container on the site network so no
 	// port is ever published. Shell is used only inside this disposable
-	// container with validated identifiers and an escaped generated password.
-	dumpCmd := fmt.Sprintf("mariadb-dump -h %s -u %s -p'%s' --single-transaction --routines %s > /stage/db.sql",
-		a.db.InternalHost(), s.DBUser, database.EscapeLiteral(s.DBPassword), s.DBName)
+	// container with validated identifiers; the DB password travels via
+	// the helper's MYSQL_PWD environment, never interpolated into the
+	// shell string (an SQL-literal escaper is not a shell quoter).
+	dumpCmd := fmt.Sprintf("mariadb-dump -h %s -u %s --single-transaction --routines %s > /stage/db.sql",
+		a.db.InternalHost(), s.DBUser, s.DBName)
 	helper := agentproto.SiteSpec{SiteID: s.SiteID}
 	_ = helper
-	if _, err := a.runOneShot(ctx, s, "mariadb:11.4", []string{"sh", "-c", dumpCmd}, nil,
+	if _, err := a.runOneShot(ctx, s, "mariadb:11.4", []string{"sh", "-c", dumpCmd}, []string{"MYSQL_PWD=" + s.DBPassword},
 		[]string{stage + ":/stage"}, websites.NetworkName(s.SiteID)); err != nil {
 		return resp, fmt.Errorf("database dump failed: %w", err)
 	}
@@ -791,11 +972,25 @@ func (a *Agent) restoreSite(ctx context.Context, req agentproto.Request) (*agent
 	if err := validateSiteBasic(s); err != nil {
 		return resp, err
 	}
-	if req.BackupPath == "" || !strings.HasPrefix(req.BackupPath, a.backupsDir) {
+	cleanBackups := filepath.Clean(a.backupsDir)
+	if req.BackupPath == "" || (filepath.Clean(req.BackupPath) != cleanBackups && !strings.HasPrefix(filepath.Clean(req.BackupPath), cleanBackups+string(os.PathSeparator))) {
 		return resp, fmt.Errorf("backup path must be inside the panel backups directory")
 	}
 	if _, err := os.Stat(req.BackupPath); err != nil {
 		return resp, fmt.Errorf("backup artifact not found")
+	}
+	// Integrity gate: when the panel supplies the recorded checksum,
+	// the artifact must match it BEFORE anything is extracted or
+	// imported - a swapped or corrupted artifact is never restored.
+	if req.ExpectedSHA256 != "" {
+		ok, got, err := backups.Verify(req.BackupPath, req.ExpectedSHA256)
+		if err != nil {
+			return resp, fmt.Errorf("verifying backup checksum: %w", err)
+		}
+		if !ok {
+			return resp, fmt.Errorf("backup checksum mismatch: recorded %s, artifact hashes to %s - refusing to restore", req.ExpectedSHA256, got)
+		}
+		resp.Events = append(resp.Events, agentproto.Event{Progress: 10, Message: "backup checksum verified", Level: "info"})
 	}
 	siteDir, err := a.siteDirFor(s)
 	if err != nil {
@@ -819,9 +1014,9 @@ func (a *Agent) restoreSite(ctx context.Context, req agentproto.Request) (*agent
 		resp.Events = append(resp.Events, agentproto.Event{Progress: 50, Message: "files restored", Level: "info"})
 	}
 	if dbSQL != "" {
-		importCmd := fmt.Sprintf("mariadb -h %s -u %s -p'%s' %s < /stage/db.sql",
-			a.db.InternalHost(), s.DBUser, database.EscapeLiteral(s.DBPassword), s.DBName)
-		if _, err := a.runOneShot(ctx, s, "mariadb:11.4", []string{"sh", "-c", importCmd}, nil,
+		importCmd := fmt.Sprintf("mariadb -h %s -u %s %s < /stage/db.sql",
+			a.db.InternalHost(), s.DBUser, s.DBName)
+		if _, err := a.runOneShot(ctx, s, "mariadb:11.4", []string{"sh", "-c", importCmd}, []string{"MYSQL_PWD=" + s.DBPassword},
 			[]string{stage + ":/stage:ro"}, websites.NetworkName(s.SiteID)); err != nil {
 			return resp, fmt.Errorf("database restore failed: %w", err)
 		}
@@ -846,6 +1041,7 @@ func extractAll(archivePath, dest string) (string, error) {
 	tr := tar.NewReader(gz)
 	cleanDest, _ := filepath.Abs(dest)
 	var dbPath string
+	var extracted int64 // cumulative decompression-bomb guard (see maxExtractBytes)
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
@@ -866,6 +1062,10 @@ func extractAll(archivePath, dest string) (string, error) {
 		case tar.TypeReg:
 			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 				return "", err
+			}
+			extracted += hdr.Size
+			if extracted > maxExtractBytes {
+				return "", fmt.Errorf("archive extracts to more than %d bytes; refusing (possible decompression bomb)", maxExtractBytes)
 			}
 			out, err := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o640)
 			if err != nil {
@@ -935,7 +1135,7 @@ func (a *Agent) wpcli(ctx context.Context, req agentproto.Request) (*agentproto.
 		}
 		args := wordpress.ResetPasswordArgs(req.Arg, req.NewDBPassword)
 		env := []string{"WORDPRESS_DB_HOST=" + a.db.InternalHost(), "WORDPRESS_DB_NAME=" + s.DBName, "WORDPRESS_DB_USER=" + s.DBUser, "WORDPRESS_DB_PASSWORD=" + s.DBPassword}
-		out, err := a.runOneShot(ctx, s, "wordpress:cli-2.11.0-php8.3", args, env, nil, websites.NetworkName(s.SiteID))
+		out, err := a.runOneShot(ctx, s, "wordpress:cli-2.12.0-php8.3", args, env, nil, websites.NetworkName(s.SiteID))
 		if err != nil {
 			return nil, err
 		}
@@ -946,7 +1146,7 @@ func (a *Agent) wpcli(ctx context.Context, req agentproto.Request) (*agentproto.
 		return nil, err
 	}
 	env := []string{"WORDPRESS_DB_HOST=" + a.db.InternalHost(), "WORDPRESS_DB_NAME=" + s.DBName, "WORDPRESS_DB_USER=" + s.DBUser, "WORDPRESS_DB_PASSWORD=" + s.DBPassword}
-	out, err := a.runOneShot(ctx, s, "wordpress:cli-2.11.0-php8.3", cmd.Args, env, nil, websites.NetworkName(s.SiteID))
+	out, err := a.runOneShot(ctx, s, "wordpress:cli-2.12.0-php8.3", cmd.Args, env, nil, websites.NetworkName(s.SiteID))
 	if err != nil {
 		return nil, err
 	}
@@ -970,7 +1170,7 @@ func (a *Agent) applyConfig(ctx context.Context, req agentproto.Request) (*agent
 		return resp, fmt.Errorf("no compose configuration supplied")
 	}
 	// The agent independently re-validates the policy - panel checks are not trusted.
-	if err := security.ValidateComposePolicy(req.Site.ComposeYAML, siteDir); err != nil {
+	if err := security.ValidateComposePolicy(req.Site.ComposeYAML, siteDir, s.Domain, s.AdminDomain); err != nil {
 		return resp, fmt.Errorf("compose policy rejected by agent: %w", err)
 	}
 	if req.Site.EnvText != "" {
@@ -985,12 +1185,9 @@ func (a *Agent) applyConfig(ctx context.Context, req agentproto.Request) (*agent
 	if _, err := a.createSite(ctx, agentproto.Request{Op: agentproto.OpCreateSite, Site: s}); err != nil {
 		// createSite is idempotent and will reuse a running container; a config
 		// change that alters the container spec requires explicit recreation:
-		c, ferr := a.docker.FindByName(ctx, s.ContainerName)
+		c, ferr := a.resolveSiteContainer(ctx, s)
 		if ferr != nil || c == nil {
 			return resp, err
-		}
-		if c.Labels["own-hpanel.site-id"] != s.SiteID {
-			return resp, fmt.Errorf("production guard: container does not belong to this site")
 		}
 		_ = a.docker.Stop(ctx, c.ID, 15)
 		if rerr := a.docker.Remove(ctx, c.ID, false); rerr != nil {
@@ -1052,12 +1249,9 @@ func (a *Agent) siteLogs(ctx context.Context, req agentproto.Request) (*agentpro
 	if err := security.ValidateSiteID(s.SiteID); err != nil {
 		return nil, err
 	}
-	c, err := a.docker.FindByName(ctx, s.ContainerName)
+	c, err := a.resolveSiteContainer(ctx, s)
 	if err != nil {
 		return nil, err
-	}
-	if c == nil || c.Labels["own-hpanel.site-id"] != s.SiteID {
-		return nil, fmt.Errorf("production guard: container not found for this site")
 	}
 	out, err := a.docker.Logs(ctx, c.ID, 300)
 	if err != nil {

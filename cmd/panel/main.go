@@ -74,6 +74,7 @@ type App struct {
 
 	mu      sync.Mutex
 	pending map[string]pendingLogin // totp/recovery pending state, memory only
+	once    map[string]string       // one-time display values (TOTP seed, recovery codes): shown once, never in URLs
 }
 
 type pendingLogin struct {
@@ -103,7 +104,7 @@ func main() {
 		AgentToken:    envOr("AGENT_TOKEN_FILE", "/opt/own-hpanel/secrets/agent.token"),
 		ServerIP:      envOr("SERVER_IP", "130.210.42.20"),
 		PanelDomain:   os.Getenv("PANEL_DOMAIN"),
-		SecureCookies: envBool("PANEL_SECURE_COOKIES", false),
+		SecureCookies: envBool("PANEL_SECURE_COOKIES", true), // secure by default; explicit opt-out only for local dev
 		SiteDBHost:    envOr("DB_CONTAINER", dbconfig.DefaultContainer),
 	}
 	st, err := openStore(log, dataDir)
@@ -147,7 +148,7 @@ func main() {
 		log.Error("parse templates", "err", err)
 		os.Exit(1)
 	}
-	app := &App{cfg: cfg, store: st, box: box, agent: agent, tmpl: tmpl, log: log, pending: map[string]pendingLogin{}}
+	app := &App{cfg: cfg, store: st, box: box, agent: agent, tmpl: tmpl, log: log, pending: map[string]pendingLogin{}, once: map[string]string{}}
 	app.runner = provisioning.New(st, agent)
 
 	mux := http.NewServeMux()
@@ -165,6 +166,36 @@ func main() {
 	mux.HandleFunc("POST /logout", app.requireAuth(app.logout))
 	mux.HandleFunc("POST /logout-all", app.requireAuth(app.logoutAll))
 	mux.HandleFunc("GET /{$}", app.requireAuth(app.dashboard))
+	// RK Host canonical routes (Stitch UI). The legacy paths below
+	// them keep working; both spellings serve the same handlers.
+	mux.HandleFunc("GET /dashboard", app.requireAuth(app.dashboard))
+	mux.HandleFunc("GET /deployments", app.requireAuth(app.jobsList))
+	mux.HandleFunc("GET /deployments/{id}", app.requireAuth(app.jobDetail))
+	mux.HandleFunc("POST /deployments/{id}/retry", app.requireAuth(app.jobRetry))
+	mux.HandleFunc("POST /deployments/{id}/cancel", app.requireAuth(app.jobCancel))
+	mux.HandleFunc("GET /websites/new/details", app.requireAuth(app.createForm))
+	mux.HandleFunc("GET /websites/new/admin", app.requireAuth(app.createForm))
+	mux.HandleFunc("GET /websites/new/review", app.requireAuth(app.createForm))
+	mux.HandleFunc("GET /websites/new/progress", app.requireAuth(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/deployments", http.StatusFound)
+	}))
+	mux.HandleFunc("GET /server", app.requireAuth(app.monitoringPage))
+	mux.HandleFunc("GET /server/containers", app.requireAuth(app.containersPage))
+	mux.HandleFunc("GET /logs", app.requireAuth(app.logsPage))
+	mux.HandleFunc("GET /audit-logs", app.requireAuth(app.auditList))
+	mux.HandleFunc("GET /settings/security", app.requireAuth(app.accountPage))
+	mux.HandleFunc("GET /websites/import", app.requireAuth(app.importPage))
+	mux.HandleFunc("GET /websites/{site}/wordpress", app.requireAuth(app.siteDetailTab("wp")))
+	mux.HandleFunc("GET /websites/{site}/domains", app.requireAuth(app.siteDetailTab("domain")))
+	mux.HandleFunc("GET /websites/{site}/performance", app.requireAuth(app.performancePage))
+	mux.HandleFunc("GET /websites/{site}/files", app.requireAuth(app.siteDetailTab("files")))
+	mux.HandleFunc("GET /websites/{site}/environment", app.requireAuth(app.siteDetailTab("env")))
+	mux.HandleFunc("GET /websites/{site}/compose", app.requireAuth(app.siteDetailTab("yaml")))
+	mux.HandleFunc("GET /websites/{site}/database", app.requireAuth(app.siteDetailTab("db")))
+	mux.HandleFunc("GET /websites/{site}/backups", app.requireAuth(app.siteDetailTab("backups")))
+	mux.HandleFunc("GET /websites/{site}/jobs", app.requireAuth(app.siteDetailTab("jobs")))
+	mux.HandleFunc("GET /websites/{site}/restore", app.requireAuth(app.restorePage))
+	mux.HandleFunc("GET /websites/{site}/settings", app.requireAuth(app.siteSettingsPage))
 	mux.HandleFunc("GET /websites", app.requireAuth(app.websitesList))
 	mux.HandleFunc("GET /websites/new", app.requireAuth(app.createForm))
 	mux.HandleFunc("POST /websites/preview", app.requireAuth(app.createPreview))
@@ -176,6 +207,7 @@ func main() {
 	mux.HandleFunc("POST /websites/{site}/restart", app.requireAuth(app.siteAction("restart_site", agentproto.OpRestartSite)))
 	mux.HandleFunc("POST /websites/{site}/delete", app.requireAuth(app.siteDelete))
 	mux.HandleFunc("POST /websites/{site}/backup", app.requireAuth(app.siteBackup))
+	mux.HandleFunc("POST /websites/{site}/repair", app.requireAuth(app.siteRepair))
 	mux.HandleFunc("POST /websites/{site}/backups/{id}/restore", app.requireAuth(app.siteRestore))
 	mux.HandleFunc("GET /websites/{site}/backups/{id}/download", app.requireAuth(app.backupDownload))
 	mux.HandleFunc("POST /websites/{site}/wp", app.requireAuth(app.siteWP))
@@ -210,17 +242,25 @@ func main() {
 	mux.HandleFunc("GET /settings", app.requireAuth(app.settingsPage))
 	mux.HandleFunc("POST /settings", app.requireAuth(app.settingsSave))
 	mux.HandleFunc("GET /api/metrics", app.requireAuth(app.apiMetrics))
+	mux.HandleFunc("GET /api/logs", app.requireAuth(app.apiLogs))
 	mux.HandleFunc("GET /api/websites", app.requireAuth(app.apiWebsites))
 	mux.HandleFunc("GET /api/jobs/{id}", app.requireAuth(app.apiJob))
 	mux.HandleFunc("/", app.notFound)
 
-	// Periodic housekeeping: expire sessions, prune samples, refresh DB sizes is agent-driven.
+	// Continuous resource sampler for the live graphs (dashboard,
+	// server, per-site performance).
+	go app.sampleLoop()
+
+	// Periodic housekeeping: expire sessions, prune samples and old
+	// history rows. (DB sizes are refreshed on the website detail
+	// page via the agent's OpDBSize.)
 	go func() {
 		t := time.NewTicker(10 * time.Minute)
 		defer t.Stop()
 		for range t.C {
 			_ = st.DeleteExpiredSessions()
 			_ = st.PruneResourceSamples(7)
+			_ = st.PruneHistory(90)
 		}
 	}()
 
@@ -339,11 +379,14 @@ func (a *App) notFound(w http.ResponseWriter, r *http.Request) {
 }
 
 func clientIP(r *http.Request) string {
-	// Panel sits behind Traefik; only trust X-Forwarded-For's first hop value
-	// for rate limiting display - auth decisions never rely on it alone.
+	// The panel sits behind Traefik, which APPENDS the real client IP
+	// to X-Forwarded-For. The LAST hop is therefore the value our own
+	// proxy vouches for; the first hop is whatever the client claimed
+	// and is trivially spoofable. (Rate limiting also matches on
+	// username, so this is attribution hygiene, not a sole control.)
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
 		parts := strings.Split(xff, ",")
-		return strings.TrimSpace(parts[0])
+		return strings.TrimSpace(parts[len(parts)-1])
 	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
@@ -433,6 +476,33 @@ func (a *App) startSession(w http.ResponseWriter, r *http.Request, admin *store.
 		Expires: auth.NewSessionExpiry(),
 	})
 	return nil
+}
+
+// preCSRF issues/reads the double-submit token that protects the
+// UNAUTHENTICATED forms (setup, login, TOTP, recovery): those routes
+// cannot use the session CSRF token because no session exists yet.
+// A cross-site POST cannot read the cookie, so it cannot forge the
+// matching form field. This closes login-CSRF and, more importantly,
+// a cross-site submission against the one-shot first-run setup.
+func (a *App) preCSRF(w http.ResponseWriter, r *http.Request) string {
+	if c, err := r.Cookie("own_hpanel_pre_csrf"); err == nil && len(c.Value) >= 32 {
+		return c.Value
+	}
+	tok := randomToken()
+	http.SetCookie(w, &http.Cookie{
+		Name: "own_hpanel_pre_csrf", Value: tok, Path: "/",
+		HttpOnly: true, Secure: a.cfg.SecureCookies, SameSite: http.SameSiteLaxMode,
+		MaxAge: 3600,
+	})
+	return tok
+}
+
+func (a *App) validPreCSRF(r *http.Request) bool {
+	c, err := r.Cookie("own_hpanel_pre_csrf")
+	if err != nil || c.Value == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(c.Value), []byte(r.FormValue("csrf_token"))) == 1
 }
 
 func (a *App) setPending(w http.ResponseWriter, adminID int64) {

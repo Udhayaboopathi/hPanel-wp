@@ -18,8 +18,19 @@
 </section>
 <p class="muted">Database (the stack's dedicated wordpress-mariadb container) and Traefik status are verified by the provisioning agent during site operations and shown on each website page; the panel itself has no Docker access, so it never guesses these.</p>
 <section class="card">
+<h2>Server load history</h2>
+{{if $d.Bars}}
+<p class="muted">Sampled every minute by the panel. Blue = CPU (% of one core), teal = memory (% of total RAM). Newest on the right.</p>
+<div style="display:flex;align-items:flex-end;gap:3px;height:110px;border-bottom:1px solid var(--line);padding-top:8px">
+{{range $d.Bars}}<div style="flex:1;display:flex;align-items:flex-end;gap:1px;min-width:4px" title="{{.When}} — CPU {{printf "%.1f" .CPUPct}}% · Memory {{printf "%.1f" .MemPct}}%"><div style="flex:1;background:var(--primary);border-radius:2px 2px 0 0;height:{{.CPUBH}}%"></div><div style="flex:1;background:var(--info);border-radius:2px 2px 0 0;height:{{.MemBH}}%"></div></div>{{end}}
+</div>
+{{else}}
+<div class="empty"><strong>No history yet</strong>The panel samples server load every minute — the graph appears after the first samples are recorded.</div>
+{{end}}
+</section>
+<section class="card">
 <h2>Recent deployment activity</h2>
-{{if $d.Recent}}<ul class="events">{{range $d.Recent}}<li><span class="muted">{{since .CreatedAt}}</span> <span class="badge {{.Level}}">{{.Level}}</span> {{.Message}} <a href="/jobs/{{.JobID}}">job</a></li>{{end}}</ul>
+{{if $d.Recent}}<ul class="events">{{range $d.Recent}}<li><span class="muted">{{since .CreatedAt}}</span> <span class="badge {{.Level}}">{{.Level}}</span> {{.Message}} <a href="/deployments/{{.JobID}}">job</a></li>{{end}}</ul>
 {{else}}<p class="muted">No deployments yet. Create your first WordPress site to get started.</p>{{end}}
 </section>
 {{template "footer" .}}

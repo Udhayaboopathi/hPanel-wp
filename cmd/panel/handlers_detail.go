@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -45,8 +46,21 @@ type liveStats struct {
 // ("<container> site=<id> cpu=3.2% mem=12345/67890"). A missing line
 // means the container is not running.
 func parseSiteStats(output, siteID string) *liveStats {
+	return parseAllStats(output)[siteID]
+}
+
+// parseAllStats parses every site line of an OpStats response into a
+// siteID-keyed map (used by the background sampler).
+func parseAllStats(output string) map[string]*liveStats {
+	out := map[string]*liveStats{}
 	for _, line := range strings.Split(output, "\n") {
-		if !strings.Contains(line, "site="+siteID) {
+		var siteID string
+		for _, f := range strings.Fields(line) {
+			if strings.HasPrefix(f, "site=") {
+				siteID = strings.TrimPrefix(f, "site=")
+			}
+		}
+		if siteID == "" {
 			continue
 		}
 		st := &liveStats{Running: true}
@@ -62,9 +76,9 @@ func parseSiteStats(output, siteID string) *liveStats {
 				}
 			}
 		}
-		return st
+		out[siteID] = st
 	}
-	return nil
+	return out
 }
 
 type detailData struct {
@@ -85,6 +99,17 @@ type detailData struct {
 	DBSize      int64
 	AgentUp     bool
 	Live        *liveStats
+	Samples     []store.ResourceSample
+	Bars        []sampleBar
+}
+
+// sampleBar is one normalized history bar for the performance page.
+type sampleBar struct {
+	When   string
+	CPUPct float64
+	MemPct float64
+	CPUBH  int // bar heights in percent, precomputed for the template
+	MemBH  int
 }
 
 func (a *App) siteRoot(site *store.Website) string {
@@ -96,8 +121,16 @@ func (a *App) siteDetail(w http.ResponseWriter, r *http.Request) {
 	if site == nil {
 		return
 	}
-	tab := r.URL.Query().Get("tab")
+	tab, _ := r.Context().Value(tabCtxKey{}).(string)
 	if tab == "" {
+		tab = r.URL.Query().Get("tab")
+		if tab != "" {
+			// Legacy ?tab= URL -> canonical RK Host subroute.
+			if dest, ok := canonicalTabPath(site.SiteID, tab, r.URL.Query()); ok {
+				http.Redirect(w, r, dest, http.StatusFound)
+				return
+			}
+		}
 		tab = "overview"
 	}
 	d := detailData{Site: site, Tab: tab, AgentUp: a.agentUp(), DBSize: a.store.DBSize(site.SiteID)}
@@ -115,8 +148,22 @@ func (a *App) siteDetail(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
 		if resp, err := a.agent.Call(ctx, agentproto.Request{Op: agentproto.OpStats}); err == nil && resp.OK {
 			d.Live = parseSiteStats(resp.Output, site.SiteID)
+			if d.Live != nil {
+				_ = a.store.AddResourceSample("site", site.SiteID, d.Live.CPUPercent, int64(d.Live.MemUsage))
+			}
 		}
 		cancel()
+		// Refresh the cached database size from the agent (it was
+		// previously never measured at all, so the UI showed 0
+		// forever). Best effort; persist for other views.
+		if spec, err := a.agentSpec(site, false); err == nil {
+			ctx2, cancel2 := context.WithTimeout(r.Context(), 8*time.Second)
+			if resp, err := a.agent.Call(ctx2, agentproto.Request{Op: agentproto.OpDBSize, Site: spec}); err == nil && resp.OK && resp.DBSizeBytes > 0 {
+				d.DBSize = resp.DBSizeBytes
+				_ = a.store.UpdateDBSize(site.SiteID, resp.DBSizeBytes)
+			}
+			cancel2()
+		}
 	}
 	d.Backups, _ = a.store.ListBackups(site.SiteID, 50)
 	d.Configs, _ = a.store.ListConfigVersions(site.ID)
@@ -284,7 +331,7 @@ func (a *App) siteYAMLSave(w http.ResponseWriter, r *http.Request) {
 	_ = r.ParseForm()
 	yamlText := r.FormValue("compose_yaml")
 	siteDir := filepath.Join(a.cfg.SitesDir, site.SiteID)
-	if err := security.ValidateComposePolicy(yamlText, siteDir); err != nil {
+	if err := security.ValidateComposePolicy(yamlText, siteDir, site.Domain, site.AdminDomain); err != nil {
 		http.Redirect(w, r, "/websites/"+site.SiteID+"?tab=yaml&flash=Rejected: "+err.Error(), http.StatusSeeOther)
 		return
 	}
@@ -359,7 +406,7 @@ func (a *App) siteApplyConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	siteDir := filepath.Join(a.cfg.SitesDir, site.SiteID)
-	if err := security.ValidateComposePolicy(latest.ComposeYAML, siteDir); err != nil {
+	if err := security.ValidateComposePolicy(latest.ComposeYAML, siteDir, site.Domain, site.AdminDomain); err != nil {
 		http.Redirect(w, r, "/websites/"+site.SiteID+"?tab=yaml&flash=Latest config fails policy validation: "+err.Error(), http.StatusSeeOther)
 		return
 	}
@@ -523,8 +570,19 @@ func (a *App) fileUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer out.Close()
-	if _, err := io.Copy(out, file); err != nil {
+	// Hard per-file cap (512 MB): the multipart envelope cap alone
+	// does not bound a streamed body, and one request must never be
+	// able to fill the disk.
+	const maxUploadBytes = 512 << 20
+	written, err := io.Copy(out, io.LimitReader(file, maxUploadBytes+1))
+	if err != nil {
 		http.Error(w, err.Error(), 500)
+		return
+	}
+	if written > maxUploadBytes {
+		_ = out.Close()
+		_ = os.Remove(abs)
+		http.Error(w, "uploaded file exceeds the 512 MB per-file limit", 400)
 		return
 	}
 	a.audit(r, "file.upload", site.SiteID, "path="+filepath.Join(dir, filepath.Base(hdr.Filename)))
@@ -600,3 +658,40 @@ func (a *App) fileDelete(w http.ResponseWriter, r *http.Request) {
 }
 
 var _ = auth.GenerateSecurePassword
+
+// tabCtxKey carries the forced detail tab for canonical subroutes.
+type tabCtxKey struct{}
+
+// canonicalTabPath maps a legacy ?tab= value to its RK Host path,
+// preserving the extra query parameters the tab needs (files path).
+func canonicalTabPath(siteID, tab string, q url.Values) (string, bool) {
+	paths := map[string]string{
+		"wp": "/wordpress", "domain": "/domains", "db": "/database",
+		"env": "/environment", "yaml": "/compose", "files": "/files",
+		"backups": "/backups", "jobs": "/jobs", "danger": "/settings",
+	}
+	suffix, ok := paths[tab]
+	if !ok {
+		return "", false
+	}
+	dest := "/websites/" + siteID + suffix
+	var extra []string
+	for _, k := range []string{"path", "view"} {
+		if v := q.Get(k); v != "" {
+			extra = append(extra, k+"="+url.QueryEscape(v))
+		}
+	}
+	if len(extra) > 0 {
+		dest += "?" + strings.Join(extra, "&")
+	}
+	return dest, true
+}
+
+// siteDetailTab serves the detail page with a fixed tab, for the
+// canonical RK Host subroutes (/websites/{id}/files, /compose, ...).
+func (a *App) siteDetailTab(tab string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ctx := context.WithValue(r.Context(), tabCtxKey{}, tab)
+		a.siteDetail(w, r.WithContext(ctx))
+	}
+}

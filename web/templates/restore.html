@@ -1,0 +1,32 @@
+{{template "header" .}}
+{{$d := .Data}}{{$s := $d.Site}}{{$csrf := .CSRF}}
+{{template "sitenav" $d}}
+
+<section class="card">
+<h2>Restore a backup</h2>
+<ol class="steps"><li class="current"><span class="n">1</span>Choose a backup</li><li><span class="n">2</span>Safety backup is taken</li><li><span class="n">3</span>Restore runs as a job</li></ol>
+<p>Restoring replaces this site's current files and database with the backup's contents. Before anything is overwritten, RK Host automatically creates a <strong>fresh safety backup</strong> of the site as it is right now — if that safety backup fails, the restore does not start. The restore itself runs as a tracked deployment job, and its recorded checksum is verified before extraction.</p>
+</section>
+
+<section class="card">
+<h2>Available backups</h2>
+{{if $d.Backups}}
+<div class="table-wrap"><table>
+<thead><tr><th>Created</th><th>Size</th><th>SHA-256</th><th>Status</th><th></th></tr></thead>
+<tbody>
+{{range $d.Backups}}
+<tr>
+<td>{{since .CreatedAt}}</td>
+<td>{{if .SizeBytes}}{{humanBytes .SizeBytes}}{{else}}—{{end}}</td>
+<td><code>{{if .SHA256}}{{slice .SHA256 0 12}}…{{else}}—{{end}}</code></td>
+<td><span class="badge status-{{.Status}}">{{.Status}}</span></td>
+<td>{{if eq .Status "ready"}}<form method="post" action="/websites/{{$s.SiteID}}/backups/{{.ID}}/restore" class="inline">{{template "csrf" $csrf}}<button class="btn small danger" type="submit" data-confirm="Restore this backup? Current files and database are replaced after a safety backup is taken.">Restore this backup</button></form>{{end}}</td>
+</tr>
+{{end}}
+</tbody>
+</table></div>
+{{else}}
+<div class="empty"><strong>No backups yet</strong>Create one first from the <a href="/websites/{{$s.SiteID}}/backups">Backups</a> page — a restore needs a completed backup to restore from.</div>
+{{end}}
+</section>
+{{template "footer" .}}

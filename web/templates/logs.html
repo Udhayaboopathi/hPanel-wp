@@ -1,0 +1,25 @@
+{{template "header" .}}
+{{$d := .Data}}
+<h1>Logs Viewer</h1>
+<p class="muted">Live container logs for a website, read through the provisioning agent. Only RK Host–managed sites can be selected — unrelated production containers are never exposed here.</p>
+
+<form method="get" action="/logs" class="toolbar">
+  <select name="site" aria-label="Website">
+    {{range $d.Sites}}<option value="{{.SiteID}}" {{if and $d.Selected (eq .SiteID $d.Selected.SiteID)}}selected{{end}}>{{.Domain}} ({{.SiteID}})</option>{{end}}
+  </select>
+  <button class="btn primary" type="submit">View logs</button>
+  {{if $d.Selected}}<a class="btn" href="/websites/{{$d.Selected.SiteID}}/logs/view">Open as plain text</a>{{end}}
+</form>
+
+{{if $d.Selected}}
+{{if $d.Note}}<div class="notice">{{$d.Note}}</div>{{end}}
+<div class="toolbar">
+  <span class="badge ok" id="live-badge">● Live — refreshes every 4 seconds</span>
+  <label class="check"><input type="checkbox" id="log-follow" checked> Follow tail (auto-scroll)</label>
+  <span class="muted" id="log-updated"></span>
+</div>
+<div class="log-view" id="log-view" data-site="{{$d.Selected.SiteID}}">{{$d.Output}}</div>
+{{else}}
+<div class="empty"><strong>No websites yet</strong>Create a website first — its container logs will appear here.</div>
+{{end}}
+{{template "footer" .}}

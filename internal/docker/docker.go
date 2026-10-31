@@ -163,6 +163,52 @@ func (c *Client) FindByName(ctx context.Context, name string) (*Container, error
 	return nil, nil
 }
 
+// AmbiguousError reports that more than one container carries a
+// site's ownership labels - a state an operator must reconcile by
+// hand, because acting on a guessed match could hit the wrong site.
+type AmbiguousError struct {
+	SiteID string
+	Count  int
+}
+
+func (e *AmbiguousError) Error() string {
+	return fmt.Sprintf("ambiguous container identity: %d containers carry own-hpanel.site-id=%s; refusing to guess - reconcile the duplicates manually", e.Count, e.SiteID)
+}
+
+// FindBySiteID resolves a site's WordPress container by its ownership
+// labels (own-hpanel.managed=true AND own-hpanel.site-id=<id>) - the
+// only trustworthy identity. The container NAME is never used for
+// resolution: names are conventions, labels are ownership. Ephemeral
+// WP-CLI helper containers carry the site-id label too and are
+// excluded via their own-hpanel.ephemeral=true label. Returns
+// (nil, nil) when no container matches, *AmbiguousError when several
+// do, and silently skips label matches that are not panel-managed
+// (a foreign container wearing the site-id label without the managed
+// label is not adopted).
+func (c *Client) FindBySiteID(ctx context.Context, siteID string) (*Container, error) {
+	all, err := c.ListContainers(ctx, true, "own-hpanel.site-id="+siteID)
+	if err != nil {
+		return nil, err
+	}
+	var match *Container
+	count := 0
+	for i := range all {
+		cand := &all[i]
+		if cand.Labels[ManagedLabel] != "true" {
+			continue
+		}
+		if cand.Labels["own-hpanel.ephemeral"] == "true" {
+			continue
+		}
+		count++
+		match = cand
+	}
+	if count > 1 {
+		return nil, &AmbiguousError{SiteID: siteID, Count: count}
+	}
+	return match, nil
+}
+
 type Network struct {
 	ID   string `json:"Id"`
 	Name string `json:"Name"`
@@ -501,11 +547,44 @@ func (c *Client) ExecDB(ctx context.Context, container string, argv []string) (s
 	return c.execRun(ctx, container, argv)
 }
 
+// ExecDBEnv is ExecDB with environment for the exec instance - used
+// to pass the MariaDB password as MYSQL_PWD instead of a -p argv
+// entry that would be visible in the container's process list.
+func (c *Client) ExecDBEnv(ctx context.Context, container string, argv []string, env []string) (string, int, error) {
+	if len(argv) == 0 || argv[0] != "mariadb" {
+		return "", -1, fmt.Errorf("ExecDB: only the mariadb SQL client may be executed in the DB container")
+	}
+	found, err := c.FindByName(ctx, container)
+	if err != nil {
+		return "", -1, err
+	}
+	if found == nil {
+		return "", -1, fmt.Errorf("ExecDB: DB container %q not found", container)
+	}
+	if found.Labels["own-hpanel.site-id"] != "" {
+		return "", -1, fmt.Errorf("ExecDB: %q is a per-site container, not the DB container", container)
+	}
+	if found.Labels[ManagedLabel] != "true" || found.Labels["own-hpanel.component"] != "mariadb" {
+		return "", -1, fmt.Errorf("ExecDB: %q is not the panel-managed MariaDB container (missing own-hpanel.managed/component=mariadb labels); refusing", container)
+	}
+	return c.execRunEnv(ctx, container, argv, env)
+}
+
 func (c *Client) execRun(ctx context.Context, container string, argv []string) (string, int, error) {
+	return c.execRunEnv(ctx, container, argv, nil)
+}
+
+// execRunEnv is execRun with extra environment for the exec instance.
+// Secrets belong here (e.g. MYSQL_PWD) rather than in argv, where any
+// user on the host could read them from the process list.
+func (c *Client) execRunEnv(ctx context.Context, container string, argv []string, env []string) (string, int, error) {
 	var created struct {
 		ID string `json:"Id"`
 	}
 	body := map[string]any{"AttachStdout": true, "AttachStderr": true, "Tty": false, "Cmd": argv}
+	if len(env) > 0 {
+		body["Env"] = env
+	}
 	if err := c.do(ctx, "POST", "/v1.47/containers/"+container+"/exec", body, &created); err != nil {
 		return "", -1, err
 	}

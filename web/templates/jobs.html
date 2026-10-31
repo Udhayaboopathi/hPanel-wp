@@ -2,6 +2,6 @@
 <h1>Deployment Jobs</h1>
 <p class="muted">Jobs are durable: they are stored in the panel database, survive restarts (interrupted jobs are marked as such), and record every step as an event.</p>
 {{if .Data}}<table><thead><tr><th>Job</th><th>Site</th><th>Kind</th><th>Status</th><th>Progress</th><th>Attempts</th><th>Message</th><th>Created</th></tr></thead><tbody>
-{{range .Data}}<tr><td><a href="/jobs/{{.ID}}">{{slice .ID 0 12}}…</a></td><td>{{.SiteID}}</td><td>{{.Kind}}</td><td><span class="badge">{{.Status}}</span></td><td>{{.Progress}}%</td><td>{{.Attempts}}/{{.MaxAttempts}}</td><td>{{.Message}}{{if .Error}}<br><span class="muted">{{.Error}}</span>{{end}}</td><td>{{since .CreatedAt}}</td></tr>{{end}}
+{{range .Data}}<tr><td><a href="/deployments/{{.ID}}">{{slice .ID 0 12}}…</a></td><td>{{.SiteID}}</td><td>{{.Kind}}</td><td><span class="badge">{{.Status}}</span></td><td>{{.Progress}}%</td><td>{{.Attempts}}/{{.MaxAttempts}}</td><td>{{.Message}}{{if .Error}}<br><span class="muted">{{.Error}}</span>{{end}}</td><td>{{since .CreatedAt}}</td></tr>{{end}}
 </tbody></table>{{else}}<section class="card"><p class="muted">No jobs yet.</p></section>{{end}}
 {{template "footer" .}}

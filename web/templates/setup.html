@@ -3,6 +3,7 @@
 <h1>First-run setup</h1>
 <p class="muted">Create the single administrator account. There is no public registration.</p>
 <form method="post" action="/setup">
+{{template "csrf" .CSRF}}
   <label>Username <input name="username" required autocomplete="username"></label>
   <label>Email <input name="email" type="email" required autocomplete="email"></label>
   <label>Password (min. 10 characters) <input name="password" type="password" required autocomplete="new-password"></label>

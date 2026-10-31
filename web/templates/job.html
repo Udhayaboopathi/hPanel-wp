@@ -1,10 +1,10 @@
 {{template "header" .}}
 {{$j := .Data.Job}}
 <h1>Job {{$j.ID}}</h1>
-<section class="card">
+<section class="card"{{if or (eq $j.Status "queued") (eq $j.Status "running")}} data-job-live{{end}}>
 <table class="kv">
 <tr><th>Kind</th><td>{{$j.Kind}}</td></tr><tr><th>Site</th><td>{{$j.SiteID}}</td></tr>
-<tr><th>Status</th><td><span class="badge">{{$j.Status}}</span></td></tr>
+<tr><th>Status</th><td><span class="badge status-{{$j.Status}}">{{$j.Status}}</span></td></tr>
 <tr><th>Progress</th><td>{{$j.Progress}}%</td></tr>
 <tr><th>Attempts</th><td>{{$j.Attempts}} / {{$j.MaxAttempts}}</td></tr>
 <tr><th>Message</th><td>{{$j.Message}}</td></tr>
@@ -12,9 +12,9 @@
 <tr><th>Created</th><td>{{since $j.CreatedAt}}</td></tr><tr><th>Updated</th><td>{{since $j.UpdatedAt}}</td></tr>
 </table>
 {{if or (eq $j.Status "queued") (eq $j.Status "running")}}
-<form method="post" action="/jobs/{{$j.ID}}/cancel" class="inline">{{template "csrf" .CSRF}}<button class="btn" type="submit">Cancel job</button></form>{{end}}
+<form method="post" action="/deployments/{{$j.ID}}/cancel" class="inline">{{template "csrf" .CSRF}}<button class="btn" type="submit">Cancel job</button></form>{{end}}
 {{if or (eq $j.Status "failed") (eq $j.Status "interrupted") (eq $j.Status "cancelled")}}
-<form method="post" action="/jobs/{{$j.ID}}/retry" class="inline">{{template "csrf" .CSRF}}<button class="btn" type="submit">Retry (re-queue)</button></form>{{end}}
+<form method="post" action="/deployments/{{$j.ID}}/retry" class="inline">{{template "csrf" .CSRF}}<button class="btn" type="submit">Retry (re-queue)</button></form>{{end}}
 </section>
 <section class="card"><h2>Events</h2>
 {{if .Data.Events}}<ul class="events">{{range .Data.Events}}<li><span class="muted">{{since .CreatedAt}}</span> <span class="badge {{.Level}}">{{.Level}}</span> {{.Message}}</li>{{end}}</ul>{{else}}<p class="muted">No events recorded.</p>{{end}}

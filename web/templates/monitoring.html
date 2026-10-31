@@ -12,6 +12,17 @@
 <div class="card stat"><span class="muted">Uptime</span><strong>{{$h.UptimeSec}}s</strong></div>
 <div class="card stat"><span class="muted">Agent</span><strong>{{if $d.AgentUp}}connected{{else}}not available{{end}}</strong></div>
 </section>
+<section class="card">
+<h2>Server load history</h2>
+{{if $d.Bars}}
+<p class="muted">Sampled every minute by the panel. Blue = CPU (% of one core), teal = memory (% of total RAM). Newest on the right.</p>
+<div style="display:flex;align-items:flex-end;gap:3px;height:110px;border-bottom:1px solid var(--line);padding-top:8px">
+{{range $d.Bars}}<div style="flex:1;display:flex;align-items:flex-end;gap:1px;min-width:4px" title="{{.When}} — CPU {{printf "%.1f" .CPUPct}}% · Memory {{printf "%.1f" .MemPct}}%"><div style="flex:1;background:var(--primary);border-radius:2px 2px 0 0;height:{{.CPUBH}}%"></div><div style="flex:1;background:var(--info);border-radius:2px 2px 0 0;height:{{.MemBH}}%"></div></div>{{end}}
+</div>
+{{else}}
+<div class="empty"><strong>No history yet</strong>The panel samples server load every minute — the graph appears after the first samples are recorded.</div>
+{{end}}
+</section>
 <section class="card"><h2>Websites</h2>
 <table><thead><tr><th>Site</th><th>Status</th><th>Configured CPU max</th><th>Configured RAM max</th></tr></thead><tbody>
 {{range $d.Sites}}<tr><td>{{.Domain}} <span class="muted">({{.SiteID}})</span></td><td><span class="badge status-{{.Status}}">{{.Status}}</span></td><td>{{printf "%.2f" .CPULimit}}</td><td>{{.MemLimitMB}} MB</td></tr>{{end}}

@@ -1,0 +1,40 @@
+{{template "header" .}}
+{{$d := .Data}}{{$s := $d.Site}}
+{{template "sitenav" $d}}
+
+<div class="grid">
+  <section class="card stat"><span class="label">Container status</span><strong>{{if not $d.AgentUp}}Unknown{{else if $d.Live}}Running{{else}}Stopped{{end}}</strong><span class="sub">{{if not $d.AgentUp}}Provisioning agent not connected{{else}}Live from the agent, just now{{end}}</span></section>
+  <section class="card stat"><span class="label">CPU usage</span><strong>{{if $d.Live}}{{printf "%.1f" $d.Live.CPUPercent}}%{{else}}—{{end}}</strong><span class="sub">Limit {{printf "%.2f" $s.CPULimit}} CPU ({{$s.ResourceProfile}} profile)</span></section>
+  <section class="card stat"><span class="label">Memory usage</span><strong>{{if $d.Live}}{{humanBytes $d.Live.MemUsage}}{{else}}—{{end}}</strong><span class="sub">{{if $d.Live}}of {{humanBytes $d.Live.MemLimit}} · {{end}}limit {{$s.MemLimitMB}} MB</span></section>
+  <section class="card stat"><span class="label">Database size</span><strong>{{if $d.DBSize}}{{humanBytes $d.DBSize}}{{else}}—{{end}}</strong><span class="sub">{{$s.DBName}}</span></section>
+</div>
+
+<section class="card">
+<h2>Usage history</h2>
+{{if $d.Bars}}
+<p class="muted">Recorded each time this site's live stats are read in the panel. Newest on the right. Blue = CPU (% of one core), teal = memory (% of the site's limit).</p>
+<div style="display:flex;align-items:flex-end;gap:3px;height:120px;border-bottom:1px solid var(--line);padding-top:8px">
+{{range $d.Bars}}<div style="flex:1;display:flex;align-items:flex-end;gap:1px;min-width:4px" title="{{.When}} — CPU {{printf "%.1f" .CPUPct}}% · Memory {{printf "%.1f" .MemPct}}%"><div style="flex:1;background:var(--primary);border-radius:2px 2px 0 0;height:{{.CPUBH}}%"></div><div style="flex:1;background:var(--info);border-radius:2px 2px 0 0;height:{{.MemBH}}%"></div></div>{{end}}
+</div>
+<table>
+<thead><tr><th>Sampled at (UTC)</th><th>CPU %</th><th>Memory % of limit</th></tr></thead>
+<tbody>
+{{range $i, $b := $d.Bars}}{{if ge $i (sub (len $d.Bars) 12)}}<tr><td>{{$b.When}}</td><td>{{printf "%.1f" $b.CPUPct}}</td><td>{{printf "%.1f" $b.MemPct}}</td></tr>{{end}}{{end}}
+</tbody>
+</table>
+{{else}}
+<div class="empty"><strong>No history yet</strong>History is recorded whenever the panel reads this site's live stats (opening Overview or this page). Visit again in a little while to see the trend.</div>
+{{end}}
+</section>
+
+<section class="card">
+<h2>Resource limits</h2>
+<table class="kv">
+<tr><th>Profile</th><td>{{$s.ResourceProfile}}</td></tr>
+<tr><th>CPU limit</th><td>{{printf "%.2f" $s.CPULimit}} CPU</td></tr>
+<tr><th>Memory limit</th><td>{{$s.MemLimitMB}} MB</td></tr>
+<tr><th>Container</th><td>{{$s.ContainerName}}{{if $s.ContainerID}} · {{slice $s.ContainerID 0 12}}{{end}}</td></tr>
+</table>
+<p class="muted">Limits are enforced by Docker for this site's container only. To change them, edit the resource values in the <a href="/websites/{{$s.SiteID}}/compose">Compose</a> configuration and apply it.</p>
+</section>
+{{template "footer" .}}

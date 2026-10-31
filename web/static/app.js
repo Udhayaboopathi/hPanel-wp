@@ -1,14 +1,30 @@
-// Own hPanel - minimal vanilla JS: theme, wizard, password helpers, copy, confirms, metric polling.
+// RK Host - minimal vanilla JS: shell, wizard, password helpers, copy, confirms, metric polling.
 (function () {
-  var root = document.documentElement;
-  var saved = localStorage.getItem("own-hpanel-theme");
-  if (saved) root.setAttribute("data-theme", saved);
-  document.querySelectorAll("[data-theme-toggle]").forEach(function (b) {
+  // Sidebar: mobile toggle + active nav state.
+  var sidebar = document.getElementById("sidebar");
+  var scrim = document.querySelector("[data-sidebar-scrim]");
+  document.querySelectorAll("[data-sidebar-toggle]").forEach(function (b) {
     b.addEventListener("click", function () {
-      var next = root.getAttribute("data-theme") === "dark" ? "light" : "dark";
-      root.setAttribute("data-theme", next);
-      localStorage.setItem("own-hpanel-theme", next);
+      if (sidebar) sidebar.classList.toggle("open");
+      if (scrim) scrim.classList.toggle("show");
     });
+  });
+  if (scrim) scrim.addEventListener("click", function () {
+    if (sidebar) sidebar.classList.remove("open");
+    scrim.classList.remove("show");
+  });
+  var path = location.pathname;
+  var alias = { "/": "/dashboard", "/jobs": "/deployments", "/monitoring": "/server", "/audit": "/audit", "/account": "/account" };
+  document.querySelectorAll("[data-nav]").forEach(function (a) {
+    var key = a.getAttribute("data-nav");
+    var hit = path === key || path.indexOf(key + "/") === 0 ||
+      (alias[path] === key) || (key === "/deployments" && path.indexOf("/jobs") === 0) ||
+      (key === "/server" && path === "/monitoring") ||
+      (key === "/audit" && (path === "/audit" || path === "/audit-logs")) ||
+      (key === "/account" && (path === "/account" || path === "/settings/security"));
+    if (key === "/server/containers" && path === "/server/containers") hit = true;
+    if (key === "/server" && path === "/server/containers") hit = false;
+    if (hit) a.classList.add("active");
   });
 
   // Confirmations for dangerous / disruptive actions.
@@ -23,6 +39,10 @@
   if (steps.length) {
     var show = function (n) {
       steps.forEach(function (s) { s.hidden = String(s.getAttribute("data-step")) !== String(n); });
+      document.querySelectorAll(".steps li").forEach(function (li, i) {
+        li.classList.toggle("current", i === Number(n) - 1);
+        li.classList.toggle("done", i < Number(n) - 1);
+      });
       if (String(n) === "2") loadPreview();
     };
     document.querySelectorAll("[data-next-step]").forEach(function (b) {
@@ -107,5 +127,33 @@
     while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
     return n.toFixed(1) + " " + u[i];
   }
+  // Live logs: poll the plain-text API and refresh the viewer.
+  var logView = document.getElementById("log-view");
+  if (logView) {
+    var site = logView.getAttribute("data-site");
+    var follow = document.getElementById("log-follow");
+    var updated = document.getElementById("log-updated");
+    var pollLogs = function () {
+      if (document.hidden) return;
+      fetch("/api/logs?site=" + encodeURIComponent(site), { credentials: "same-origin" })
+        .then(function (r) { return r.text(); })
+        .then(function (txt) {
+          if (txt !== logView.textContent) {
+            logView.textContent = txt;
+            if (follow && follow.checked) logView.scrollTop = logView.scrollHeight;
+          }
+          if (updated) updated.textContent = "Updated " + new Date().toLocaleTimeString();
+        })
+        .catch(function () {});
+    };
+    logView.scrollTop = logView.scrollHeight;
+    setInterval(pollLogs, 4000);
+  }
+
+  // Live job page: refresh while the job is queued/running.
+  if (document.querySelector("[data-job-live]")) {
+    setTimeout(function () { if (!document.hidden) location.reload(); }, 5000);
+  }
+
   if (window.htmx) { document.body.addEventListener("htmx:configRequest", function () {}); }
 })();

@@ -1,7 +1,8 @@
 {{template "header" .}}
 <section class="card auth-card">
-<h1>Login to Own hPanel</h1>
+<h1>Welcome back</h1><p class="muted">Sign in to your RK Host control panel.</p>
 <form method="post" action="/login">
+{{template "csrf" .CSRF}}
   <label>Username <input name="username" required autocomplete="username" autofocus></label>
   <label>Password <input name="password" type="password" required autocomplete="current-password"></label>
   <button class="btn primary big" type="submit">Login</button>

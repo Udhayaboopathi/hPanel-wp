@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -82,8 +83,23 @@ func OpenMySQL(dsn string) (*Store, error) {
 
 func finishOpen(db *sql.DB, driver string) (*Store, error) {
 	s := &Store{DB: db, driver: driver}
-	// Crash recovery: jobs left running when the process died are interrupted.
-	if _, err := db.Exec(`UPDATE jobs SET status='interrupted', error=COALESCE(NULLIF(error,''),'panel restarted during job'), updated_at=? WHERE status='running'`, Now()); err != nil {
+	// Crash recovery. Execution is driven by in-process goroutines
+	// (and in-memory retry timers), so after a restart NOTHING will
+	// ever run jobs left in 'queued' or 'running': both are honestly
+	// 'interrupted' - the operator can re-run them from the job page.
+	if _, err := db.Exec(`UPDATE jobs SET status='interrupted', error=COALESCE(NULLIF(error,''),'panel restarted during job'), updated_at=? WHERE status IN ('running','queued')`, Now()); err != nil {
+		return nil, err
+	}
+	// Websites left in transient states by the dead process would
+	// otherwise sit in 'provisioning'/'deleting' forever: no job is
+	// active for them anymore. 'failed' is the honest state - the
+	// site's data is untouched and Repair/delete can proceed.
+	if _, err := db.Exec(`UPDATE websites SET status='failed' WHERE status IN ('provisioning','deleting')`); err != nil {
+		return nil, err
+	}
+	// Backup records whose reconciler goroutine died with the old
+	// process would sit in 'creating' forever.
+	if _, err := db.Exec(`UPDATE backups SET status='failed' WHERE status='creating'`, Now()); err != nil {
 		return nil, err
 	}
 	return s, nil
@@ -328,17 +344,22 @@ func (s *Store) CreateWebsite(w *Website) (int64, error) {
 	}
 	id, _ := res.LastInsertId()
 	w.ID = id
-	_, _ = s.DB.Exec(`INSERT INTO website_domains(website_id,domain,kind,created_at) VALUES(?,?, 'primary', ?)`, id, w.Domain, now)
-	if w.AdminDomain != "" {
-		// INSERT OR IGNORE (SQLite) vs INSERT IGNORE (MySQL): the only
-		// dialect-specific insert besides the settings upsert.
-		q := `INSERT OR IGNORE INTO website_domains(website_id,domain,kind,created_at) VALUES(?,?, 'admin', ?)`
-		if s.driver == "mysql" {
-			q = `INSERT IGNORE INTO website_domains(website_id,domain,kind,created_at) VALUES(?,?, 'admin', ?)`
-		}
-		_, _ = s.DB.Exec(q, id, w.AdminDomain, now)
+	// The domain rows are part of the website's identity: their
+	// insert errors are NOT ignored (a swallowed collision here once
+	// let two sites publish Traefik routers for the same host - the
+	// panel validates collisions before this point, and any remaining
+	// failure must surface instead of corrupting state quietly).
+	if _, err := s.DB.Exec(`INSERT INTO website_domains(website_id,domain,kind,created_at) VALUES(?,?, 'primary', ?)`, id, w.Domain, now); err != nil {
+		return 0, fmt.Errorf("recording primary domain: %w", err)
 	}
-	_, _ = s.DB.Exec(`INSERT INTO website_databases(website_id,db_name,db_user) VALUES(?,?,?)`, id, w.DBName, w.DBUser)
+	if w.AdminDomain != "" {
+		if _, err := s.DB.Exec(`INSERT INTO website_domains(website_id,domain,kind,created_at) VALUES(?,?, 'admin', ?)`, id, w.AdminDomain, now); err != nil {
+			return 0, fmt.Errorf("recording admin domain: %w", err)
+		}
+	}
+	if _, err := s.DB.Exec(`INSERT INTO website_databases(website_id,db_name,db_user) VALUES(?,?,?)`, id, w.DBName, w.DBUser); err != nil {
+		return 0, fmt.Errorf("recording website database: %w", err)
+	}
 	return id, nil
 }
 
@@ -589,13 +610,42 @@ func (s *Store) BumpJobAttempts(id string) error {
 }
 
 // HasActiveJobForSite prevents duplicate concurrent creation for one site.
+// PruneHistory bounds the growth of append-only history tables
+// (SSL checks, login attempts, job events, finished jobs) that
+// otherwise grow forever on the production database.
+func (s *Store) PruneHistory(days int) error {
+	cutoff := time.Now().UTC().AddDate(0, 0, -days).Format(time.RFC3339)
+	for _, q := range []string{
+		`DELETE FROM ssl_checks WHERE created_at < ?`,
+		`DELETE FROM login_attempts WHERE created_at < ?`,
+		`DELETE FROM deployment_events WHERE created_at < ?`,
+		`DELETE FROM jobs WHERE status IN ('succeeded','failed','cancelled','interrupted') AND created_at < ?`,
+	} {
+		if _, err := s.DB.Exec(q, cutoff); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// HasActiveJobForSite reports whether a job is active for the site.
+// An empty kind matches ANY kind: lifecycle operations for one site
+// must never run concurrently (a restart racing a delete against the
+// same container is how resources get corrupted), so the runner
+// enforces one active job per site across kinds.
 func (s *Store) HasActiveJobForSite(siteID, kind string) (bool, error) {
 	var n int
-	err := s.DB.QueryRow(`SELECT COUNT(*) FROM jobs WHERE site_id=? AND kind=? AND status IN ('queued','running')`, siteID, kind).Scan(&n)
+	var err error
+	if kind == "" {
+		err = s.DB.QueryRow(`SELECT COUNT(*) FROM jobs WHERE site_id=? AND status IN ('queued','running')`, siteID).Scan(&n)
+	} else {
+		err = s.DB.QueryRow(`SELECT COUNT(*) FROM jobs WHERE site_id=? AND kind=? AND status IN ('queued','running')`, siteID, kind).Scan(&n)
+	}
 	return n > 0, err
 }
 
 func (s *Store) AddEvent(jobID, level, message string) error {
+	message = Redact(message) // job events must never carry secrets either
 	_, err := s.DB.Exec(`INSERT INTO deployment_events(job_id,level,message,created_at) VALUES(?,?,?,?)`, jobID, level, message, Now())
 	if err != nil {
 		return err
@@ -680,6 +730,16 @@ func (s *Store) CreateBackup(b *Backup) (int64, error) {
 		return 0, err
 	}
 	return res.LastInsertId()
+}
+
+// CompleteBackup records the AUTHORITATIVE artifact facts the agent
+// returned for a finished backup job (exact path, checksum, size) -
+// the panel must never have to re-derive them by guessing from a
+// directory listing.
+func (s *Store) CompleteBackup(id int64, filename, path, sha string, size int64) error {
+	_, err := s.DB.Exec(`UPDATE backups SET filename=?, path=?, status='ready', sha256=?, size_bytes=?, verified_at=? WHERE id=?`,
+		filename, path, sha, size, Now(), id)
+	return err
 }
 
 func (s *Store) UpdateBackup(id int64, status, sha string, size int64, verified bool) error {
@@ -781,18 +841,14 @@ func (s *Store) AddAudit(adminID int64, action, target, detail, ip string) error
 	return err
 }
 
+// secretPattern matches key=value and JSON "key": "value" forms for
+// common secret-bearing keys, case-insensitively, so Redact can scrub
+// EVERY occurrence (the previous implementation handled only the
+// first occurrence of four exact markers).
+var secretPattern = regexp.MustCompile(`(?i)(password|passwd|secret|token|api[-_]?key|db_password)(\s*["']?\s*[:=]\s*["']?)[^\s"',;]+`)
+
 func Redact(s string) string {
-	for _, marker := range []string{"password=", "PASSWORD=", "db_password=", "secret="} {
-		if i := strings.Index(s, marker); i >= 0 {
-			rest := s[i+len(marker):]
-			end := strings.IndexAny(rest, " \n,;")
-			if end < 0 {
-				end = len(rest)
-			}
-			s = s[:i+len(marker)] + "***" + rest[end:]
-		}
-	}
-	return s
+	return secretPattern.ReplaceAllString(s, "${1}${2}***")
 }
 
 type AuditEntry struct {
@@ -860,4 +916,41 @@ func boolInt(b bool) int {
 		return 1
 	}
 	return 0
+}
+
+// ---------- resource samples (read side; RK Host performance/server pages) ----------
+
+// ResourceSample is one recorded host or per-site resource sample.
+type ResourceSample struct {
+	Scope      string
+	SiteID     string
+	CPUPercent float64
+	MemBytes   int64
+	CreatedAt  string
+}
+
+// ListResourceSamples returns the newest samples for a scope (and site,
+// when siteID is non-empty), oldest first, ready for charting.
+func (s *Store) ListResourceSamples(scope, siteID string, limit int) ([]ResourceSample, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 120
+	}
+	rows, err := s.DB.Query(`SELECT scope,site_id,cpu_percent,mem_bytes,created_at FROM resource_samples
+		WHERE scope=? AND site_id=? ORDER BY created_at DESC LIMIT ?`, scope, siteID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ResourceSample
+	for rows.Next() {
+		var r ResourceSample
+		if err := rows.Scan(&r.Scope, &r.SiteID, &r.CPUPercent, &r.MemBytes, &r.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
+	}
+	return out, rows.Err()
 }

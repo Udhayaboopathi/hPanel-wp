@@ -7,3 +7,5 @@
 /secrets/
 *.tar.gz
 .DS_Store
+# Stitch design downloads (re-fetchable via the connector; ~26 MB)
+/design-reference/

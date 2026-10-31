@@ -54,9 +54,9 @@ func TestUsesCommonUser(t *testing.T) {
 }
 
 func TestMariaDBArgvUsesAdminUserNotRoot(t *testing.T) {
-	argv := mariadbArgv("WordPress_common_DB", "pw-value", "SELECT 1;")
-	if len(argv) != 5 || argv[0] != "mariadb" {
-		t.Fatalf("unexpected argv shape: %v", argv[:1])
+	argv := mariadbArgv("WordPress_common_DB", "SELECT 1;")
+	if len(argv) != 4 || argv[0] != "mariadb" {
+		t.Fatalf("unexpected argv shape: %v", argv)
 	}
 	if argv[1] != "-uWordPress_common_DB" {
 		t.Fatalf("must authenticate as the common admin user, got %q", argv[1])
@@ -65,8 +65,11 @@ func TestMariaDBArgvUsesAdminUserNotRoot(t *testing.T) {
 		if a == "-uroot" || a == "root" {
 			t.Fatal("agent must never connect to the MariaDB container as root")
 		}
+		if strings.HasPrefix(a, "-p") {
+			t.Fatal("the password must travel via MYSQL_PWD env, never in argv")
+		}
 	}
-	if !strings.HasSuffix(argv[4], "SELECT 1;") || argv[3] != "-e" {
-		t.Fatalf("SQL must be passed via -e: %v", argv[3:])
+	if !strings.HasSuffix(argv[3], "SELECT 1;") || argv[2] != "-e" {
+		t.Fatalf("SQL must be passed via -e: %v", argv[2:])
 	}
 }
