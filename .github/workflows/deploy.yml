@@ -398,17 +398,31 @@ jobs:
       - name: Verify the agent container and its socket
         run: |
           set -euo pipefail
-          # The agent must be running AND have bound its Unix socket. The
-          # socket file lives in the host /run/own-hpanel directory
-          # (bind-mounted into both the agent and the panel containers);
-          # a bound socket path is visible in /proc/net/unix to any
-          # user, which avoids having to stat inside a root-owned
-          # directory as the runner (that false negative failed earlier
-          # deploys in the agent's previous form).
+          # The agent must be running AND have bound its Unix socket.
+          # Three checks, all namespace-correct:
+          #   1. the container is running (docker inspect);
+          #   2. the socket FILE exists on the host path
+          #      /run/own-hpanel/agent.sock - the directory is 0755, so
+          #      the runner user can stat it directly. (An earlier
+          #      version of this step grepped the HOST /proc/net/unix
+          #      for the socket path; that can never match for a
+          #      containerised agent, because the socket is bound in the
+          #      container's own network namespace - the check failed
+          #      every deploy while the agent was in fact listening.)
+          #   3. once the panel container is running, the socket must
+          #      also be visible from INSIDE the panel (same host
+          #      directory bind-mounted there) - that is the exact view
+          #      the panel's agent client connects through.
           agent_ok=""
-          for i in $(seq 1 30); do
+          for i in $(seq 1 45); do
             running="$(docker inspect -f '{{.State.Running}}' own-hpanel-agent 2>/dev/null || echo false)"
-            if [ "$running" = "true" ] && grep -q " /run/own-hpanel/agent.sock\$" /proc/net/unix; then
+            sock=no; [ -S /run/own-hpanel/agent.sock ] && sock=yes
+            panel_sock=na
+            if [ "$(docker inspect -f '{{.State.Running}}' own-hpanel 2>/dev/null || echo false)" = "true" ]; then
+              if docker exec own-hpanel sh -c 'test -S /run/own-hpanel/agent.sock' 2>/dev/null; then panel_sock=yes; else panel_sock=no; fi
+            fi
+            echo "attempt $i: agent_running=$running host_socket=$sock panel_socket=$panel_sock"
+            if [ "$running" = "true" ] && [ "$sock" = "yes" ] && [ "$panel_sock" != "no" ]; then
               agent_ok=1; break
             fi
             sleep 1
@@ -416,8 +430,8 @@ jobs:
           echo "--- own-hpanel-agent logs (last 50 lines) ---"
           docker logs --tail 50 own-hpanel-agent || true
           echo "--- end own-hpanel-agent logs ---"
-          [ -n "$agent_ok" ] || { echo "::error::own-hpanel-agent is not running with its socket bound after 30s - see its logs above"; exit 1; }
-          echo "agent container running; socket /run/own-hpanel/agent.sock is bound and shared with the panel container"
+          [ -n "$agent_ok" ] || { echo "::error::own-hpanel-agent socket verification failed after 45s - see the attempt lines and its logs above"; exit 1; }
+          echo "agent container running; socket /run/own-hpanel/agent.sock is bound on the host and visible inside the panel container"
 
       - name: Ensure the panel database and provisioning grants (root exec into wordpress-mariadb)
         run: |

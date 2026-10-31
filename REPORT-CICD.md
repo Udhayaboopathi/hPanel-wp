@@ -605,3 +605,43 @@ production guard. The panel still never receives the Docker socket.
   runs recorded above. The first zero-sudo production run is the real
   end-to-end test, and it remains protected by the before/after
   container-ID diff.
+
+## Full CI/CD audit (2026-10-31, after the first successful compose up)
+
+The first compose up that succeeded (panel + agent + MariaDB all created
+and started, MariaDB healthy) exposed exactly one remaining workflow bug,
+found by reading the whole pipeline end to end rather than patching the
+single failing line:
+
+1. **Agent socket verification was namespace-blind (the live failure).**
+   The verify step grepped the HOST `/proc/net/unix` for
+   `/run/own-hpanel/agent.sock`. That was correct when the agent was a
+   host systemd process; for the containerised agent the socket is bound
+   in the container's own network namespace and NEVER appears in the
+   host table - the agent's own log said "listening" while the step
+   failed. Fixed: verify (a) container running, (b) socket file present
+   on the host path (the shared directory is 0755, so the runner can
+   stat it), (c) socket visible from inside the panel container, which
+   is the exact view the panel connects through.
+2. **Panel healthcheck had no start period.** A slow first boot could
+   flip the panel to `unhealthy` before it ever served, and the verify
+   step would then burn its full wait. Added `start_period: 20s` and
+   raised retries to 5.
+3. **Audited and cleared (no change needed):** token files carry a
+   trailing newline from `openssl` output, but BOTH readers trim
+   (`cmd/agent/main.go`, `internal/agentclient/client.go` use
+   `strings.TrimSpace`), so panel-agent auth is unaffected; the DB admin
+   password file is written with `printf '%s'` (no newline) and read
+   byte-exact by both MariaDB's entrypoint and the panel; the ensure
+   step's secret reads (`/run/secrets/...` inside the DB container)
+   match the compose `secrets:` names; `MYSQL_PWD` is forwarded to the
+   in-container client by name only; the MariaDB root password file was
+   generated in the same run that first initialised the data volume, so
+   file and container agree; rsync excludes, `.env` contents, Traefik
+   labels, protected-container diffing and artifact upload were all
+   re-checked line by line.
+4. **Residual operational note:** the legacy systemd agent unit, if
+   still enabled on the server, can compete for the same socket path;
+   it must be disabled once by the server owner
+   (`systemctl disable --now own-hpanel-agent`). The container agent is
+   the only agent the stack uses.
