@@ -164,7 +164,7 @@ jobs:
       - name: Sync source to deploy directory
         run: |
           set -euo pipefail
-          $SUDO install -d -m 755 "$DEPLOY_DIR"
+          $SUDO install -d -m 755 -o "$(id -un)" -g "$(id -gn)" "$DEPLOY_DIR"
           rsync -a --delete \
             --exclude='.git' \
             --exclude='.env' \
