@@ -1,37 +1,79 @@
 {{template "header" .}}
 {{$d := .Data}}{{$s := $d.Site}}{{$csrf := .CSRF}}
 <div class="row-between"><h1>{{$s.Domain}}</h1><span class="badge status-{{$s.Status}}">{{$s.Status}}</span></div>
-<nav class="tabs">
-{{range $t := list "overview" "env" "yaml" "files" "wp" "db" "domain" "backups" "jobs" "danger"}}
-<a href="/websites/{{$s.SiteID}}?tab={{$t}}" {{if eq $d.Tab $t}}class="active"{{end}}>{{$t}}</a>{{end}}
-</nav>
+{{if ne $d.Tab "overview"}}<p><a href="/websites/{{$s.SiteID}}">← Back to {{$s.Domain}}</a></p>{{end}}
 
 {{if eq $d.Tab "overview"}}
+{{if $d.LatestJob}}{{if eq $d.LatestJob.Status "failed"}}
 <section class="card">
-<h2>Overview</h2>
+<h2>⚠ Last job failed — {{$d.LatestJob.Kind}}</h2>
+<p>{{if $d.LatestJob.Error}}{{$d.LatestJob.Error}}{{else}}{{$d.LatestJob.Message}}{{end}}</p>
+<p><a class="btn" href="/jobs/{{$d.LatestJob.ID}}">View job &amp; retry</a></p>
+</section>
+{{else if or (eq $d.LatestJob.Status "queued") (eq $d.LatestJob.Status "running")}}
+<section class="card">
+<h2>{{$d.LatestJob.Kind}} — {{$d.LatestJob.Status}} ({{$d.LatestJob.Progress}}%)</h2>
+<p>{{$d.LatestJob.Message}}</p>
+<p><a class="btn" href="/jobs/{{$d.LatestJob.ID}}">View job</a></p>
+</section>
+{{end}}{{end}}
+
+<section class="card">
+<h2>Your website</h2>
+<div class="actions">
+<a class="btn primary big" href="https://{{$s.Domain}}" target="_blank" rel="noopener">Open Website</a>
+<a class="btn primary big" href="https://{{$s.Domain}}/wp-admin/" target="_blank" rel="noopener">Open WordPress Admin</a>
+</div>
 <table class="kv">
 <tr><th>Website URL</th><td><a href="https://{{$s.Domain}}" target="_blank" rel="noopener">https://{{$s.Domain}}</a></td></tr>
 <tr><th>WordPress Admin</th><td><a href="https://{{$s.Domain}}/wp-admin/" target="_blank" rel="noopener">https://{{$s.Domain}}/wp-admin/</a></td></tr>
-<tr><th>Admin alias</th><td>{{if $s.AdminDomain}}https://{{$s.AdminDomain}} → redirects to the admin URL above{{else}}—{{end}}</td></tr>
-<tr><th>WordPress version</th><td>{{if $s.WPVersion}}{{$s.WPVersion}}{{else}}not recorded yet (check WordPress tab){{end}}</td></tr>
+{{if $s.AdminDomain}}<tr><th>Admin alias</th><td>https://{{$s.AdminDomain}} → redirects to the admin URL above</td></tr>{{end}}
+<tr><th>WordPress version</th><td>{{if $s.WPVersion}}{{$s.WPVersion}}{{else}}not recorded yet{{end}}</td></tr>
 <tr><th>PHP version</th><td>{{$s.PHPVersion}}</td></tr>
 <tr><th>Database</th><td>{{$s.DBName}} (user {{$s.DBUser}}){{if $d.DBSize}} · {{humanBytes $d.DBSize}}{{end}}</td></tr>
-<tr><th>Container</th><td>{{$s.ContainerName}}{{if $s.ContainerID}} · {{slice $s.ContainerID 0 12}}{{end}}</td></tr>
-<tr><th>Resources</th><td>{{$s.ResourceProfile}} · {{printf "%.2f" $s.CPULimit}} CPU max · {{$s.MemLimitMB}} MB RAM max</td></tr>
-<tr><th>SSL</th><td>{{if $d.SSL}}{{if $d.SSL.OK}}Valid · {{$d.SSL.Issuer}} · expires {{$d.SSL.ExpiresAt}} ({{$d.SSL.DaysLeft}} days){{else}}Not verified — {{$d.SSL.Detail}}{{end}}{{else}}Not checked yet — use the Domain tab.{{end}}</td></tr>
+<tr><th>SSL</th><td>{{if $d.SSL}}{{if $d.SSL.OK}}Valid · {{$d.SSL.Issuer}} · expires {{$d.SSL.ExpiresAt}} ({{$d.SSL.DaysLeft}} days){{else}}Not verified — {{$d.SSL.Detail}}{{end}}{{else}}Not checked yet{{end}}</td></tr>
 <tr><th>Created</th><td>{{since $s.CreatedAt}}</td></tr>
 </table>
-<div class="actions">
-<a class="btn" href="https://{{$s.Domain}}" target="_blank" rel="noopener">Open Website</a>
-<a class="btn" href="https://{{$s.Domain}}/wp-admin/" target="_blank" rel="noopener">Open WordPress Admin</a>
-<form method="post" action="/websites/{{$s.SiteID}}/start" class="inline">{{template "csrf" $csrf}}<button class="btn" type="submit">Start website</button></form>
-<form method="post" action="/websites/{{$s.SiteID}}/stop" class="inline">{{template "csrf" $csrf}}<button class="btn" type="submit" data-confirm="Stop this website? Its files and database are kept.">Stop website</button></form>
-<form method="post" action="/websites/{{$s.SiteID}}/restart" class="inline">{{template "csrf" $csrf}}<button class="btn" type="submit">Restart website</button></form>
-<form method="post" action="/websites/{{$s.SiteID}}/backup" class="inline">{{template "csrf" $csrf}}<button class="btn" type="submit">Backup website</button></form>
-<a class="btn" href="/websites/{{$s.SiteID}}/logs/view">View logs &amp; events</a>
-</div>
-<p class="muted">Provisioning agent: {{if $d.AgentUp}}connected{{else}}not available — lifecycle actions will queue jobs that fail with a clear “agent unavailable” reason until the agent is deployed{{end}}.</p>
+<p class="muted">Everything about the site itself — pages, posts, themes, plugins, settings — is edited in the WordPress Admin. This panel is only for opening the site, checking its health, and server-level tools.</p>
 </section>
+
+<section class="card">
+<h2>Monitoring</h2>
+<table class="kv">
+<tr><th>Container</th><td>{{$s.ContainerName}}{{if $s.ContainerID}} · {{slice $s.ContainerID 0 12}}{{end}}</td></tr>
+<tr><th>Live status</th><td>{{if not $d.AgentUp}}unknown — provisioning agent not connected{{else if $d.Live}}<span class="badge status-running">running</span>{{else}}not running{{end}}</td></tr>
+{{if $d.Live}}
+<tr><th>CPU usage</th><td>{{printf "%.1f" $d.Live.CPUPercent}}% (limit {{printf "%.2f" $s.CPULimit}} CPU)</td></tr>
+<tr><th>Memory usage</th><td>{{humanBytes $d.Live.MemUsage}} of {{humanBytes $d.Live.MemLimit}} (limit {{$s.MemLimitMB}} MB)</td></tr>
+{{end}}
+<tr><th>Resource profile</th><td>{{$s.ResourceProfile}} · {{printf "%.2f" $s.CPULimit}} CPU max · {{$s.MemLimitMB}} MB RAM max</td></tr>
+<tr><th>Database size</th><td>{{if $d.DBSize}}{{humanBytes $d.DBSize}}{{else}}not measured yet{{end}}</td></tr>
+<tr><th>Provisioning agent</th><td>{{if $d.AgentUp}}connected{{else}}not available — start/stop/restart will queue jobs that fail with a clear “agent unavailable” reason until the agent is back{{end}}</td></tr>
+</table>
+<div class="actions">
+<form method="post" action="/websites/{{$s.SiteID}}/start" class="inline">{{template "csrf" $csrf}}<button class="btn small" type="submit">Start</button></form>
+<form method="post" action="/websites/{{$s.SiteID}}/stop" class="inline">{{template "csrf" $csrf}}<button class="btn small" type="submit" data-confirm="Stop this website? Its files and database are kept.">Stop</button></form>
+<form method="post" action="/websites/{{$s.SiteID}}/restart" class="inline">{{template "csrf" $csrf}}<button class="btn small" type="submit">Restart</button></form>
+<form method="post" action="/websites/{{$s.SiteID}}/backup" class="inline">{{template "csrf" $csrf}}<button class="btn small" type="submit">Backup</button></form>
+<a class="btn small" href="/websites/{{$s.SiteID}}/logs/view">Logs &amp; events</a>
+<a class="btn small" href="/monitoring">Server monitoring</a>
+</div>
+</section>
+
+<details class="card">
+<summary>Advanced tools (rarely needed — most editing happens in WordPress Admin)</summary>
+<ul>
+<li><a href="/websites/{{$s.SiteID}}?tab=wp">WordPress tools (WP-CLI, reset admin password)</a></li>
+<li><a href="/websites/{{$s.SiteID}}?tab=backups">Backups</a></li>
+<li><a href="/websites/{{$s.SiteID}}?tab=jobs">Jobs for this website</a></li>
+<li><a href="/websites/{{$s.SiteID}}?tab=domain">Domain &amp; SSL</a></li>
+<li><a href="/websites/{{$s.SiteID}}?tab=db">Database</a></li>
+<li><a href="/websites/{{$s.SiteID}}?tab=env">Environment</a></li>
+<li><a href="/websites/{{$s.SiteID}}?tab=files">File manager</a></li>
+<li><a href="/websites/{{$s.SiteID}}?tab=yaml">Compose YAML</a></li>
+<li><a href="/websites/{{$s.SiteID}}?tab=danger">Delete website</a></li>
+</ul>
+</details>
 {{end}}
 
 {{if eq $d.Tab "env"}}

@@ -22,7 +22,7 @@ table{width:100%;border-collapse:collapse;background:var(--card);border:1px soli
 th,td{padding:9px 12px;border-bottom:1px solid var(--line);text-align:left;font-size:14px;vertical-align:top}
 table.kv th{width:220px;color:var(--muted);font-weight:500}
 .badge{display:inline-block;padding:1px 8px;border-radius:999px;background:var(--bg);border:1px solid var(--line);font-size:12px}
-.badge.status-ready{border-color:var(--ok);color:var(--ok)}.badge.status-failed{border-color:var(--danger);color:var(--danger)}
+.badge.status-ready{border-color:var(--ok);color:var(--ok)}.badge.status-failed{border-color:var(--danger);color:var(--danger)}.badge.status-running{border-color:var(--ok);color:var(--ok)}
 .muted{color:var(--muted);font-size:13px}.flash{background:#ecfdf3;border:1px solid #a6f4c5;color:#027a48;padding:10px 14px;border-radius:8px;margin:12px 0}
 [data-theme="dark"] .flash{background:#06351f;color:#7ee2ae}
 .error-box{background:#fef3f2;border:1px solid #fecdca;color:#b42318;padding:10px 14px;border-radius:8px;margin:12px 0}

@@ -32,11 +32,47 @@ type fileEntry struct {
 	Editable  bool
 }
 
+// liveStats is one site's live container usage, parsed from the
+// agent's OpStats output (running containers only).
+type liveStats struct {
+	Running    bool
+	CPUPercent float64
+	MemUsage   uint64
+	MemLimit   uint64
+}
+
+// parseSiteStats finds this site's line in the agent's stats output
+// ("<container> site=<id> cpu=3.2% mem=12345/67890"). A missing line
+// means the container is not running.
+func parseSiteStats(output, siteID string) *liveStats {
+	for _, line := range strings.Split(output, "\n") {
+		if !strings.Contains(line, "site="+siteID) {
+			continue
+		}
+		st := &liveStats{Running: true}
+		for _, f := range strings.Fields(line) {
+			switch {
+			case strings.HasPrefix(f, "cpu="):
+				_, _ = fmt.Sscanf(strings.TrimSuffix(f[4:], "%"), "%f", &st.CPUPercent)
+			case strings.HasPrefix(f, "mem="):
+				parts := strings.SplitN(f[4:], "/", 2)
+				if len(parts) == 2 {
+					_, _ = fmt.Sscanf(parts[0], "%d", &st.MemUsage)
+					_, _ = fmt.Sscanf(parts[1], "%d", &st.MemLimit)
+				}
+			}
+		}
+		return st
+	}
+	return nil
+}
+
 type detailData struct {
 	Site        *store.Website
 	Tab         string
 	SSL         *store.SSLCheck
 	Jobs        []*store.Job
+	LatestJob   *store.Job
 	Backups     []*store.Backup
 	Configs     []*store.ConfigVersion
 	Latest      *store.ConfigVersion
@@ -48,6 +84,7 @@ type detailData struct {
 	Logs        string
 	DBSize      int64
 	AgentUp     bool
+	Live        *liveStats
 }
 
 func (a *App) siteRoot(site *store.Website) string {
@@ -68,6 +105,19 @@ func (a *App) siteDetail(w http.ResponseWriter, r *http.Request) {
 		d.SSL = chk
 	}
 	d.Jobs, _ = a.store.ListJobsForSite(site.SiteID)
+	if len(d.Jobs) > 0 {
+		d.LatestJob = d.Jobs[0] // ListJobsForSite is newest-first
+	}
+	// Live monitoring for the simple overview: one read-only stats
+	// call to the agent (running containers only). Best effort - the
+	// page must render fine with the agent down or the site stopped.
+	if d.AgentUp && site.ContainerName != "" {
+		ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
+		if resp, err := a.agent.Call(ctx, agentproto.Request{Op: agentproto.OpStats}); err == nil && resp.OK {
+			d.Live = parseSiteStats(resp.Output, site.SiteID)
+		}
+		cancel()
+	}
 	d.Backups, _ = a.store.ListBackups(site.SiteID, 50)
 	d.Configs, _ = a.store.ListConfigVersions(site.ID)
 	if latest, err := a.store.LatestConfig(site.ID); err == nil {
