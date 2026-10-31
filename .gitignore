@@ -4,6 +4,6 @@
 *.db
 *.db-wal
 *.db-shm
-secrets/
+/secrets/
 *.tar.gz
 .DS_Store
