@@ -16,7 +16,7 @@
   <div class="card stat"><span class="muted">Provisioning agent</span><strong>{{if $d.AgentUp}}Connected{{else}}Not available — provisioning is paused{{end}}</strong></div>
   <div class="card stat"><span class="muted">Verified backups</span><strong>{{$d.BackupCount}}</strong></div>
 </section>
-<p class="muted">Database (the pre-existing shared MariaDB) and Traefik status are verified by the provisioning agent during site operations and shown on each website page; the panel itself has no Docker access, so it never guesses these.</p>
+<p class="muted">Database (the stack's dedicated wordpress-mariadb container) and Traefik status are verified by the provisioning agent during site operations and shown on each website page; the panel itself has no Docker access, so it never guesses these.</p>
 <section class="card">
 <h2>Recent deployment activity</h2>
 {{if $d.Recent}}<ul class="events">{{range $d.Recent}}<li><span class="muted">{{since .CreatedAt}}</span> <span class="badge {{.Level}}">{{.Level}}</span> {{.Message}} <a href="/jobs/{{.JobID}}">job</a></li>{{end}}</ul>

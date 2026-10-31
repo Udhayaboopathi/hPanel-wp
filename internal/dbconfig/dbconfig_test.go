@@ -16,7 +16,7 @@ func TestFromEnvDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Container != "construction-mariadb" || cfg.Host != "db.krwebsolution.com" || cfg.ExternalPort != 3024 || cfg.AdminUser != "WordPress_common_DB" {
+	if cfg.Container != "wordpress-mariadb" || cfg.Host != "db.krwebsolution.com" || cfg.ExternalPort != 3024 || cfg.AdminUser != "WordPress_common_DB" {
 		t.Fatalf("unexpected defaults: %+v", cfg)
 	}
 	if cfg.InternalHost() != cfg.Container {

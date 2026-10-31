@@ -2,7 +2,7 @@
 
 A lightweight, self-hosted WordPress hosting control panel written in Go.
 
-**Login → Create New WordPress Site → enter domain + WordPress details → Create → a real WordPress site is provisioned automatically**: per-site Docker container, dedicated database + least-privilege user in a shared MariaDB, persistent storage, Traefik route via the existing reverse proxy, and a WP-CLI installation — with DNS instructions for the manual Cloudflare step.
+**Login → Create New WordPress Site → enter domain + WordPress details → Create → a real WordPress site is provisioned automatically**: per-site Docker container, dedicated database + least-privilege user in the stack's own MariaDB container, persistent storage, Traefik route via the existing reverse proxy, and a WP-CLI installation — with DNS instructions for the manual Cloudflare step.
 
 ## Architecture
 
@@ -14,9 +14,9 @@ Panel (unprivileged, NO Docker socket)          Agent (host systemd service)
                                                         │ Docker Engine API (unix socket)
         ┌──────────────── Traefik (existing redberyl-traefik, network redberyl-internal)
         ▼                        ▼                          ▼
-   WordPress site 1        WordPress site N          construction-mariadb (pre-existing,
-   own container/db        own container/db          shared: one DB + user per site,
-                                                     panel metadata DB too)
+   WordPress site 1        WordPress site N          wordpress-mariadb (the stack's own
+   own container/db        own container/db          dedicated MariaDB: one DB + user
+                                                     per site, panel metadata DB too)
 ```
 
 - The panel process never opens `/var/run/docker.sock`. All privileged work goes through the agent (`internal/agentproto`), which accepts only `CreateSite, DeleteSite, StartSite, StopSite, RestartSite, BackupSite, RestoreSite, WPCLI, ApplyConfig, RotateDBPassword, DBSize, Ping, Discovery, Stats, Logs`.
@@ -53,7 +53,7 @@ CI/CD (GitHub Actions, self-hosted runner on the server): [docs/CICD.md](docs/CI
 | `cmd/agent` | Privileged provisioning worker |
 | `internal/auth` | Argon2id, TOTP, sessions helpers, recovery codes |
 | `internal/store` | Panel metadata store: SQLite (WAL) locally, MariaDB/MySQL in production, embedded dialect-paired migrations |
-| `internal/dbconfig` | Shared-MariaDB configuration (container/host/port/common admin user) from env/secret files |
+| `internal/dbconfig` | Dedicated-MariaDB configuration (container/host/port/common admin user) from env/secret files |
 | `internal/provisioning` | Durable job runner |
 | `internal/docker` | Docker Engine API client over the unix socket (stdlib only) |
 | `internal/database` | Validated MariaDB provisioning SQL builders |

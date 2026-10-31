@@ -13,8 +13,9 @@ The production host already runs GitHub Actions self-hosted runners. The
 deploy job therefore executes **locally on the server**: it uses Docker and
 systemd directly. There are **no SSH steps and no SSH secrets** — nothing
 connects to the server from outside. A guard step refuses to run anywhere
-else: it fails unless `redberyl-traefik` and the shared MariaDB container
-are visible in `docker ps` on the runner host.
+else: it fails unless `redberyl-traefik` is visible in `docker ps` on the
+runner host. (The stack's dedicated DB container is created by compose
+during the deploy itself, so it is not part of the host proof.)
 
 Triggers:
 
@@ -97,8 +98,22 @@ and is used). The deploy runner runs on the server itself, so there is
 no SSH step and no SSH credential of any kind. They can be left in place
 or deleted; neither affects the deploy.
 
-The deploy also uses one non-secret constant: the shared DB container name
-`construction-mariadb` (env `DB_CONTAINER` in the workflow).
+The deploy also uses one non-secret constant: the DB container name
+`wordpress-mariadb` (env `DB_CONTAINER` in the workflow) — the stack's own
+dedicated MariaDB container, defined in `compose.yaml`.
+
+### The MariaDB root password is server-generated — never a GitHub secret
+
+The root password of `wordpress-mariadb` is **not** part of `HPANEL_ENV`
+and never travels through GitHub. A deploy step generates it on the
+server if missing (`openssl rand -hex 24`) into
+`/opt/own-hpanel/secrets/mariadb_root_password.txt` (0600, value never
+printed) — the same pattern as the agent token. It becomes the
+container's root password on the data volume's **first initialization**
+and is used by the deploy's ensure step (root `docker exec`) to create
+the panel database and sync the common user's provisioning grants. Both
+passwords reach MariaDB only as file-based compose `secrets:`; neither is
+ever a compose literal or a `${...}` interpolation.
 
 ## Cloudflare notes (panel + DB records)
 
@@ -111,12 +126,16 @@ The deploy also uses one non-secret constant: the shared DB container name
   for direct MariaDB TCP access. Cloudflare's proxy forwards HTTP(S)
   only — it does **not** forward MariaDB traffic, so a proxied DB record
   can never serve direct database connections, whatever port is used.
-  Note the panel and the WordPress sites do **not** use this record for
-  their normal traffic anyway: the deploy's panel-database check runs
-  inside the DB container via `docker exec`, and WordPress sites connect
-  over their internal Docker networks. The external endpoint is only for
-  testing/admin tools — which is exactly the traffic that needs the
-  record to be DNS-only (and the host to publish the matching port).
+  The port itself **is** published — by the stack's own
+  `wordpress-mariadb` container (`${DB_EXTERNAL_PORT:-3024}:3306` in
+  compose.yaml) — so with a DNS-only record, external testing/admin
+  tools reach the dedicated DB container directly. Note the panel and
+  the WordPress sites do **not** use this record for their normal
+  traffic anyway: they connect to `wordpress-mariadb` over internal
+  Docker networks, and the deploy's panel-database step runs as root via
+  `docker exec` into that container. The external endpoint is only for
+  testing/admin tools — exactly the traffic that needs the record to be
+  DNS-only.
 
 ## Runner setup (on the server, one time)
 
@@ -141,12 +160,14 @@ The deploy also uses one non-secret constant: the shared DB container name
 2. Snapshot `docker ps` + the IDs of the 10 pre-existing production
    containers (the protection baseline).
 3. Prerequisite checks: `redberyl-internal` network exists, Traefik
-   running, shared MariaDB running, >5 GB disk. Abort changes nothing.
+   running, >5 GB disk. Abort changes nothing. (No database prerequisite:
+   the stack creates its own DB container in step 10.)
 4. Load configuration: parse the `HPANEL_ENV` secret (or the individual-
    secret fallback), export the known non-secret keys for later steps,
    and write the DB admin password file-only to
    `/opt/own-hpanel/secrets/db_admin_password.txt` (0600). This happens
-   before the agent is installed/restarted and before the DB check.
+   before the agent is installed/restarted, before the stack starts
+   (compose mounts it as a file secret) and before the ensure step.
 5. `rsync` the checkout to `DEPLOY_DIR` (excluding `.git` and `.env`).
 6. Write `DEPLOY_DIR/.env` (chmod 600; key names only in the log). It
    contains `PANEL_DOMAIN`, `SERVER_IP`, `DB_HOST`, `DB_EXTERNAL_PORT`,
@@ -157,30 +178,46 @@ The deploy also uses one non-secret constant: the shared DB container name
    agent token if missing (0600, never printed), install/refresh
    `own-hpanel-agent.service`, `daemon-reload`, restart **the agent
    only** (verifying the password file written in step 4 exists first).
-9. Ensure the panel database exists: `docker exec` **into the shared DB
-   container** (`construction-mariadb`) runs
-   `CREATE DATABASE IF NOT EXISTS …; SELECT 1;` as the common account,
-   with `MYSQL_PWD` loaded silently from the password file. This is
-   intentionally *not* an external TCP connection — the external record
-   is Cloudflare-proxied and the published port differs, so external
-   connectivity is a warning-only reachability note in the same step,
-   never a deploy requirement. If the common account lacks the
-   privileges, the step fails with the exact GRANT to run — it never
-   guesses or escalates.
-10. `docker compose build panel` + `docker compose up -d` — panel-owned
-    container only.
-11. Health: wait for the panel container to be running/healthy, then
+9. Generate the MariaDB **root** password file if missing
+   (`/opt/own-hpanel/secrets/mariadb_root_password.txt`, 0600, never
+   printed, never overwritten — see the root-password section above).
+10. `docker compose build` + `docker compose up -d` — the whole stack
+    defined in compose.yaml, i.e. exactly two panel-owned services:
+    `wordpress-mariadb` (image pulled by compose; on first boot of its
+    empty volume the entrypoint creates the panel database and the
+    common user from the file secrets, and
+    `deployment/mariadb-init/01-grants.sh` upgrades that user to full
+    provisioning admin of this container) and `own-hpanel` (starts once
+    the DB is healthy). The step then waits until `wordpress-mariadb`
+    reports healthy.
+11. Ensure the panel database and provisioning grants — **after** the
+    stack is up: `docker exec` **into `wordpress-mariadb` as root**
+    (`MYSQL_PWD` loaded silently from the root password file) feeds it a
+    generated SQL file (0600 temp file, shredded afterwards) that runs
+    `CREATE DATABASE IF NOT EXISTS …`, `CREATE USER IF NOT EXISTS …` /
+    `ALTER USER … IDENTIFIED BY …` (syncing the common user's password
+    with the current secret) and the provisioning `GRANT … WITH GRANT
+    OPTION` for `'%'` and `'localhost'`, followed by a `SELECT 1` check
+    **as the common user**. This repeats the first-init setup
+    idempotently because initdb scripts run only on an empty volume.
+    The common user's password is embedded in the SQL file as a
+    single-quoted literal with single quotes doubled (SQL-standard
+    escaping); passwords containing CR/LF are refused outright. Nothing
+    connects over external TCP for this — external endpoint reachability
+    remains a warning-only note in the same step.
+12. Health: wait for the panel container to be running/healthy, then
     `curl https://$PANEL_DOMAIN/healthz`. A non-200 here with a healthy
     container is reported as a **warning** (usually SSL-pending: Let's
     Encrypt not yet issued or DNS not yet pointing at the server), not a
     failed deploy.
-12. Snapshot again and diff the 10 protected container IDs — **the deploy
+13. Snapshot again and diff the 10 protected container IDs — **the deploy
     fails if any changed or disappeared**. Snapshots are uploaded as the
     `deploy-snapshots-<run>` artifact, and a summary is written to the run.
 
 The workflow never runs `docker prune`, never runs `compose down` for
 anything except during a manual rollback, never modifies Traefik, and
-never creates/stops/restarts the shared MariaDB container.
+never touches the pre-existing production MariaDB (`construction-mariadb`)
+in any way — it only appears in the protected before/after ID comparison.
 
 ## First deploy
 
@@ -204,25 +241,30 @@ never creates/stops/restarts the shared MariaDB container.
   push to `main` — the normal deploy then rolls the panel forward to the
   reverted code.
 - **Panel offline only**: on the server, `docker compose stop panel` and
-  `systemctl stop own-hpanel-agent` — websites and the shared DB are
-  unaffected (docs/RECOVERY.md).
-- Rollback never needs to touch Traefik, the shared MariaDB, or any
-  pre-existing container.
+  `systemctl stop own-hpanel-agent` — websites and the dedicated DB
+  container are unaffected (docs/RECOVERY.md).
+- Rollback never needs to touch Traefik, the dedicated MariaDB's data
+  volume, or any pre-existing container.
 
 ## Security notes
 
-- **DB external port 3024 is a testing convenience.** A MariaDB port
-  reachable from the internet is a real attack surface: in production,
-  firewall it to your own IPs (or close it entirely once testing is done —
-  WordPress containers reach the DB over their Docker network on 3306, and
-  only the panel's metadata store uses the external endpoint; if you close
-  the port, point `DB_HOST`/`PANEL_STORE_DSN` at an internal route
-  instead).
+- **DB external port 3024 is a testing convenience.** The published port
+  (`${DB_EXTERNAL_PORT:-3024}:3306` on `wordpress-mariadb`) exists for
+  outside testing/admin tools only — **nothing in the stack uses it**:
+  the panel, the agent and every WordPress container reach MariaDB
+  internally by container name on 3306. A MariaDB port reachable from
+  the internet is a real attack surface: in production, firewall it to
+  your own IPs or close it entirely once testing is done (remove the
+  `ports:` mapping in compose.yaml — in-stack behaviour is unchanged).
 - **Rotate any credential that has ever been shared in chat** (including
   the DB admin password) and update the GitHub Secret afterwards — the
   workflows read only the current Secret value.
-- The common DB account is powerful: it can create databases/users for
-  provisioning. Keep its password only in GitHub Secrets and the two
-  0600 files on the server; the agent falls back to using it directly for
+- The common DB account is powerful **on `wordpress-mariadb` only**: it
+  holds full grants there (with grant option) so the agent can create
+  databases/users for provisioning — it has no rights on any other
+  database server. Keep its password only in GitHub Secrets and the 0600
+  file on the server; the agent falls back to using it directly for
   a site's connection only when it cannot create a dedicated user, and
-  records that loudly (job warning event + panel audit entry).
+  records that loudly (job warning event + panel audit entry). The
+  container's root password is a separate, server-generated secret
+  (also a 0600 file, never in GitHub) used only by deploys and recovery.

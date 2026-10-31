@@ -146,11 +146,11 @@ func (r *Runner) execute(jobID string, req agentproto.Request, kind string) {
 		_ = r.Store.UpdateJob(jobID, "running", ev.Progress, ev.Message, "")
 	}
 	if resp.UsedCommonDBUser {
-		// The agent fell back to the shared common DB user for this site
+		// The agent fell back to the common DB user for this site
 		// (admin account lacks CREATE USER/GRANT). This must be visible in
 		// the audit log, not only in job events - never fail silently.
 		_ = r.Store.AddAudit(0, "db.common_user_fallback", req.Site.SiteID,
-			"site provisioned with the shared common DB user because the DB admin account could not create a dedicated user/grant; per-site database isolation is reduced for this site", "")
+			"site provisioned with the common DB user because the DB admin account could not create a dedicated user/grant; per-site database isolation is reduced for this site", "")
 	}
 	if !resp.OK {
 		_ = r.Store.UpdateJob(jobID, "failed", 100, "failed", resp.Error)

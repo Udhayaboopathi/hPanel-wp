@@ -36,7 +36,8 @@ type Store struct {
 }
 
 // Driver returns the backend in use ("sqlite" dev default, "mysql" in
-// production where the panel metadata lives in the shared MariaDB server).
+// production where the panel metadata lives in the dedicated MariaDB
+// container of the hPanel stack).
 func (s *Store) Driver() string { return s.driver }
 
 func Open(path string) (*Store, error) {
@@ -56,9 +57,11 @@ func Open(path string) (*Store, error) {
 }
 
 // OpenMySQL opens the panel store on a MariaDB/MySQL server (in production:
-// the ONE pre-existing shared MariaDB, reached through its external
-// host:port). The database itself must already exist - the deploy workflow
-// creates it with CREATE DATABASE IF NOT EXISTS using the admin account.
+// the dedicated wordpress-mariadb container of the hPanel stack, reached
+// internally by container name on port 3306). The database itself must
+// already exist - the MariaDB entrypoint creates it on first init
+// (MARIADB_DATABASE), and the deploy workflow additionally ensures it with
+// CREATE DATABASE IF NOT EXISTS via root exec.
 func OpenMySQL(dsn string) (*Store, error) {
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {

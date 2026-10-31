@@ -7,12 +7,16 @@
 // own-hpanel.managed=true (production guard). It never touches the existing
 // production containers (redberyl-*, construction-*, krweb-*, runners).
 //
-// The ONE exception is the pre-existing shared MariaDB container
-// (DB_CONTAINER, default construction-mariadb): the agent may exec the
-// mariadb SQL client in it (docker.ExecDB) and connect it to new per-site
-// networks. It must NEVER stop, restart, remove or recreate it - that rule
-// is enforced by refuseDBContainer plus the docker client's managed-label
-// guard, and covered by tests.
+// The ONE special case is the stack's own dedicated MariaDB container
+// (DB_CONTAINER, default wordpress-mariadb; defined by compose.yaml and
+// labelled own-hpanel.managed=true + own-hpanel.component=mariadb): the
+// agent may exec the mariadb SQL client in it (docker.ExecDB - the only
+// exec target ExecDB accepts) and connect it to new per-site networks.
+// The agent must NEVER stop, restart, remove or recreate it directly -
+// its lifecycle belongs to Docker Compose alone. That rule is enforced
+// by refuseDBContainer and covered by tests. The pre-existing production
+// construction-mariadb is not the DB container anymore and is never
+// touched at all.
 package main
 
 import (
@@ -54,8 +58,9 @@ type Agent struct {
 	token      string
 	sitesDir   string
 	backupsDir string
-	// db describes the ONE pre-existing shared MariaDB server. The agent
-	// connects to it as the common admin user; it is never lifecycle-managed.
+	// db describes the ONE dedicated MariaDB container of the hPanel stack
+	// (wordpress-mariadb). The agent connects to it as the common admin
+	// user; the agent itself never lifecycle-manages it (Compose does).
 	db  dbconfig.Config
 	log *slog.Logger
 }
@@ -76,7 +81,7 @@ func main() {
 		log.Error("cannot read agent token file", "err", err)
 		os.Exit(1)
 	}
-	// Shared-MariaDB configuration. Legacy AGENT_MARIADB_* names are honoured
+	// Dedicated-MariaDB configuration. Legacy AGENT_MARIADB_* names are honoured
 	// as a fallback so older systemd units keep working during the upgrade.
 	if os.Getenv("DB_ADMIN_PASSWORD_FILE") == "" && os.Getenv("AGENT_MARIADB_ROOT_PASSWORD_FILE") != "" {
 		_ = os.Setenv("DB_ADMIN_PASSWORD_FILE", os.Getenv("AGENT_MARIADB_ROOT_PASSWORD_FILE"))
@@ -254,25 +259,29 @@ func (a *Agent) guardExisting(ctx context.Context, name string) error {
 	return nil
 }
 
-// refuseDBContainer enforces the hardest rule of the shared-DB design: the
-// pre-existing MariaDB container is never lifecycle-managed by the panel.
-// Any operation that would stop/restart/remove/recreate a container whose
-// name matches the configured DB container is refused outright.
+// refuseDBContainer enforces the DB rule of the dedicated-container
+// design: the panel-managed MariaDB container (wordpress-mariadb) is a
+// lifecycle target of Docker Compose ONLY - the agent never stops,
+// restarts, removes or recreates it directly. Any operation that would
+// lifecycle-manage a container whose name matches the configured DB
+// container is refused outright. Every OTHER container is protected by
+// the managed-label guard as usual; the configured DB container is the
+// agent's only ExecDB/network-connect target.
 func (a *Agent) refuseDBContainer(name string) error {
 	if name != "" && name == a.db.Container {
-		return fmt.Errorf("production guard: %q is the shared pre-existing MariaDB container; the panel never stops/restarts/removes/recreates it", name)
+		return fmt.Errorf("production guard: %q is the panel-managed MariaDB container; the agent never stops/restarts/removes/recreates it (its lifecycle belongs to Docker Compose)", name)
 	}
 	return nil
 }
 
-// usesCommonUser reports whether a site's DB user is the shared common
-// admin account (privilege-fallback provisioning). Such a user must never
+// usesCommonUser reports whether a site's DB user is the common admin
+// account (privilege-fallback provisioning). Such a user must never
 // be dropped or password-rotated by per-site operations.
 func (a *Agent) usesCommonUser(dbUser string) bool {
 	return dbUser != "" && dbUser == a.db.AdminUser
 }
 
-// mariadbArgv builds the SQL-client argv used inside the shared DB
+// mariadbArgv builds the SQL-client argv used inside the dedicated DB
 // container. It always authenticates as the configured common admin user -
 // never as root.
 func mariadbArgv(adminUser, adminPassword, joinedSQL string) []string {
@@ -281,10 +290,10 @@ func mariadbArgv(adminUser, adminPassword, joinedSQL string) []string {
 
 func (a *Agent) mariadbExec(ctx context.Context, sqlStatements []string) (string, error) {
 	if a.db.AdminPassword == "" {
-		return "", fmt.Errorf("agent has no shared-MariaDB admin credential configured (set DB_ADMIN_PASSWORD_FILE)")
+		return "", fmt.Errorf("agent has no MariaDB admin credential configured (set DB_ADMIN_PASSWORD_FILE)")
 	}
 	joined := strings.Join(sqlStatements, " ")
-	// ExecDB is the exec-only exception for the shared DB container; it
+	// ExecDB is the exec-only path into the panel-managed DB container; it
 	// cannot start/stop/remove anything.
 	out, code, err := a.docker.ExecDB(ctx, a.db.Container, mariadbArgv(a.db.AdminUser, a.db.AdminPassword, joined))
 	if err != nil {
@@ -413,21 +422,23 @@ func (a *Agent) createSite(ctx context.Context, req agentproto.Request) (*agentp
 	if !ok {
 		return resp, fmt.Errorf("required existing network %q not found; refusing to proceed", traefikNetwork)
 	}
-	// The shared MariaDB is the PRE-EXISTING production container
-	// (DB_CONTAINER, default construction-mariadb). It is not panel-managed:
-	// the agent only verifies it is running, execs the SQL client in it and
-	// connects it to per-site networks. Its lifecycle is never touched.
+	// The MariaDB container is the stack's OWN dedicated container
+	// (DB_CONTAINER, default wordpress-mariadb), panel-managed and created
+	// by Docker Compose. The agent only verifies it is running, execs the
+	// SQL client in it and connects it to per-site networks; it never
+	// starts/stops/restarts it directly - if it is down, the operator
+	// fixes the stack with `docker compose up -d`.
 	maria, err := a.docker.FindByName(ctx, a.db.Container)
 	if err != nil {
 		return resp, err
 	}
 	if maria == nil {
-		return resp, fmt.Errorf("shared MariaDB container %q not found; it must already exist on this server (the panel does not create it)", a.db.Container)
+		return resp, fmt.Errorf("MariaDB container %q not found; it is created by the hPanel compose stack - deploy/start the stack first (docker compose up -d)", a.db.Container)
 	}
 	if maria.State != "running" {
-		return resp, fmt.Errorf("shared MariaDB container %q is not running (state=%s); refusing to proceed - the panel will not start it", a.db.Container, maria.State)
+		return resp, fmt.Errorf("MariaDB container %q is not running (state=%s); refusing to proceed - start the hPanel stack (docker compose up -d)", a.db.Container, maria.State)
 	}
-	add(20, "existing Traefik network verified; shared MariaDB ("+a.db.Container+") is running")
+	add(20, "existing Traefik network verified; dedicated MariaDB ("+a.db.Container+") is running")
 
 	siteDir, err := a.siteDirFor(s)
 	if err != nil {
@@ -437,13 +448,13 @@ func (a *Agent) createSite(ctx context.Context, req agentproto.Request) (*agentp
 	if err := a.docker.CreateNetwork(ctx, network, map[string]string{docker.ManagedLabel: "true", "own-hpanel.site-id": s.SiteID}); err != nil {
 		return resp, fmt.Errorf("creating site network: %w", err)
 	}
-	// Connect the shared MariaDB to the new per-site network. Together with
-	// ExecDB this is the only permitted interaction with that container: it
-	// never stops, restarts or recreates it.
+	// Connect the dedicated MariaDB to the new per-site network. Together
+	// with ExecDB this is the only permitted agent interaction with that
+	// container: the agent never stops, restarts or recreates it.
 	if err := a.docker.ConnectNetwork(ctx, network, a.db.Container); err != nil {
 		return resp, fmt.Errorf("connecting MariaDB to site network: %w", err)
 	}
-	add(30, "per-site network created; shared MariaDB connected to it")
+	add(30, "per-site network created; MariaDB connected to it")
 
 	// Database provisioning with the common admin account: one database +
 	// one dedicated least-privilege user per site. If the common account
@@ -471,7 +482,7 @@ func (a *Agent) createSite(ctx context.Context, req agentproto.Request) (*agentp
 		}
 		effDBUser, effDBPassword = a.db.AdminUser, a.db.AdminPassword
 		resp.UsedCommonDBUser = true
-		add(45, "database created; site connects with the shared common DB user (fallback)")
+		add(45, "database created; site connects with the common DB user (fallback)")
 	} else {
 		add(45, "database and least-privilege user created")
 	}
@@ -674,7 +685,7 @@ func (a *Agent) deleteSite(ctx context.Context, req agentproto.Request) (*agentp
 		resp.Events = append(resp.Events, agentproto.Event{Progress: 40, Message: "site container removed", Level: "info"})
 	}
 	// Drop the site's own database (validated identifiers). If the site was
-	// provisioned on the shared common user (privilege fallback), drop ONLY
+	// provisioned on the common user (privilege fallback), drop ONLY
 	// the database - the common user serves every other site and must never
 	// be dropped.
 	var dropSQL []string
@@ -692,7 +703,7 @@ func (a *Agent) deleteSite(ctx context.Context, req agentproto.Request) (*agentp
 		return resp, fmt.Errorf("dropping site database: %w", err)
 	}
 	if commonSite {
-		resp.Events = append(resp.Events, agentproto.Event{Progress: 70, Message: "site database dropped; shared common DB user preserved", Level: "info"})
+		resp.Events = append(resp.Events, agentproto.Event{Progress: 70, Message: "site database dropped; common DB user preserved", Level: "info"})
 	} else {
 		resp.Events = append(resp.Events, agentproto.Event{Progress: 70, Message: "site database and user dropped", Level: "info"})
 	}
@@ -994,7 +1005,7 @@ func (a *Agent) rotateDBPassword(ctx context.Context, req agentproto.Request) (*
 		return nil, err
 	}
 	if a.usesCommonUser(s.DBUser) {
-		return nil, fmt.Errorf("this site uses the shared common DB user (%s); per-site password rotation is refused because it would change the password for every site and for the provisioning account itself", s.DBUser)
+		return nil, fmt.Errorf("this site uses the common DB user (%s); per-site password rotation is refused because it would change the password for every site and for the provisioning account itself", s.DBUser)
 	}
 	if req.NewDBPassword == "" || len(req.NewDBPassword) < 20 {
 		return nil, fmt.Errorf("new database password is too short")

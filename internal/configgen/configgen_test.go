@@ -12,7 +12,7 @@ func testSpec() SiteSpec {
 	return SiteSpec{
 		SiteID: "wp-ab12cd34", Domain: "example.com", AdminDomain: "wpadmin.example.com",
 		Title: "Example", DBName: "wp_ab12cd34_db", DBUser: "wp_ab12cd34_usr",
-		DBPassword: "supersecretvalue", DBHost: "construction-mariadb",
+		DBPassword: "supersecretvalue", DBHost: "wordpress-mariadb",
 		PHPVersion: "8.3", Profile: p, SiteDir: "/opt/own-hpanel/websites/wp-ab12cd34",
 		ContainerName: "own-hpanel-wp-ab12cd34", Network: "own-hpanel-net-wp-ab12cd34",
 	}

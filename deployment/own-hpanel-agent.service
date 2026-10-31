@@ -8,11 +8,13 @@ Type=simple
 ExecStart=/opt/own-hpanel/bin/agent
 Environment=AGENT_SOCKET=/run/own-hpanel/agent.sock
 Environment=AGENT_TOKEN_FILE=/opt/own-hpanel/secrets/agent.token
-# Shared MariaDB (pre-existing construction-mariadb): the agent connects as
-# the common admin user. Password comes from a 0600 file, never from a unit
-# literal. DB_* values may be overridden via a systemd drop-in or the
-# EnvironmentFile below (written by CI from GitHub Secrets).
-Environment=DB_CONTAINER=construction-mariadb
+# Dedicated MariaDB of the hPanel stack (wordpress-mariadb, defined in
+# compose.yaml): the agent connects as the common admin user, execs the
+# SQL client in that container only, and connects it to per-site networks.
+# Password comes from a 0600 file, never from a unit literal. DB_* values
+# may be overridden via a systemd drop-in or the EnvironmentFile below
+# (written by CI from GitHub Secrets).
+Environment=DB_CONTAINER=wordpress-mariadb
 Environment=DB_HOST=db.krwebsolution.com
 Environment=DB_EXTERNAL_PORT=3024
 Environment=DB_ADMIN_USER=WordPress_common_DB

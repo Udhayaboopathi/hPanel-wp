@@ -10,11 +10,16 @@ name: Deploy Own hPanel
 # because its `$` characters would be corrupted by Compose interpolation.
 #
 # Safety contract:
-#   - only panel-owned resources are created/updated (own-hpanel container,
-#     own-hpanel-agent systemd service, /opt/own-hpanel data)
+#   - only panel-owned resources are created/updated (own-hpanel panel
+#     container, the dedicated wordpress-mariadb DB container defined in
+#     compose.yaml, own-hpanel-agent systemd service, /opt/own-hpanel data)
 #   - the existing Traefik (redberyl-traefik) is reused, never touched
-#   - the shared pre-existing MariaDB (construction-mariadb) is used as-is,
-#     never created/stopped/restarted/removed
+#   - the database is the stack's OWN dedicated MariaDB container
+#     (wordpress-mariadb): compose pulls the image and runs it; ALL its
+#     config is in compose.yaml and its passwords are file-based secrets
+#   - the pre-existing production MariaDB (construction-mariadb) is NOT
+#     used by this stack at all: never exec'd into, never connected,
+#     never created/stopped/restarted/removed - it is purely protected
 #   - docker ps is snapshotted BEFORE and AFTER; the deploy FAILS if any of
 #     the 10 pre-existing production containers changed or disappeared
 #   - no docker prune, no compose down of anything else, ever
@@ -39,7 +44,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  DB_CONTAINER: construction-mariadb
+  DB_CONTAINER: wordpress-mariadb
   PROTECTED_CONTAINERS: "krweb-ui redberyl-api redberyl-ui redberyl-rustfs redberyl-postgres construction-api construction-ui construction-mariadb redberyl-postgres-proxy redberyl-traefik"
 
 jobs:
@@ -57,12 +62,11 @@ jobs:
           command -v docker >/dev/null || { echo "::error::docker not found - this workflow must run on the target server's self-hosted runner"; exit 1; }
           command -v rsync >/dev/null || { echo "::error::rsync not found on the runner host (apt install rsync)"; exit 1; }
           docker ps --format '{{.Names}}' | grep -qx 'redberyl-traefik' || { echo "::error::redberyl-traefik is not visible from this runner - wrong host, refusing to deploy"; exit 1; }
-          docker ps --format '{{.Names}}' | grep -qx "$DB_CONTAINER" || { echo "::error::shared MariaDB container $DB_CONTAINER is not running - wrong host or the existing stack is down, refusing to deploy"; exit 1; }
           if [ "$(id -u)" -ne 0 ] && ! sudo -n true 2>/dev/null; then
             echo "::error::the runner user needs passwordless sudo to install the agent systemd unit (or run the runner as root)"
             exit 1
           fi
-          echo "Runner host: $(hostname) - target server confirmed (Traefik + shared MariaDB visible)"
+          echo "Runner host: $(hostname) - target server confirmed (existing Traefik visible; the dedicated DB container $DB_CONTAINER is created by compose during this deploy, so it need not exist yet)"
 
       - name: Checkout
         uses: actions/checkout@v4
@@ -78,15 +82,14 @@ jobs:
           done
           cat "${SNAP_DIR}/docker-before.txt"
 
-      - name: Verify prerequisites (existing Traefik, network, DB, disk)
+      - name: Verify prerequisites (existing Traefik, network, disk)
         run: |
           set -euo pipefail
           docker network inspect redberyl-internal >/dev/null 2>&1 || { echo "::error::Docker network redberyl-internal is missing - aborting, nothing was changed"; exit 1; }
           [ "$(docker inspect -f '{{.State.Running}}' redberyl-traefik)" = "true" ] || { echo "::error::redberyl-traefik is not running - aborting"; exit 1; }
-          [ "$(docker inspect -f '{{.State.Running}}' "$DB_CONTAINER")" = "true" ] || { echo "::error::shared MariaDB $DB_CONTAINER is not running - aborting (the panel never starts it)"; exit 1; }
           avail_kb="$(df -k --output=avail / | tail -1 | tr -d ' ')"
           [ "$((avail_kb / 1024))" -gt 5120 ] || { echo "::error::less than 5 GB free disk - aborting"; exit 1; }
-          echo "Prerequisites OK: network, Traefik, shared MariaDB, >5 GB free disk"
+          echo "Prerequisites OK: network, Traefik, >5 GB free disk (the DB container is panel-owned and created by compose - no pre-existing DB is required or used)"
 
       - name: Load configuration (HPANEL_ENV secret, or individual secrets)
         env:
@@ -244,49 +247,117 @@ jobs:
           $SUDO chmod 640 /run/own-hpanel/agent.token
           echo "agent installed and running (panel-owned service only)"
 
-      - name: Ensure the panel database exists on the shared MariaDB (inside the DB container)
+      - name: Generate the MariaDB root password file if missing (server-side only)
+        run: |
+          set -euo pipefail
+          rootpw_file=/opt/own-hpanel/secrets/mariadb_root_password.txt
+          if $SUDO test -s "$rootpw_file"; then
+            echo "MariaDB root password file already exists (never overwritten, value never printed)"
+          else
+            $SUDO install -d -m 750 /opt/own-hpanel/secrets
+            openssl rand -hex 24 | $SUDO tee "$rootpw_file" >/dev/null
+            $SUDO chmod 600 "$rootpw_file"
+            echo "MariaDB root password generated into $rootpw_file (0600, value never printed)"
+          fi
+          echo "Note: this password becomes the root password of the dedicated wordpress-mariadb container on its FIRST initialization (empty data volume). If the volume was already initialized earlier, the file must match the root password set back then - the ensure step below fails loudly if it does not."
+
+      - name: Build and start the hPanel stack (panel + dedicated MariaDB, panel-owned only)
+        working-directory: ${{ env.DEPLOY_DIR }}
+        run: |
+          set -euo pipefail
+          # The compose file defines ONLY panel-owned services:
+          # wordpress-mariadb (the stack's OWN dedicated DB container -
+          # image pulled by compose, all config in compose.yaml,
+          # file-based secrets) and own-hpanel (depends_on the DB being
+          # healthy). Nothing pre-existing can be started/stopped by it.
+          docker compose build
+          docker compose up -d
+          # Wait for the dedicated DB container to become healthy.
+          dbhealth=""
+          for i in $(seq 1 60); do
+            status="$(docker inspect -f '{{.State.Status}}' "$DB_CONTAINER" 2>/dev/null || echo missing)"
+            health="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$DB_CONTAINER" 2>/dev/null || echo unknown)"
+            echo "attempt $i: $DB_CONTAINER container=$status health=$health"
+            if [ "$status" = "running" ] && [ "$health" = "healthy" ]; then dbhealth=1; break; fi
+            if [ "$status" = "exited" ] || [ "$status" = "dead" ]; then
+              docker logs --tail 100 "$DB_CONTAINER" || true
+              echo "::error::dedicated MariaDB container $DB_CONTAINER is $status"
+              exit 1
+            fi
+            sleep 3
+          done
+          [ -n "$dbhealth" ] || { docker logs --tail 100 "$DB_CONTAINER" || true; echo "::error::dedicated MariaDB container $DB_CONTAINER did not become healthy in time"; exit 1; }
+          docker ps --filter "name=$DB_CONTAINER" --filter 'name=own-hpanel' --format '{{.Names}} {{.Status}}'
+          echo "stack is up: dedicated MariaDB ($DB_CONTAINER) healthy; panel starts once its DB dependency is healthy"
+
+      - name: Ensure the panel database and provisioning grants (root exec into wordpress-mariadb)
         run: |
           set -euo pipefail
           user="${DB_ADMIN_USER:-WordPress_common_DB}"
           dbname="${PANEL_DB_NAME:-hpanel_panel}"
-          pwfile=/opt/own-hpanel/secrets/db_admin_password.txt
-          $SUDO test -s "$pwfile" || { echo "::error::DB admin password file $pwfile is missing/empty - the Load configuration step should have written it"; exit 1; }
-          # This check runs INSIDE the DB container via docker exec - it
-          # deliberately does NOT connect to the external DB endpoint:
-          # DB_HOST is Cloudflare-proxied (Cloudflare does not forward
-          # MariaDB TCP) and the host publishes a different port than the
-          # external one, so an external connection is unreliable by design.
-          # The password is loaded silently from the 0600 file (no echo, no
-          # set -x) and passed to docker exec by name only, never in argv.
-          MYSQL_PWD="$($SUDO cat "$pwfile")"
-          export MYSQL_PWD
-          if ! docker exec -e MYSQL_PWD "$DB_CONTAINER" mariadb -u"$user" \
-                 -e "CREATE DATABASE IF NOT EXISTS \`${dbname}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci; SELECT 1;" >/dev/null; then
-            echo "::error::could not create/use database ${dbname} inside container ${DB_CONTAINER} as ${user}. The common DB account needs privileges for this: it must be able to CREATE DATABASE (or the database must already exist) and to use it. Fix as a privileged user, e.g.: CREATE DATABASE IF NOT EXISTS ${dbname}; GRANT ALL PRIVILEGES ON ${dbname}.* TO '${user}'@'%'; - then re-run this workflow."
-            unset MYSQL_PWD
+          # These identifiers are interpolated into the generated SQL:
+          # only plain identifiers are acceptable (the panel validates
+          # identifiers the same way).
+          case "$user" in *[!A-Za-z0-9_]*) echo "::error::DB_ADMIN_USER is not a plain identifier - refusing to build SQL with it"; exit 1 ;; esac
+          case "$dbname" in *[!A-Za-z0-9_]*) echo "::error::PANEL_DB_NAME is not a plain identifier - refusing to build SQL with it"; exit 1 ;; esac
+          rootpw_file=/opt/own-hpanel/secrets/mariadb_root_password.txt
+          userpw_file=/opt/own-hpanel/secrets/db_admin_password.txt
+          $SUDO test -s "$rootpw_file" || { echo "::error::MariaDB root password file $rootpw_file is missing/empty - the root-password generation step should have written it"; exit 1; }
+          $SUDO test -s "$userpw_file" || { echo "::error::DB admin password file $userpw_file is missing/empty - the Load configuration step should have written it"; exit 1; }
+          # Load both passwords silently (no echo, no set -x). They reach
+          # the mariadb client via MYSQL_PWD passed by NAME only - never
+          # in argv, never printed.
+          root_pw="$($SUDO cat "$rootpw_file")"
+          user_pw="$($SUDO cat "$userpw_file")"
+          # The user password is embedded in the generated SQL as a
+          # single-quoted literal: escape it by doubling single quotes
+          # (the SQL-standard escape) and refuse CR/LF outright - a line
+          # break would terminate the literal and inject statements.
+          case "$user_pw" in *$'\n'*|*$'\r'*) echo "::error::the DB admin password contains a newline/CR character, which cannot be embedded safely in generated SQL - rotate it to a password without line breaks"; exit 1 ;; esac
+          user_pw_sql="${user_pw//\'/\'\'}"
+          sql_file="$(mktemp)"
+          chmod 600 "$sql_file"
+          trap 'shred -u "$sql_file" 2>/dev/null || rm -f "$sql_file"' EXIT
+          {
+            printf 'CREATE DATABASE IF NOT EXISTS `%s` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;\n' "$dbname"
+            printf "CREATE USER IF NOT EXISTS '%s'@'%%' IDENTIFIED BY '%s';\n" "$user" "$user_pw_sql"
+            printf "ALTER USER '%s'@'%%' IDENTIFIED BY '%s';\n" "$user" "$user_pw_sql"
+            printf "CREATE USER IF NOT EXISTS '%s'@'localhost' IDENTIFIED BY '%s';\n" "$user" "$user_pw_sql"
+            printf "ALTER USER '%s'@'localhost' IDENTIFIED BY '%s';\n" "$user" "$user_pw_sql"
+            printf "GRANT ALL PRIVILEGES ON *.* TO '%s'@'%%' WITH GRANT OPTION;\n" "$user"
+            printf "GRANT ALL PRIVILEGES ON *.* TO '%s'@'localhost' WITH GRANT OPTION;\n" "$user"
+            printf 'FLUSH PRIVILEGES;\n'
+          } > "$sql_file"
+          # Why root exec + a generated SQL file: the MariaDB entrypoint
+          # grants the common user rights only on the panel database, and
+          # deployment/mariadb-init/01-grants.sh runs only on FIRST
+          # initialization of an empty volume. This step repeats the same
+          # setup idempotently on EVERY deploy (existing volumes
+          # included): panel DB exists, the common user exists with the
+          # secret's current password (ALTER USER syncs rotations), and
+          # it holds full provisioning grants ON THIS CONTAINER ONLY.
+          if ! MYSQL_PWD="$root_pw" docker exec -i -e MYSQL_PWD "$DB_CONTAINER" mariadb -uroot < "$sql_file"; then
+            echo "::error::could not initialise database ${dbname} / provisioning user ${user} inside ${DB_CONTAINER} as root. Check that the root password file matches this container's actual root password (it is fixed at first initialization of the data volume; if the volume was initialised with a different one, update $rootpw_file to match) and that the container is healthy."
             exit 1
           fi
-          unset MYSQL_PWD
-          echo "panel database ${dbname} exists and is usable by ${user} (verified inside ${DB_CONTAINER} via docker exec)"
+          if ! MYSQL_PWD="$user_pw" docker exec -e MYSQL_PWD "$DB_CONTAINER" mariadb -u"$user" -e "USE \`${dbname}\`; SELECT 1;" >/dev/null; then
+            echo "::error::panel database ${dbname} is not usable by ${user} inside ${DB_CONTAINER} even after the root ensure step - investigate the MariaDB logs (docker logs $DB_CONTAINER) before re-running."
+            exit 1
+          fi
+          unset root_pw user_pw user_pw_sql
+          echo "panel database ${dbname} exists; common user ${user} holds provisioning grants on ${DB_CONTAINER} (this container only) - verified as root and as ${user}"
           # WARNING-ONLY: external endpoint reachability. The external
-          # endpoint exists for testing/admin access only - the panel and
-          # WordPress sites connect internally and do NOT use it, so a
-          # failure here never fails the deploy.
+          # endpoint (DB_HOST:DB_EXTERNAL_PORT, i.e. the published port of
+          # wordpress-mariadb) exists for testing/admin access only - the
+          # panel and WordPress sites connect internally and do NOT use
+          # it, so a failure here never fails the deploy.
           host="${DB_HOST:-db.krwebsolution.com}"
           port="${DB_EXTERNAL_PORT:-3024}"
           if timeout 3 bash -c "exec 3<>/dev/tcp/${host}/${port}" 2>/dev/null; then
-            echo "external DB endpoint ${host}:${port} is reachable over TCP (testing/admin access)"
+            echo "external DB endpoint ${host}:${port} is reachable over TCP (testing/admin access to the published MariaDB port)"
           else
-            echo "::warning::external DB endpoint ${host}:${port} is not reachable over TCP. Expected while the Cloudflare record for ${host} is Proxied (Cloudflare does not forward MariaDB traffic) or while the host publishes a different port. This does NOT affect the deploy, the panel, or the WordPress sites (they connect internally). For direct external MariaDB access, set the ${host} DNS record to DNS-only (grey cloud)."
+            echo "::warning::external DB endpoint ${host}:${port} is not reachable over TCP. Expected while the Cloudflare record for ${host} is Proxied (Cloudflare does not forward MariaDB traffic). This does NOT affect the deploy, the panel, or the WordPress sites (they connect internally). For direct external MariaDB access, set the ${host} DNS record to DNS-only (grey cloud)."
           fi
-
-      - name: Build and start the panel container (panel-owned only)
-        working-directory: ${{ env.DEPLOY_DIR }}
-        run: |
-          set -euo pipefail
-          docker compose build panel
-          docker compose up -d
-          docker ps --filter 'name=own-hpanel' --format '{{.Names}} {{.Status}}'
 
       - name: Verify panel health
         # PANEL_DOMAIN comes from the Load configuration step ($GITHUB_ENV),
@@ -348,7 +419,7 @@ jobs:
             echo "- Commit: ${GITHUB_SHA}"
             echo "- Trigger: ${GITHUB_EVENT_NAME}"
             echo "- Panel: https://${PANEL_DOMAIN:-unknown} (healthz HTTPS code: ${PANEL_HTTPS_CODE:-not checked})"
-            echo "- Database: shared pre-existing MariaDB (${DB_CONTAINER}), panel DB ${PANEL_DB_NAME:-hpanel_panel} - the DB container was used, never managed"
+            echo "- Database: dedicated panel-owned MariaDB (${DB_CONTAINER}) defined in compose.yaml, panel DB ${PANEL_DB_NAME:-hpanel_panel}; construction-mariadb is NOT used by the stack and must be unchanged (protected check)"
             echo "- Protected containers: IDs compared before/after (see artifact deploy-snapshots-${GITHUB_RUN_ID})"
             echo ""
             echo "Rollback: re-run this workflow from a previous commit, or git revert + push. See docs/CICD.md."

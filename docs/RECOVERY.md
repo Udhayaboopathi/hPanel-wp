@@ -2,7 +2,7 @@
 
 ## Roll back the panel itself (leaves every website running)
 
-Websites are independent containers + the pre-existing shared MariaDB; removing the panel does **not** stop them (Traefik keeps routing by label).
+Websites are independent containers + the stack's dedicated wordpress-mariadb; removing the panel does **not** stop them (Traefik keeps routing by label).
 
 ```bash
 cd hPanel-wp
@@ -13,9 +13,11 @@ systemctl stop own-hpanel-agent    # provisioning paused; sites unaffected
 Full removal of panel-owned resources only (explicit, no prune):
 
 ```bash
-docker compose down                # removes the own-hpanel panel container only
-                                   # (NOT the named volumes, NOT any other service,
-                                   #  and NEVER the shared construction-mariadb)
+docker compose down                # removes the panel-owned containers of this
+                                   # stack only (panel + wordpress-mariadb);
+                                   # NOT the named volumes, NOT any other
+                                   # stack's containers, and NEVER the
+                                   # pre-existing production containers
 systemctl disable --now own-hpanel-agent
 rm /etc/systemd/system/own-hpanel-agent.service
 # Data remains under /opt/own-hpanel and in the named volumes until you
@@ -26,7 +28,7 @@ Never run `docker system prune`, `docker volume prune` or similar generic cleanu
 
 ## Panel database recovery
 
-Panel metadata in production lives in the panel's own database (`hpanel_panel`) on the shared MariaDB server (`PANEL_STORE_DRIVER=mysql`); locally it is the panel container volume's `panel.db` (SQLite WAL). Recover the MySQL copy from your MariaDB backups of that database (dump/restore with the admin account). The AES encryption key for stored per-site DB passwords lives in the panel volume (`/data`, file created by the panel with 0600) — back it up with the metadata. Without that key, stored per-site DB passwords cannot be decrypted (sites keep running; rotate each site's DB password afterwards).
+Panel metadata in production lives in the panel's own database (`hpanel_panel`) on the dedicated wordpress-mariadb container (`PANEL_STORE_DRIVER=mysql`); locally it is the panel container volume's `panel.db` (SQLite WAL). Recover the MySQL copy from your backups of that database (dump/restore with the admin account; container root credentials are in `/opt/own-hpanel/secrets/mariadb_root_password.txt`). The AES encryption key for stored per-site DB passwords lives in the panel volume (`/data`, file created by the panel with 0600) — back it up with the metadata. Without that key, stored per-site DB passwords cannot be decrypted (sites keep running; rotate each site's DB password afterwards).
 
 ## Website recovery
 
@@ -37,4 +39,4 @@ Panel metadata in production lives in the panel's own database (`hpanel_panel`) 
 
 ## MariaDB recovery
 
-All WordPress databases (and the panel's own `hpanel_panel` database) live in the ONE pre-existing shared MariaDB container (`construction-mariadb`) — its data volume belongs to the existing production stack and is backed up with that stack, not by Own hPanel. Per-site recovery does not need volume-level access: import the site's `db.sql` dump from its panel backup (Backups → Restore handles this per site). The panel never stops/restarts/recreates `construction-mariadb`; if that server itself is down, restore it via the existing stack's own procedures first.
+All WordPress databases (and the panel's own `hpanel_panel` database) live in the stack's dedicated MariaDB container (`wordpress-mariadb`) — its data lives in the named volume `own-hpanel-wordpress-mariadb-data`, owned by Own hPanel. Back that volume up (or dump the databases with the common admin account / container root from `/opt/own-hpanel/secrets/mariadb_root_password.txt`) as part of the hPanel backup routine. Per-site recovery does not need volume-level access: import the site's `db.sql` dump from its panel backup (Backups → Restore handles this per site). The agent never stops/restarts/recreates `wordpress-mariadb` — its lifecycle is Compose's; if the container itself is down, bring the stack up (`docker compose up -d`) and check `docker logs wordpress-mariadb`. (The pre-existing production `construction-mariadb` holds none of this data and is never involved.)

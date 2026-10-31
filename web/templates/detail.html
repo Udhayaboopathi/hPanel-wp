@@ -40,7 +40,7 @@
 <p class="muted">Only approved settings can be edited. Database name, user and host are shown for reference; the database password is stored encrypted, is never displayed, and can only be changed from the Database tab. Changes are saved as a new config version and take effect when you Apply Configuration.</p>
 <table class="kv">
 <tr><th>Website domain</th><td>{{$s.Domain}}</td></tr>
-<tr><th>Database host</th><td>construction-mariadb (shared MariaDB, internal Docker network)</td></tr>
+<tr><th>Database host</th><td>wordpress-mariadb (dedicated MariaDB of the hPanel stack, internal Docker network)</td></tr>
 <tr><th>Database name</th><td>{{$s.DBName}}</td></tr>
 <tr><th>Database username</th><td>{{$s.DBUser}}</td></tr>
 <tr><th>Database password</th><td>•••••••• (masked)</td></tr>
@@ -132,7 +132,7 @@
 <section class="card">
 <h2>Database Management</h2>
 <table class="kv">
-<tr><th>Host</th><td>construction-mariadb — shared pre-existing MariaDB; WP containers reach it on the per-site Docker network (3306), external testing endpoint db.krwebsolution.com:3024</td></tr>
+<tr><th>Host</th><td>wordpress-mariadb — the hPanel stack's dedicated MariaDB container; WP containers reach it on the per-site Docker network (3306), external testing endpoint db.krwebsolution.com:3024</td></tr>
 <tr><th>Database</th><td>{{$s.DBName}}</td></tr>
 <tr><th>User</th><td>{{$s.DBUser}} — least-privilege, this database only</td></tr>
 <tr><th>Size</th><td>{{if $d.DBSize}}{{humanBytes $d.DBSize}}{{else}}not measured yet{{end}}</td></tr>

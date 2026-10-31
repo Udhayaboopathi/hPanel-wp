@@ -1,11 +1,14 @@
 // Package dbconfig holds the environment-driven configuration for the ONE
-// shared MariaDB server used by every WordPress site and by the panel
-// itself. That server is the pre-existing `construction-mariadb` container
-// (MariaDB 11.4) on the production host. Own hPanel NEVER creates, stops,
-// restarts, removes or recreates it; the stack only connects to it.
+// MariaDB server used by every WordPress site and by the panel itself:
+// the dedicated `wordpress-mariadb` container (MariaDB 11.4) that the
+// hPanel compose stack itself defines, pulls and runs (see compose.yaml).
+// It is labelled own-hpanel.managed=true and is the only database Own
+// hPanel ever talks to. The pre-existing production `construction-mariadb`
+// container is never used, exec'd into or otherwise touched by Own hPanel.
 //
 // The provisioning/admin account is a single common user (default
-// WordPress_common_DB). Its password is only ever read from a secret file
+// WordPress_common_DB) holding full grants on THIS container only. Its
+// password is only ever read from a secret file
 // (DB_ADMIN_PASSWORD_FILE, preferred) or an environment variable
 // (DB_ADMIN_PASSWORD, development only). It is never logged, never written
 // to the repository, and never stored in the panel database.
@@ -19,7 +22,7 @@ import (
 )
 
 const (
-	DefaultContainer    = "construction-mariadb"
+	DefaultContainer    = "wordpress-mariadb"
 	DefaultHost         = "db.krwebsolution.com"
 	DefaultExternalPort = 3024
 	DefaultAdminUser    = "WordPress_common_DB"
@@ -30,16 +33,16 @@ const (
 )
 
 type Config struct {
-	// Container is the Docker name of the pre-existing shared MariaDB
-	// container (DB_CONTAINER). It doubles as the internal hostname WP
-	// containers use (WORDPRESS_DB_HOST) once the agent connects the
-	// container to each per-site network.
+	// Container is the Docker name of the dedicated MariaDB container
+	// (DB_CONTAINER). It doubles as the internal hostname WP containers
+	// use (WORDPRESS_DB_HOST) once the agent connects the container to
+	// each per-site network.
 	Container string
 	// Host is the external/testing hostname of the DB server (DB_HOST).
 	Host string
-	// ExternalPort is the host-published port for external/testing access
-	// (DB_EXTERNAL_PORT). The panel's own MySQL store connects through
-	// Host:ExternalPort.
+	// ExternalPort is the host-published port of the wordpress-mariadb
+	// container for external/testing access (DB_EXTERNAL_PORT). In-stack
+	// traffic (panel store included) uses Container:InternalPort instead.
 	ExternalPort int
 	// AdminUser is the common provisioning account (DB_ADMIN_USER).
 	AdminUser string

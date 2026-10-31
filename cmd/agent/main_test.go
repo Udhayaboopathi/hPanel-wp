@@ -9,7 +9,7 @@ import (
 
 func testAgent() *Agent {
 	return &Agent{db: dbconfig.Config{
-		Container:    "construction-mariadb",
+		Container:    "wordpress-mariadb",
 		Host:         "db.krwebsolution.com",
 		ExternalPort: 3024,
 		AdminUser:    "WordPress_common_DB",
@@ -18,19 +18,24 @@ func testAgent() *Agent {
 
 func TestRefuseDBContainer(t *testing.T) {
 	a := testAgent()
-	// The shared pre-existing MariaDB container must never be a lifecycle
-	// target (stop/restart/remove/recreate) under any operation.
-	if err := a.refuseDBContainer("construction-mariadb"); err == nil {
-		t.Fatal("agent must refuse lifecycle operations on the shared DB container")
+	// The panel-managed MariaDB container must never be a lifecycle
+	// target (stop/restart/remove/recreate) of the AGENT under any
+	// operation - its lifecycle belongs to Docker Compose alone.
+	if err := a.refuseDBContainer("wordpress-mariadb"); err == nil {
+		t.Fatal("agent must refuse lifecycle operations on the DB container")
 	}
+	// Any other pre-existing production container is refused as a DB
+	// target too once it is the configured container name (tested below
+	// with a custom name); as a plain lifecycle target here it is simply
+	// not the DB container.
 	for _, ok := range []string{"own-hpanel-wp-abc123", "own-hpanel", ""} {
 		if err := a.refuseDBContainer(ok); err != nil {
 			t.Fatalf("container %q must be allowed: %v", ok, err)
 		}
 	}
 	// A customised DB_CONTAINER name is protected too.
-	a2 := &Agent{db: dbconfig.Config{Container: "my-shared-db", AdminUser: "u"}}
-	if err := a2.refuseDBContainer("my-shared-db"); err == nil {
+	a2 := &Agent{db: dbconfig.Config{Container: "my-own-db", AdminUser: "u"}}
+	if err := a2.refuseDBContainer("my-own-db"); err == nil {
 		t.Fatal("custom DB container name must also be refused")
 	}
 }
@@ -58,7 +63,7 @@ func TestMariaDBArgvUsesAdminUserNotRoot(t *testing.T) {
 	}
 	for _, a := range argv {
 		if a == "-uroot" || a == "root" {
-			t.Fatal("agent must never connect to the shared MariaDB as root")
+			t.Fatal("agent must never connect to the MariaDB container as root")
 		}
 	}
 	if !strings.HasSuffix(argv[4], "SELECT 1;") || argv[3] != "-e" {

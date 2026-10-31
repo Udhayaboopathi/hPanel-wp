@@ -1,7 +1,7 @@
 name: CI
 
 # Test + build gate. Runs on GitHub-hosted runners and uses NO secrets:
-# this workflow never touches the production server or the shared database.
+# this workflow never touches the production server or any database.
 on:
   push:
     branches: [main]
@@ -42,6 +42,7 @@ jobs:
       - name: Shell syntax check (deployment scripts)
         run: |
           bash -n deployment/install.sh
+          bash -n deployment/mariadb-init/01-grants.sh
           bash -n scripts/dev-agent.sh
 
       - name: YAML sanity (compose + workflows)
@@ -57,6 +58,8 @@ jobs:
 
       - name: Compose config sanity (dummy values only, no secrets)
         run: |
-          PANEL_DOMAIN=panel.example.com DB_ADMIN_PASSWORD=dummy-not-a-secret \
+          # Passwords are file-based compose secrets and are never
+          # interpolated, so the render needs only non-secret values.
+          PANEL_DOMAIN=panel.example.com \
             docker compose -f compose.yaml config --quiet
           echo "compose.yaml renders OK"

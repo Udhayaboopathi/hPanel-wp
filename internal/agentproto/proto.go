@@ -79,7 +79,7 @@ type Response struct {
 	DBSizeBytes  int64   `json:"db_size_bytes,omitempty"`
 	Events       []Event `json:"events,omitempty"`
 	DNSPending   bool    `json:"dns_pending,omitempty"`
-	// UsedCommonDBUser is set when CreateSite had to fall back to the shared
+	// UsedCommonDBUser is set when CreateSite had to fall back to the
 	// common DB user because the admin account lacks CREATE USER/GRANT
 	// privileges. The panel records an audit warning when this is true.
 	UsedCommonDBUser bool `json:"used_common_db_user,omitempty"`

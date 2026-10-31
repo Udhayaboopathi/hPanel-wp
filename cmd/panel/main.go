@@ -44,7 +44,7 @@ type Config struct {
 	PanelDomain   string
 	SecureCookies bool
 	// SiteDBHost is the hostname written into generated site configs as
-	// WORDPRESS_DB_HOST: the shared MariaDB container's name (DB_CONTAINER),
+	// WORDPRESS_DB_HOST: the dedicated MariaDB container's name (DB_CONTAINER),
 	// reachable from WP containers on their per-site network (port 3306).
 	SiteDBHost string
 }
@@ -104,7 +104,7 @@ func main() {
 		ServerIP:      envOr("SERVER_IP", "130.210.42.20"),
 		PanelDomain:   os.Getenv("PANEL_DOMAIN"),
 		SecureCookies: envBool("PANEL_SECURE_COOKIES", false),
-		SiteDBHost:    envOr("DB_CONTAINER", "construction-mariadb"),
+		SiteDBHost:    envOr("DB_CONTAINER", dbconfig.DefaultContainer),
 	}
 	st, err := openStore(log, dataDir)
 	if err != nil {
@@ -243,10 +243,13 @@ func main() {
 
 // openStore selects the panel metadata store. Default is SQLite in the
 // data dir (local development). In production PANEL_STORE_DRIVER=mysql
-// stores panel metadata in the ONE pre-existing shared MariaDB server, in
-// its own database (PANEL_DB_NAME, default hpanel_panel), reached through
-// DB_HOST:DB_EXTERNAL_PORT with the common admin account - the same server
-// every WordPress site uses. PANEL_STORE_DSN overrides the built DSN.
+// stores panel metadata in the dedicated wordpress-mariadb container of
+// the hPanel stack, in its own database (PANEL_DB_NAME, default
+// hpanel_panel), reached through DB_HOST:DB_EXTERNAL_PORT with the common
+// admin account - the same container every WordPress site uses. In the
+// compose stack DB_HOST/DB_EXTERNAL_PORT are pinned to the internal
+// wordpress-mariadb:3306 endpoint. PANEL_STORE_DSN overrides the built
+// DSN.
 func openStore(log *slog.Logger, dataDir string) (*store.Store, error) {
 	driver := envOr("PANEL_STORE_DRIVER", "sqlite")
 	switch driver {
@@ -271,7 +274,7 @@ func openStore(log *slog.Logger, dataDir string) (*store.Store, error) {
 		if err != nil {
 			return nil, err
 		}
-		log.Info("panel store: mysql (shared MariaDB)", "db", envOr("PANEL_DB_NAME", dbconfig.DefaultPanelDBName))
+		log.Info("panel store: mysql (dedicated wordpress-mariadb)", "db", envOr("PANEL_DB_NAME", dbconfig.DefaultPanelDBName))
 		return st, nil
 	default:
 		return nil, fmt.Errorf("unknown PANEL_STORE_DRIVER %q (want sqlite or mysql)", driver)

@@ -2,7 +2,8 @@
 -- This is the dialect translation of 001_init.sql (SQLite): identical table
 -- and column names, with AUTO_INCREMENT, bounded VARCHARs for indexed /
 -- unique columns (utf8mb4 index limits) and DOUBLE instead of REAL.
--- Target server: the pre-existing shared MariaDB 11.4 (construction-mariadb).
+-- Target server: the dedicated MariaDB 11.4 container of the hPanel stack
+-- (wordpress-mariadb, defined in compose.yaml).
 -- The migration-lint test in internal/store asserts both files create the
 -- same set of tables.
 CREATE TABLE IF NOT EXISTS administrators(

@@ -119,12 +119,14 @@ func (c *Client) IsManaged(ctx context.Context, id string) (bool, string, error)
 	return managed, siteID, nil
 }
 
-// Guard refuses mutation of containers not owned by the panel. The shared
-// pre-existing MariaDB container is NOT panel-managed, so all lifecycle
-// operations on it are refused here. The only operations ever performed on
-// it are: ConnectNetwork (adding it to a new per-site network - it never
-// stops/restarts/recreates the container) and ExecDB (exec of the mariadb
-// SQL client only, see below).
+// Guard refuses mutation of containers not owned by the panel. The
+// dedicated MariaDB container (own-hpanel.component=mariadb) IS
+// panel-managed, so its compose lifecycle is allowed here - but the agent
+// still never lifecycle-manages it directly (see refuseDBContainer in the
+// agent); the only agent operations on it are ConnectNetwork (adding it
+// to a new per-site network) and ExecDB (exec of the mariadb SQL client
+// only, see below). All pre-existing production containers (redberyl-*,
+// construction-*, krweb-*) are NOT panel-managed and are refused.
 func (c *Client) Guard(ctx context.Context, id string) error {
 	managed, _, err := c.IsManaged(ctx, id)
 	if err != nil {
@@ -346,31 +348,38 @@ func (c *Client) Exec(ctx context.Context, container string, argv []string) (str
 	return c.execRun(ctx, container, argv)
 }
 
-// ExecDB is the narrow exec-only exception for the ONE pre-existing shared
-// MariaDB container (production name: construction-mariadb). That container
-// is deliberately NOT labelled own-hpanel.managed=true - it belongs to the
-// existing production stack - so Guard would (correctly) refuse lifecycle
-// operations on it. ExecDB therefore:
+// ExecDB is the narrow exec-only path into the ONE dedicated MariaDB
+// container (production name: wordpress-mariadb, defined by the hPanel
+// compose stack). That container IS panel-managed - it carries
+// own-hpanel.managed=true and own-hpanel.component=mariadb - and it is
+// the only container ExecDB will ever exec into. ExecDB therefore:
 //
 //   - refuses any argv whose program is not the `mariadb` SQL client,
 //   - refuses if the named container does not exist,
-//   - offers NO start/stop/restart/remove path: it is exec and nothing else.
+//   - refuses unless the container is the panel-managed MariaDB
+//     (managed label set AND component=mariadb, and no per-site label),
+//   - offers NO start/stop/restart/remove path: it is exec and nothing
+//     else. (The agent additionally refuses lifecycle operations on the
+//     DB container by name - see refuseDBContainer in cmd/agent.)
 //
 // SQL statements passed here are built only by internal/database from
 // validated identifiers; no user input is executed as raw SQL.
 func (c *Client) ExecDB(ctx context.Context, container string, argv []string) (string, int, error) {
 	if len(argv) == 0 || argv[0] != "mariadb" {
-		return "", -1, fmt.Errorf("ExecDB: only the mariadb SQL client may be executed in the shared DB container")
+		return "", -1, fmt.Errorf("ExecDB: only the mariadb SQL client may be executed in the DB container")
 	}
 	found, err := c.FindByName(ctx, container)
 	if err != nil {
 		return "", -1, err
 	}
 	if found == nil {
-		return "", -1, fmt.Errorf("ExecDB: shared DB container %q not found", container)
+		return "", -1, fmt.Errorf("ExecDB: DB container %q not found", container)
 	}
 	if found.Labels["own-hpanel.site-id"] != "" {
-		return "", -1, fmt.Errorf("ExecDB: %q is a per-site container, not the shared DB container", container)
+		return "", -1, fmt.Errorf("ExecDB: %q is a per-site container, not the DB container", container)
+	}
+	if found.Labels[ManagedLabel] != "true" || found.Labels["own-hpanel.component"] != "mariadb" {
+		return "", -1, fmt.Errorf("ExecDB: %q is not the panel-managed MariaDB container (missing own-hpanel.managed/component=mariadb labels); refusing", container)
 	}
 	return c.execRun(ctx, container, argv)
 }

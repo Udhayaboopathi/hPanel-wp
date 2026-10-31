@@ -7,7 +7,7 @@
 <tr><th>Panel domain</th><td>{{if .Data.PanelDomain}}{{.Data.PanelDomain}}{{else}}set with PANEL_DOMAIN at deploy time{{end}}</td></tr>
 <tr><th>Provisioning agent</th><td>{{if .Data.AgentUp}}connected{{else}}not available{{end}}</td></tr>
 <tr><th>Reverse proxy</th><td>Existing Traefik (redberyl-traefik) on network redberyl-internal — reused, never modified by normal provisioning</td></tr>
-<tr><th>WordPress database</th><td>Shared pre-existing MariaDB 11.4 (container construction-mariadb) — one database + dedicated user per site, provisioned by the common admin account; the panel itself also stores its metadata there (database hpanel_panel)</td></tr>
+<tr><th>WordPress database</th><td>Dedicated MariaDB 11.4 container of the hPanel stack (wordpress-mariadb) — one database + dedicated user per site, provisioned by the common admin account; the panel itself also stores its metadata there (database hpanel_panel)</td></tr>
 </table>
 </section>
 <section class="card"><h2>Panel settings</h2>

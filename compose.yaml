@@ -1,18 +1,93 @@
-# Own hPanel stack. Deploys ONLY the panel-owned `own-hpanel` container.
+# Own hPanel stack. Deploys ONLY panel-owned resources: the `own-hpanel`
+# panel container and the dedicated `wordpress-mariadb` database container.
 #
-# DATABASE: there is deliberately NO database service in this file. All
-# WordPress sites and the panel itself use the ONE pre-existing shared
-# MariaDB server on this host (container `construction-mariadb`, MariaDB
-# 11.4, external endpoint db.krwebsolution.com:3024). That container belongs
-# to the existing production stack: this compose file never creates, stops,
-# restarts or otherwise manages it. The agent connects it to per-site Docker
-# networks and execs the SQL client in it - nothing more.
+# DATABASE: this stack runs its OWN MariaDB container (service
+# `wordpress-mariadb` below) - the image is pulled and the container is
+# created/started by `docker compose up`, and ALL of its configuration lives
+# in this file. It serves the panel's own metadata database AND every
+# WordPress site (one database + one dedicated user per site, provisioned by
+# the common admin account). It is labelled own-hpanel.managed=true and is
+# the ONLY database the panel/agent ever talk to.
+#
+# The pre-existing production `construction-mariadb` container is NOT used
+# by this stack in any way: it is never referenced here, never exec'd into,
+# never network-connected, never stopped/restarted. It belongs to the
+# existing production stack and stays purely protected (the deploy workflow
+# snapshots it before/after and fails if it changes).
+#
+# Secrets are FILE-based only (compose `secrets:` below, files under
+# /opt/own-hpanel/secrets/ with 0600 permissions). No password is ever a
+# literal in this file or interpolated via ${...}: the DB passwords contain
+# `$`, which Compose would corrupt during interpolation.
 #
 # The provisioning agent runs on the host via systemd
 # (deployment/own-hpanel-agent.service) because it needs
 # /var/run/docker.sock + host paths - it is never exposed.
 # Existing production containers are not referenced or modified here.
 services:
+  wordpress-mariadb:
+    image: mariadb:11.4
+    container_name: wordpress-mariadb
+    restart: unless-stopped
+    environment:
+      # On first initialization of the data volume, the entrypoint creates
+      # MARIADB_DATABASE and MARIADB_USER (granted on that database) and
+      # sets the root password - all read from the secret FILES below.
+      # deployment/mariadb-init/01-grants.sh then upgrades the common user
+      # to a full provisioning admin OF THIS CONTAINER ONLY.
+      MARIADB_ROOT_PASSWORD_FILE: /run/secrets/mariadb_root_password
+      MARIADB_DATABASE: ${PANEL_DB_NAME:-hpanel_panel}
+      MARIADB_USER: ${DB_ADMIN_USER:-WordPress_common_DB}
+      MARIADB_PASSWORD_FILE: /run/secrets/db_admin_password
+    secrets:
+      - mariadb_root_password
+      - db_admin_password
+    command:
+      - --innodb-buffer-pool-size=256M
+      - --max-connections=150
+      - --skip-name-resolve
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    # Published on the host for TESTING/admin tools (the external endpoint
+    # db.krwebsolution.com:${DB_EXTERNAL_PORT}). In-stack traffic never uses
+    # this port - containers reach MariaDB internally on 3306. WARNING: an
+    # internet-reachable MariaDB port is an attack surface; restrict it by
+    # firewall to your own IPs in production (see docs/CICD.md).
+    ports:
+      - "${DB_EXTERNAL_PORT:-3024}:3306"
+    volumes:
+      - wordpress-mariadb-data:/var/lib/mysql
+      # First-init provisioning grants for the common admin user. Init
+      # scripts run ONLY when the data volume is empty (first boot); the
+      # deploy workflow's ensure step repeats the same grants idempotently
+      # for already-initialized volumes.
+      - ./deployment/mariadb-init/01-grants.sh:/docker-entrypoint-initdb.d/01-grants.sh:ro
+    networks:
+      - panel-db
+    labels:
+      own-hpanel.managed: "true"
+      own-hpanel.component: "mariadb"
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    mem_limit: 512m
+    cpus: 0.50
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
   panel:
     build:
       context: .
@@ -20,6 +95,9 @@ services:
     image: own-hpanel:latest
     container_name: own-hpanel
     restart: unless-stopped
+    depends_on:
+      wordpress-mariadb:
+        condition: service_healthy
     environment:
       PANEL_ADDR: ":8080"
       PANEL_DATA_DIR: /data
@@ -30,19 +108,23 @@ services:
       AGENT_TOKEN_FILE: /run/own-hpanel/agent.token
       SITES_DIR: /opt/own-hpanel/websites
       BACKUPS_DIR: /opt/own-hpanel/backups
-      # Panel metadata store: the shared MariaDB (PANEL_STORE_DRIVER=mysql),
-      # its own database PANEL_DB_NAME, via the external DB endpoint and the
-      # common admin account. The password arrives ONLY as a file on the
-      # read-only secrets mount below - it is deliberately NOT passed via
-      # the .env file or a ${...} substitution: the password contains `$`,
-      # which Docker Compose would interpolate and corrupt (and the same
-      # applies to the .env file itself, so CI never writes it there).
+      # Panel metadata store: the dedicated wordpress-mariadb container
+      # (PANEL_STORE_DRIVER=mysql), in its own database PANEL_DB_NAME. The
+      # password arrives ONLY as a file on the read-only secrets mount
+      # below - it is deliberately NOT passed via the .env file or a
+      # ${...} substitution: the password contains `$`, which Docker
+      # Compose would interpolate and corrupt.
       PANEL_STORE_DRIVER: ${PANEL_STORE_DRIVER:-mysql}
       PANEL_DB_NAME: ${PANEL_DB_NAME:-hpanel_panel}
       PANEL_STORE_DSN: ${PANEL_STORE_DSN:-}
-      DB_CONTAINER: ${DB_CONTAINER:-construction-mariadb}
-      DB_HOST: ${DB_HOST:-db.krwebsolution.com}
-      DB_EXTERNAL_PORT: ${DB_EXTERNAL_PORT:-3024}
+      DB_CONTAINER: wordpress-mariadb
+      # INTERNAL Docker DNS - the external db.krwebsolution.com:3024
+      # endpoint is for outside testing tools; in-stack traffic never
+      # leaves Docker, so the panel always connects to the DB container by
+      # name on port 3306 (these literals intentionally override any
+      # DB_HOST/DB_EXTERNAL_PORT values from the .env file).
+      DB_HOST: wordpress-mariadb
+      DB_EXTERNAL_PORT: "3306"
       DB_ADMIN_USER: ${DB_ADMIN_USER:-WordPress_common_DB}
       DB_ADMIN_PASSWORD_FILE: /opt/own-hpanel/secrets/db_admin_password.txt
     volumes:
@@ -57,6 +139,7 @@ services:
       - /opt/own-hpanel/backups:/opt/own-hpanel/backups:ro
     networks:
       - traefik
+      - panel-db
     labels:
       own-hpanel.managed: "true"
       own-hpanel.component: "panel"
@@ -89,9 +172,27 @@ networks:
   traefik:
     name: redberyl-internal
     external: true
+  panel-db:
+    name: own-hpanel-db
+    labels:
+      own-hpanel.managed: "true"
 
 volumes:
+  wordpress-mariadb-data:
+    name: own-hpanel-wordpress-mariadb-data
+    labels:
+      own-hpanel.managed: "true"
   panel-data:
     name: own-hpanel-panel-data
     labels:
       own-hpanel.managed: "true"
+
+# File-based secrets ONLY. The files are created on the server with 0600
+# permissions (root password: generated by CI/install if missing; common
+# user password: written by CI from GitHub Secrets) and are never part of
+# this repository.
+secrets:
+  mariadb_root_password:
+    file: /opt/own-hpanel/secrets/mariadb_root_password.txt
+  db_admin_password:
+    file: /opt/own-hpanel/secrets/db_admin_password.txt

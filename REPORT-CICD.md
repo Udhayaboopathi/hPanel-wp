@@ -304,3 +304,109 @@ different port — so no deploy step may depend on external DB TCP.
   `DB_HOST:DB_EXTERNAL_PORT` (documented in the previous section); this
   fix only changed how the *deploy* verifies/creates the panel database
   and how the password is delivered, per scope.
+
+## Dedicated DB container in compose (supersedes the shared-DB wiring)
+
+Per the user's explicit instruction ("ADD DB image download and run and
+assign all config details in docker yaml file"), the design above —
+agent/panel using the pre-existing `construction-mariadb` — is
+**reversed**. The stack now runs its OWN database container, defined
+completely in `compose.yaml`:
+
+- **compose.yaml**: new service `wordpress-mariadb` (`mariadb:11.4`,
+  pulled and started by `docker compose up`). ALL configuration is in
+  the YAML: entrypoint env (`MARIADB_DATABASE=${PANEL_DB_NAME}`,
+  `MARIADB_USER=${DB_ADMIN_USER}`, both passwords via
+  `MARIADB_*_PASSWORD_FILE` pointing at compose file `secrets:` from
+  `/opt/own-hpanel/secrets/` — file-based only, no literal or
+  `${}`-interpolated passwords, because the common user's password
+  contains `$`), tuned `command:` flags, published port
+  `"${DB_EXTERNAL_PORT:-3024}:3306"` (the requested testing exposure —
+  firewall it in production; nothing in-stack uses it), named volume
+  `own-hpanel-wordpress-mariadb-data`, private `panel-db` network,
+  healthcheck, resource limits, hardened caps, labels
+  `own-hpanel.managed=true` / `own-hpanel.component=mariadb`.
+- **Provisioning grants**: the entrypoint grants the common user rights
+  only on the panel DB, so `deployment/mariadb-init/01-grants.sh`
+  (bind-mounted into `/docker-entrypoint-initdb.d/`) grants it
+  `ALL PRIVILEGES ON *.* WITH GRANT OPTION` — on THIS container only;
+  the script documents that scope explicitly. Rationale: the agent
+  provisions per-site databases/users with that account, and this
+  container serves only hPanel + its WordPress sites.
+- **Initdb caveat (and its cover)**: `/docker-entrypoint-initdb.d`
+  scripts run ONLY on first initialization of an empty data volume.
+  For already-initialized volumes the deploy workflow's ensure step
+  repeats the same setup idempotently on every deploy (below).
+- **Panel**: `depends_on: wordpress-mariadb (service_healthy)`, joins
+  `panel-db`, and its DB endpoint is pinned to literals in the compose
+  `environment:` block (`DB_HOST=wordpress-mariadb`,
+  `DB_EXTERNAL_PORT="3306"`, `DB_CONTAINER=wordpress-mariadb`) so
+  in-stack traffic always uses internal Docker DNS, overriding the
+  external values in the server `.env`. This also supersedes the
+  previous section's limitation: the panel store no longer connects via
+  the external endpoint.
+- **Code**: `dbconfig.DefaultContainer` is now `wordpress-mariadb`
+  (tests updated). `docker.ExecDB` now REFUSES any container that is not
+  the panel-managed MariaDB (requires `own-hpanel.managed=true` +
+  `own-hpanel.component=mariadb`, still mariadb-argv-only, still no
+  lifecycle path). The agent's `refuseDBContainer` is unchanged in
+  behaviour — the agent still never stops/restarts/removes the DB
+  container; its lifecycle belongs to Compose alone.
+  `construction-mariadb` returns to being a purely protected, untouched
+  production container: it stays in the workflow's `PROTECTED_CONTAINERS`
+  before/after ID diff, but nothing execs into it, network-connects it,
+  or depends on it. The systemd unit sets
+  `Environment=DB_CONTAINER=wordpress-mariadb` explicitly.
+- **Deploy workflow**: `DB_CONTAINER: wordpress-mariadb`. The guard no
+  longer requires a pre-running DB container (compose creates it). A new
+  step generates `/opt/own-hpanel/secrets/mariadb_root_password.txt`
+  (`openssl rand -hex 24`, sudo tee, 600, never printed, never
+  overwritten) before compose up — the root password is server-generated
+  and stored only in that file; it is set on the volume's first
+  initialization. `docker compose up -d` now starts the whole stack and
+  the step waits for `wordpress-mariadb` to report healthy. The ensure
+  step moved AFTER compose up: as **root** (MYSQL_PWD from the root
+  password file, passed by name) it feeds a generated SQL file (0600
+  mktemp, shredded via trap) via `docker exec -i … mariadb -uroot`
+  stdin: `CREATE DATABASE IF NOT EXISTS`, `CREATE USER IF NOT EXISTS` /
+  `ALTER USER … IDENTIFIED BY …` (syncs secret rotations) and the
+  provisioning grants for `'%'` + `'localhost'`, then verifies with a
+  `SELECT 1` as the common user. The user password is embedded as a
+  single-quoted literal with single quotes doubled; CR/LF passwords are
+  refused. External endpoint reachability stays warning-only.
+- **install.sh** mirrors this: discovery reports the dedicated
+  container (absent is fine — compose creates it), the hard prerequisite
+  on a pre-existing DB is gone, and `--apply` generates
+  `mariadb_root_password.txt` if missing.
+- **Docs**: README, SECURITY.md, docs/CICD.md (incl. the root-password
+  section), docs/DEPLOYMENT.md, docs/RECOVERY.md, `.env.example`,
+  `config/panel.env.example`, the agent systemd unit, and the panel's
+  dashboard/detail/settings templates were updated to the
+  dedicated-container design and the reversal is called out.
+
+### Validation (this change)
+
+- `go test ./...` — all packages pass (dbconfig/agent/configgen tests
+  updated to the `wordpress-mariadb` default); `go vet ./...` clean;
+  `gofmt` clean.
+- Python YAML parse: compose.yaml + ci.yml + deploy.yml — OK.
+- `bash -n`: all workflow `run:` scripts (after `${{ }}` substitution),
+  install.sh, mariadb-init/01-grants.sh, dev-agent.sh — clean.
+- SQL-generation escaping test, run against the deploy workflow's OWN
+  extracted ensure-step script (docker stubbed, secret paths redirected
+  to /tmp): with a FAKE password containing a single quote, `$`, `=`,
+  `)` and `+`, the generated SQL contains the password with its single
+  quote doubled (`''`) and every other byte exact, both GRANTs present,
+  and no raw unescaped form anywhere; a password containing a newline
+  makes the step exit 1 with the rotation error BEFORE any SQL file is
+  generated. The initdb grants script was likewise run against a stubbed
+  `mariadb` binary: both GRANT statements emitted for the default user,
+  and a non-identifier `MARIADB_USER` is refused (exit 1).
+- Still NOT exercised here (no Docker in this VM): the actual compose
+  bring-up, MariaDB first-init (entrypoint user/DB creation + the
+  initdb grants script) and the root-exec ensure step against a real
+  container. First real run remains the production runner, guarded by
+  the before/after protected-container diff; if the ensure step's root
+  login fails because a pre-existing volume was initialized with a
+  different root password, the step fails loudly with that exact
+  remediation.
