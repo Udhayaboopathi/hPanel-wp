@@ -339,11 +339,19 @@ jobs:
           #    10001) cannot open its DB credential. compose creates the
           #    volume with the same name if it is missing; creating it
           #    here first is idempotent and lets us stage into it.
+          #    IMPORTANT: staging a file into the fresh volume also
+          #    suppresses Docker's first-use copy of the image's /data
+          #    ownership (the panel image ships /data owned by 10001),
+          #    leaving the volume root root-owned - the panel could
+          #    then READ the staged password but not CREATE its
+          #    /data/panel.key encryption key, and crash-looped on
+          #    "open /data/panel.key: permission denied". The staging
+          #    container therefore chowns the volume root to 10001 too.
           docker volume create own-hpanel-panel-data >/dev/null
           docker run --rm \
             -v own-hpanel-panel-data:/data \
             -v /opt/own-hpanel/secrets:/secrets:ro \
-            alpine:3.20 sh -c 'if [ ! -s /secrets/db_admin_password.txt ]; then echo "DB admin password file /opt/own-hpanel/secrets/db_admin_password.txt is missing or empty - the Load configuration step should have written it" >&2; exit 1; fi; install -m 600 -o 10001 -g 10001 /secrets/db_admin_password.txt /data/db_admin_password.txt'
+            alpine:3.20 sh -c 'if [ ! -s /secrets/db_admin_password.txt ]; then echo "DB admin password file /opt/own-hpanel/secrets/db_admin_password.txt is missing or empty - the Load configuration step should have written it" >&2; exit 1; fi; chown 10001:10001 /data && install -m 600 -o 10001 -g 10001 /secrets/db_admin_password.txt /data/db_admin_password.txt'
           echo "panel DB credential staged into the panel-data volume (/data/db_admin_password.txt, 0600, owned by the panel uid/gid 10001)"
           # 2) websites/backups are bind-mounted into the panel container
           #    (fixed gid 10001): group-share them (setgid) so the panel

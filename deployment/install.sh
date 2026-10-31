@@ -136,7 +136,7 @@ if [[ -s "$BASE/secrets/db_admin_password.txt" ]]; then
   docker run --rm \
     -v own-hpanel-panel-data:/data \
     -v "$BASE/secrets":/secrets:ro \
-    alpine:3.20 sh -c 'install -m 600 -o 10001 -g 10001 /secrets/db_admin_password.txt /data/db_admin_password.txt'
+    alpine:3.20 sh -c 'chown 10001:10001 /data && install -m 600 -o 10001 -g 10001 /secrets/db_admin_password.txt /data/db_admin_password.txt'
   echo "Panel DB credential staged into the panel-data volume (/data/db_admin_password.txt, 0600, uid/gid 10001)"
   # Group-share the panel-mounted site/backup dirs with the panel gid
   # (same as the workflow's docker staging step).

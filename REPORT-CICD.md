@@ -664,3 +664,17 @@ panel restart-count reporting and a full diagnostics dump (container
 states, host vs panel views of the directory, panel logs) on failure,
 after two consecutive runs failed without the panel's logs ever being
 captured.
+
+## Follow-up (same day): panel crash-loop on /data/panel.key
+
+The a789e2c run's diagnostics (added in that same commit) captured the
+panel's first-ever logs: the MySQL store connected fine, then the panel
+exited repeatedly on `open /data/panel.key: permission denied`. Cause:
+the credential-staging step writes db_admin_password.txt into the fresh
+panel-data volume BEFORE the panel container ever starts; a non-empty
+volume suppresses Docker's first-use initialisation from the image
+(which ships /data owned by uid 10001), so the volume root stayed
+root-owned 0755. The panel could read its 10001-owned password file
+(store connected) but could not create its encryption key in the
+directory. Fix: the staging one-shot container now also
+`chown 10001:10001 /data` (both in deploy.yml and deployment/install.sh).
