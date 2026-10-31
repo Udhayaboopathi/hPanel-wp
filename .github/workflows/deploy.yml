@@ -366,7 +366,17 @@ jobs:
           # only service with the Docker socket mounted). Nothing
           # pre-existing can be started/stopped by it.
           docker compose build
-          docker compose up -d
+          if ! docker compose up -d; then
+            echo "::error::docker compose up failed - diagnostics follow"
+            docker compose ps -a || true
+            echo "===== wordpress-mariadb logs (tail 150) ====="
+            docker logs wordpress-mariadb --tail 150 2>&1 || true
+            echo "===== own-hpanel-agent logs (tail 60) ====="
+            docker logs own-hpanel-agent --tail 60 2>&1 || true
+            echo "===== own-hpanel (panel) logs (tail 60) ====="
+            docker logs own-hpanel --tail 60 2>&1 || true
+            exit 1
+          fi
           # Wait for the dedicated DB container to become healthy.
           dbhealth=""
           for i in $(seq 1 60); do

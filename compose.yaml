@@ -80,7 +80,8 @@ services:
       test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
       interval: 10s
       timeout: 5s
-      retries: 12
+      start_period: 30s
+      retries: 30
     mem_limit: 512m
     cpus: 0.50
     cap_drop:
