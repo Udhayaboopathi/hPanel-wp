@@ -232,6 +232,29 @@ jobs:
             $SUDO chmod 600 /opt/own-hpanel/secrets/agent.token
             echo "agent token generated"
           fi
+          # Smoke-test the agent binary DIRECTLY (no systemd): separates
+          # binary/config errors from systemd sandbox errors, and prints the
+          # agent's own stderr into this log either way.
+          smoke_dir="${RUNNER_TEMP}/agent-smoke"; mkdir -p "$smoke_dir"
+          openssl rand -hex 32 > "$smoke_dir/token"
+          printf 'smoke-dummy' > "$smoke_dir/dbpw"
+          AGENT_SOCKET="$smoke_dir/agent.sock" \
+          AGENT_TOKEN_FILE="$smoke_dir/token" \
+          DB_ADMIN_PASSWORD_FILE="$smoke_dir/dbpw" \
+          SITES_DIR="$smoke_dir/websites" BACKUPS_DIR="$smoke_dir/backups" \
+            timeout 6 "${RUNNER_TEMP}/hpanel-bin/agent" > "$smoke_dir/agent.log" 2>&1 &
+          smoke_pid=$!
+          smoke_ok=""
+          for i in $(seq 1 10); do
+            [ -S "$smoke_dir/agent.sock" ] && { smoke_ok=1; break; }
+            sleep 0.5
+          done
+          kill "$smoke_pid" 2>/dev/null || true
+          echo "--- agent direct smoke test log ---"
+          cat "$smoke_dir/agent.log" || true
+          echo "--- end agent smoke test log ---"
+          [ -n "$smoke_ok" ] || { echo "::error::agent binary failed its direct smoke test (systemd not involved) - see its log above"; exit 1; }
+          echo "agent binary smoke test OK - starting it under systemd"
           $SUDO install -m 644 "${DEPLOY_DIR}/deployment/own-hpanel-agent.service" /etc/systemd/system/own-hpanel-agent.service
           $SUDO systemctl daemon-reload
           $SUDO systemctl enable own-hpanel-agent >/dev/null
@@ -240,7 +263,12 @@ jobs:
             [ -S /run/own-hpanel/agent.sock ] && break
             sleep 1
           done
-          [ -S /run/own-hpanel/agent.sock ] || { echo "::error::agent socket did not appear; check: systemctl status own-hpanel-agent"; exit 1; }
+          if [ ! -S /run/own-hpanel/agent.sock ]; then
+            echo "::error::agent socket did not appear under systemd (binary smoke test passed, so this is a service/sandbox problem) - diagnostics follow"
+            $SUDO systemctl status own-hpanel-agent --no-pager -l || true
+            $SUDO systemctl show own-hpanel-agent -p NRestarts -p ExecMainStatus -p ExecMainCode -p Result || true
+            exit 1
+          fi
           $SUDO systemctl is-active own-hpanel-agent
           # Panel reads the agent token through the shared /run/own-hpanel mount.
           $SUDO cp /opt/own-hpanel/secrets/agent.token /run/own-hpanel/agent.token
