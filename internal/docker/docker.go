@@ -23,6 +23,12 @@ const ManagedLabel = "own-hpanel.managed"
 type Client struct {
 	Socket string
 	http   *http.Client
+	// httpLong is used for image pulls: a first pull of a WordPress
+	// image can legitimately take several minutes, far beyond the
+	// 120s ceiling that is right for ordinary API calls. It shares the
+	// transport and has no overall timeout - the caller's context is
+	// the deadline.
+	httpLong *http.Client
 }
 
 func New(socket string) *Client {
@@ -35,7 +41,11 @@ func New(socket string) *Client {
 			return d.DialContext(ctx, "unix", socket)
 		},
 	}
-	return &Client{Socket: socket, http: &http.Client{Transport: tr, Timeout: 120 * time.Second}}
+	return &Client{
+		Socket:   socket,
+		http:     &http.Client{Transport: tr, Timeout: 120 * time.Second},
+		httpLong: &http.Client{Transport: tr},
+	}
 }
 
 func (c *Client) do(ctx context.Context, method, path string, body any, out any) error {
@@ -211,6 +221,15 @@ type CreateConfig struct {
 }
 
 func (c *Client) CreateContainer(ctx context.Context, name string, cfg CreateConfig) (string, error) {
+	// The daemon does NOT pull on create: a missing image is a hard
+	// 404 ("No such image"). Ensure the image first so no call site
+	// can forget - the pinned WordPress/WP-CLI images are not pulled
+	// by anything else on a fresh host.
+	if cfg.Image != "" {
+		if err := c.EnsureImage(ctx, cfg.Image); err != nil {
+			return "", err
+		}
+	}
 	var out struct {
 		ID string `json:"Id"`
 	}
@@ -218,9 +237,107 @@ func (c *Client) CreateContainer(ctx context.Context, name string, cfg CreateCon
 	return out.ID, err
 }
 
-// PullImage pulls an approved image (used for the pinned WordPress/MariaDB images).
+// ImagePresent reports whether an image reference exists locally.
+func (c *Client) ImagePresent(ctx context.Context, image string) (bool, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", "http://docker/v1.47/images/"+image+"/json", nil)
+	if err != nil {
+		return false, err
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return false, fmt.Errorf("docker API image inspect %s: %w (is the Docker daemon running?)", image, err)
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+	switch resp.StatusCode {
+	case http.StatusOK:
+		return true, nil
+	case http.StatusNotFound:
+		return false, nil
+	default:
+		return false, fmt.Errorf("docker API image inspect %s: unexpected status %s", image, resp.Status)
+	}
+}
+
+// splitImageRef splits "name:tag" (the tag colon is the one after the
+// last slash, so registry ports in the name are not mistaken for tags).
+func splitImageRef(image string) (name, tag string) {
+	if i := strings.LastIndex(image, ":"); i > strings.LastIndex(image, "/") {
+		return image[:i], image[i+1:]
+	}
+	return image, ""
+}
+
+// PullImage pulls an image from its registry. The response is a stream
+// of JSON progress objects that runs until the pull finishes; it is
+// drained in full (no overall client timeout) and any error object
+// embedded in the stream - the daemon reports many pull failures that
+// way, with an HTTP 200 - is surfaced as an error.
 func (c *Client) PullImage(ctx context.Context, image string) error {
-	return c.do(ctx, "POST", "/v1.47/images/create?fromImage="+urlQueryEscape(image), nil, nil)
+	name, tag := splitImageRef(image)
+	path := "/v1.47/images/create?fromImage=" + urlQueryEscape(name)
+	if tag != "" {
+		path += "&tag=" + urlQueryEscape(tag)
+	}
+	req, err := http.NewRequestWithContext(ctx, "POST", "http://docker"+path, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := c.httpLong.Do(req)
+	if err != nil {
+		return fmt.Errorf("docker API pull %s: %w (is the Docker daemon running?)", image, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		data, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+		var e struct {
+			Message string `json:"message"`
+		}
+		_ = json.Unmarshal(data, &e)
+		if e.Message == "" {
+			e.Message = string(data)
+		}
+		return fmt.Errorf("docker API pull %s: %s (%s)", image, resp.Status, e.Message)
+	}
+	sc := bufio.NewScanner(resp.Body)
+	sc.Buffer(make([]byte, 0, 64<<10), 1<<20)
+	for sc.Scan() {
+		var line struct {
+			Error       string `json:"error"`
+			ErrorDetail *struct {
+				Message string `json:"message"`
+			} `json:"errorDetail"`
+		}
+		if err := json.Unmarshal(sc.Bytes(), &line); err != nil {
+			continue // progress lines we cannot parse are not failures
+		}
+		if line.Error != "" {
+			msg := line.Error
+			if line.ErrorDetail != nil && line.ErrorDetail.Message != "" {
+				msg = line.ErrorDetail.Message
+			}
+			return fmt.Errorf("pulling image %s: %s", image, msg)
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return fmt.Errorf("pulling image %s: reading pull progress: %w", image, err)
+	}
+	return nil
+}
+
+// EnsureImage pulls the image if it is not already present locally.
+func (c *Client) EnsureImage(ctx context.Context, image string) error {
+	present, err := c.ImagePresent(ctx, image)
+	if err != nil {
+		return err
+	}
+	if present {
+		return nil
+	}
+	if err := c.PullImage(ctx, image); err != nil {
+		return fmt.Errorf("image %s is not present locally and pulling it failed: %w", image, err)
+	}
+	return nil
 }
 
 // Wait polls inspect until the container exits or ctx is done.

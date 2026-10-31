@@ -47,3 +47,19 @@ Built locally on 2026-10-31 in `~/workspace/own-hpanel-build` (git repo, branch 
 ## Repository state
 
 81 files, working tree ready for the parent to commit/push. No secrets in the tree (`.env` and `secrets/` are gitignored; no token was used or stored by this build).
+
+## Live provisioning finding (2026-10-31): images are now pulled on demand
+
+The first real create_site job on the production server ran the full
+provisioning chain successfully - validation, Traefik network check,
+per-site network creation, MariaDB connection to it, per-site database
+AND least-privilege user creation, site storage/.env/compose written -
+and failed only at container creation: the Docker daemon does not pull
+on create, and nothing had ever pulled the pinned WordPress image
+(`No such image: wordpress:6.7.2-php8.3-apache`). The agent's
+CreateContainer now ensures the image first (inspect; pull if missing)
+for every call site, with a pull implementation that has no overall
+client timeout, drains the progress stream fully, and surfaces errors
+embedded in that stream. Covered by unit tests against a fake daemon
+on a real unix socket (pull-when-missing, skip-when-present,
+stream-error propagation, image-ref splitting).

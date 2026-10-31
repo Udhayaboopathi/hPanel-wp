@@ -566,9 +566,10 @@ func (a *Agent) createSite(ctx context.Context, req agentproto.Request) (*agentp
 				},
 			},
 		}
+		add(60, "ensuring the WordPress image is available locally (first create pulls it - this can take a few minutes)")
 		id, err := a.docker.CreateContainer(ctx, s.ContainerName, cfg)
 		if err != nil {
-			return resp, fmt.Errorf("creating WordPress container: %w (is image %s pulled?)", err, img)
+			return resp, fmt.Errorf("creating WordPress container: %w", err)
 		}
 		containerID = id
 		if err := a.docker.Start(ctx, id); err != nil {
