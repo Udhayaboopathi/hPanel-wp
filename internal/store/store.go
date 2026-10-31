@@ -99,7 +99,7 @@ func finishOpen(db *sql.DB, driver string) (*Store, error) {
 	}
 	// Backup records whose reconciler goroutine died with the old
 	// process would sit in 'creating' forever.
-	if _, err := db.Exec(`UPDATE backups SET status='failed' WHERE status='creating'`, Now()); err != nil {
+	if _, err := db.Exec(`UPDATE backups SET status='failed' WHERE status='creating'`); err != nil {
 		return nil, err
 	}
 	return s, nil
