@@ -20,13 +20,14 @@ const (
 	OpStats            = "Stats"
 	OpLogs             = "Logs"
 	OpRepairSite       = "RepairSite"
+	OpImportSite       = "ImportSite"
 )
 
 var Allowlist = map[string]bool{
 	OpCreateSite: true, OpDeleteSite: true, OpStartSite: true, OpStopSite: true,
 	OpRestartSite: true, OpBackupSite: true, OpRestoreSite: true, OpWPCLI: true,
 	OpApplyConfig: true, OpRotateDBPassword: true, OpDBSize: true, OpPing: true, OpDiscovery: true,
-	OpStats: true, OpLogs: true, OpRepairSite: true,
+	OpStats: true, OpLogs: true, OpRepairSite: true, OpImportSite: true,
 }
 
 type SiteSpec struct {
@@ -46,8 +47,12 @@ type SiteSpec struct {
 	MemLimitMB    int     `json:"mem_limit_mb"`
 	SiteDir       string  `json:"site_dir"`
 	ContainerName string  `json:"container_name"`
-	ComposeYAML   string  `json:"compose_yaml,omitempty"`
-	EnvText       string  `json:"env_text,omitempty"`
+	// TablePrefix is the WordPress table prefix ("" or "wp_" for
+	// native sites; the source prefix for imported ones). It becomes
+	// WORDPRESS_TABLE_PREFIX in the generated configuration.
+	TablePrefix string `json:"table_prefix,omitempty"`
+	ComposeYAML string `json:"compose_yaml,omitempty"`
+	EnvText     string `json:"env_text,omitempty"`
 }
 
 type Request struct {
@@ -71,6 +76,14 @@ type Request struct {
 	// password was supplied, provisioning leaves the browser setup
 	// wizard for the operator instead of failing.
 	RepairMode bool `json:"repair_mode,omitempty"`
+	// Import (OpImportSite): paths of the artifacts the panel staged
+	// inside the site's own directory (<siteDir>/import/), plus the
+	// source site URL detected in the dump for the post-import
+	// search-replace. The agent re-validates that both paths stay
+	// inside the site directory.
+	ImportZipPath   string `json:"import_zip_path,omitempty"`
+	ImportDBPath    string `json:"import_db_path,omitempty"`
+	ImportSourceURL string `json:"import_source_url,omitempty"`
 }
 
 type Event struct {

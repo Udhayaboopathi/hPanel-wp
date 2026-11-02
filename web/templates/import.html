@@ -1,39 +1,45 @@
 {{template "header" .}}
 {{$d := .Data}}
 <h1>Migrate a WordPress Website</h1>
-<p class="muted">KR Host does not run a one-click importer — migrations use the same verified tools as everything else in the panel, so nothing is silently half-copied. Follow these steps; each one is a real, working feature.</p>
 
 <section class="card">
-<h2>Step 1 — Create the new website</h2>
-<p>Create an empty WordPress site on the target domain with the <a href="/websites/new">Create Website</a> wizard and let provisioning finish. This gives the migrated site its own container, database and restricted database user.</p>
+<h2>One-upload import (WPvivid &amp; standard backups)</h2>
+<p>Upload the site's <strong>wp-content as one ZIP</strong> — a WPvivid backup layout works as-is: if the ZIP also contains the WPvivid database file (the <code>…-db</code> file WPvivid leaves inside wp-content), the database is taken from there. Otherwise add the database export (<code>.sql</code>, <code>.sql.gz</code>, or a ZIP of one) as the second file. KR Host then deploys the site as a tracked job: it provisions the container and a fresh database, installs your files, imports the database, rewrites the old domain to the new one, and creates the administrator account below in the imported site.</p>
+<form method="post" action="/websites/import" enctype="multipart/form-data">
+{{template "csrf" .CSRF}}
+<label>New domain <input name="domain" required placeholder="example.com"></label>
+<label>Site title <input name="title" placeholder="(defaults to the domain)"></label>
+<label>wp-content ZIP (required, up to 2 GB) <input type="file" name="files_zip" accept=".zip" required></label>
+<label>Database file (optional if the ZIP contains the WPvivid dump) <input type="file" name="db_file" accept=".sql,.gz,.zip"></label>
+<label>WordPress admin username <input name="admin_user" required autocomplete="username"></label>
+<label>WordPress admin email <input name="admin_email" type="email" required autocomplete="email"></label>
+<label>WordPress admin password (min. 12 characters) <input name="admin_password" type="password" required autocomplete="new-password"></label>
+<label>PHP version <select name="php_version"><option value="8.3" selected>PHP 8.3 (WordPress 7.1.4)</option><option value="8.2">PHP 8.2 (WordPress 7.1.4)</option></select></label>
+<label>Resource profile <select name="resource_profile"><option value="lightweight">Lightweight — 0.5 CPU, 512 MB RAM</option><option value="standard" selected>Standard — 1 CPU, 768 MB RAM</option></select></label>
+<button class="btn primary" type="submit">Upload and deploy</button>
+</form>
+<p class="muted">Notes: the source table prefix and old domain are detected from the dump automatically. Source-server extras (LiteSpeed cache folders, WPvivid staging folders) are skipped. The old <code>wp-config.php</code> is never imported — KR Host supplies the database credentials itself. Sites that ran on LiteSpeed keep working, but the LiteSpeed Cache plugin's server-level caching does not apply on this Apache stack; remove that plugin after the move.</p>
 </section>
 
 <section class="card">
-<h2>Step 2 — Bring the files over</h2>
+<h2>Prefer to migrate by hand?</h2>
+<p class="muted">The same result is reachable step by step with the panel's existing tools:</p>
+<h3>Step 1 — Create the new website</h3>
+<p>Create an empty WordPress site on the target domain with the <a href="/websites/new">Create Website</a> wizard and let provisioning finish. This gives the migrated site its own container, database and restricted database user.</p>
+<h3>Step 2 — Bring the files over</h3>
 <p>Upload the old site's <code>wp-content</code> (uploads, themes, plugins) into the new site with the File Manager. For a site that already exists in KR Host, pick it here:</p>
 <form method="get" class="toolbar" onsubmit="if(this.site.value){location='/websites/'+this.site.value+'/files';}return false;">
   <select name="site" aria-label="Website">{{range $d.Sites}}<option value="{{.SiteID}}">{{.Domain}}</option>{{end}}</select>
   <button class="btn" type="submit">Open File Manager</button>
 </form>
-</section>
-
-<section class="card">
-<h2>Step 3 — Import the database</h2>
-<p>Export the old database as <code>.sql</code> or <code>.sql.gz</code>, then import it from the new site's Database page. The import runs inside the site's own database — other sites are not touched.</p>
-<form method="get" class="toolbar" onsubmit="if(this.site.value){location='/websites/'+this.site.value+'/database';}return false;">
-  <select name="site" aria-label="Website">{{range $d.Sites}}<option value="{{.SiteID}}">{{.Domain}}</option>{{end}}</select>
-  <button class="btn" type="submit">Open Database</button>
-</form>
-<p class="muted">After importing, update the site URL inside WordPress (Settings → General) or with the WordPress tab's WP-CLI tools if the domain changed, and flush permalinks once.</p>
-</section>
-
-<section class="card">
-<h2>Step 4 — Verify, then point DNS</h2>
+<h3>Step 3 — Import the database</h3>
+<p>Connect to the new site's database with your database tool (the external endpoint is shown on the site's <strong>Database</strong> page) and import the old dump there, or simply use the one-upload import above, which does this for you. Afterwards update the site URL inside WordPress (Settings → General) or with the WordPress tab's WP-CLI tools if the domain changed, and flush permalinks once.</p>
+<h3>Step 4 — Verify, then point DNS</h3>
 <p>Open the site, check pages, forms and media, then point the domain's DNS A records at this server (the exact records are shown on the site's <strong>Domains &amp; SSL</strong> page). Keep the old hosting live until DNS has propagated.</p>
 </section>
 
 <section class="card">
 <h2>Moving between KR Host servers?</h2>
-<p>Use the same steps above: export the database from the source site's Database page, copy the files with the File Manager, and import both into the new site here. Restoring a backup archive taken on a different KR Host server is not supported yet — backups are tied to the site that created them. This limitation is tracked in KR-HOST-REMAINING-ISSUES.md.</p>
+<p>Take a backup on the source server, download it, and use the one-upload import here with the backup's files and database — or follow the manual steps above. Restoring a backup archive directly into a different site is still not supported; backups restore into the site that created them.</p>
 </section>
 {{template "footer" .}}

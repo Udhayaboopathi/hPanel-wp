@@ -116,6 +116,66 @@ func (r *Runner) run(jobID string, spec agentproto.SiteSpec, adminPassword strin
 	r.mu.Unlock()
 }
 
+// ImportMeta carries the non-secret import parameters of an
+// import_site job: where the panel staged the artifacts inside the
+// site's own directory, and the source site URL detected in the
+// dump (for the post-import search-replace).
+type ImportMeta struct {
+	ZipPath   string `json:"zip_path"`
+	DBPath    string `json:"db_path"`
+	SourceURL string `json:"source_url,omitempty"`
+}
+
+type importPayload struct {
+	Spec   agentproto.SiteSpec `json:"spec"`
+	Import ImportMeta          `json:"import"`
+}
+
+// EnqueueImport queues an import_site job. The admin password is
+// memory-only, exactly like create_site; the payload persisted in
+// the DB carries paths and the source URL, never a secret.
+func (r *Runner) EnqueueImport(site *store.Website, spec agentproto.SiteSpec, adminPassword string, meta ImportMeta) (*store.Job, error) {
+	if active, err := r.Store.HasActiveJobForSite(site.SiteID, ""); err != nil {
+		return nil, err
+	} else if active {
+		return nil, fmt.Errorf("another job is already active for site %s; wait for it to finish first", site.SiteID)
+	}
+	specCopy := spec
+	specCopy.DBPassword = ""
+	specCopy.AdminPassword = ""
+	payload, _ := json.Marshal(importPayload{Spec: specCopy, Import: meta})
+	job := &store.Job{
+		WebsiteID:   sql.NullInt64{Int64: site.ID, Valid: site.ID != 0},
+		SiteID:      site.SiteID,
+		Kind:        "import_site",
+		Status:      "queued",
+		PayloadJSON: string(payload),
+	}
+	if err := r.Store.CreateJob(job); err != nil {
+		return nil, err
+	}
+	if adminPassword != "" {
+		r.mu.Lock()
+		r.secrets[job.ID] = adminPassword
+		r.mu.Unlock()
+	}
+	_ = r.Store.AddEvent(job.ID, "info", "job queued: import_site")
+	go r.runImport(job.ID, spec, adminPassword, meta)
+	return job, nil
+}
+
+func (r *Runner) runImport(jobID string, spec agentproto.SiteSpec, adminPassword string, meta ImportMeta) {
+	spec.AdminPassword = adminPassword
+	req := agentproto.Request{
+		Op: agentproto.OpImportSite, Site: spec, JobID: jobID,
+		ImportZipPath: meta.ZipPath, ImportDBPath: meta.DBPath, ImportSourceURL: meta.SourceURL,
+	}
+	r.execute(jobID, req, "import_site")
+	r.mu.Lock()
+	delete(r.secrets, jobID)
+	r.mu.Unlock()
+}
+
 func (r *Runner) execute(jobID string, req agentproto.Request, kind string) {
 	r.Sem <- struct{}{}
 	defer func() { <-r.Sem }()
@@ -134,7 +194,7 @@ func (r *Runner) execute(jobID string, req agentproto.Request, kind string) {
 	// lastProgress tracks the furthest step actually reached, so a
 	// FAILED job never displays 100% (which must mean success only).
 	lastProgress := 5
-	if kind == "create_site" {
+	if kind == "create_site" || kind == "import_site" {
 		_ = r.Store.UpdateWebsite(req.Site.SiteID, map[string]any{"status": "provisioning"})
 	}
 	// fail marks the job failed at the progress it actually reached,
@@ -153,7 +213,7 @@ func (r *Runner) execute(jobID string, req agentproto.Request, kind string) {
 		}
 		_ = r.Store.UpdateJob(jobID, "failed", lastProgress, "failed", msg)
 		_ = r.Store.AddEvent(jobID, "error", msg)
-		if kind == "create_site" {
+		if kind == "create_site" || kind == "import_site" {
 			_ = r.Store.UpdateWebsite(req.Site.SiteID, map[string]any{"status": "failed"})
 		}
 	}
@@ -227,7 +287,7 @@ func (r *Runner) execute(jobID string, req agentproto.Request, kind string) {
 		_ = r.Store.CompleteBackup(req.BackupID, resp.BackupPath[strings.LastIndex(resp.BackupPath, "/")+1:], resp.BackupPath, resp.BackupSHA256, resp.BackupSize)
 	}
 	switch kind {
-	case "create_site", "repair_site":
+	case "create_site", "repair_site", "import_site":
 		status := "ready"
 		if resp.DNSPending {
 			status = "dns_pending"

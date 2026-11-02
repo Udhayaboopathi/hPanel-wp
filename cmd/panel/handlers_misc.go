@@ -77,6 +77,9 @@ func (a *App) jobRetry(w http.ResponseWriter, r *http.Request) {
 		if job.Kind == "create_site" {
 			msg = "A failed creation cannot be retried from here: the WordPress admin password is never stored. Use Repair Website on the website page - it recreates the container against the existing database and files - or delete the site and create it again."
 		}
+		if job.Kind == "import_site" {
+			msg = "A failed import cannot be retried from here: the WordPress admin password is never stored. Re-run the import from the Migrate page (the site record and its database can be deleted first from the website page if you want a clean slate)."
+		}
 		http.Redirect(w, r, "/jobs/"+id+"?flash="+msg, http.StatusSeeOther)
 		return
 	}

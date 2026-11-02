@@ -78,6 +78,10 @@ type SiteSpec struct {
 	PHPMemory     string
 	UploadSize    string
 	Debug         bool
+	// TablePrefix is the WordPress table prefix for the site ("" or
+	// "wp_" = default). Set for imported sites whose database dump
+	// uses a custom prefix; emitted as WORDPRESS_TABLE_PREFIX.
+	TablePrefix string
 }
 
 // TraefikLabels returns the exact label set for a site container.
@@ -129,7 +133,7 @@ func EnvMap(s SiteSpec) map[string]string {
 	if upload == "" {
 		upload = "64M"
 	}
-	return map[string]string{
+	m := map[string]string{
 		"WORDPRESS_DB_HOST":     s.DBHost,
 		"WORDPRESS_DB_NAME":     s.DBName,
 		"WORDPRESS_DB_USER":     s.DBUser,
@@ -141,6 +145,10 @@ func EnvMap(s SiteSpec) map[string]string {
 		"SITE_DOMAIN":           s.Domain,
 		"SITE_TITLE":            s.Title,
 	}
+	if s.TablePrefix != "" && s.TablePrefix != "wp_" {
+		m["WORDPRESS_TABLE_PREFIX"] = s.TablePrefix
+	}
+	return m
 }
 
 // GenerateEnv renders a .env file (0600 on disk; values are secrets - never log).

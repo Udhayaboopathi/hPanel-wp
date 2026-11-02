@@ -43,7 +43,7 @@ var Kinds = map[string]bool{
 	"create_site": true, "delete_site": true, "start_site": true, "stop_site": true,
 	"restart_site": true, "backup_site": true, "restore_site": true, "wpcli": true,
 	"apply_config": true, "update_wordpress": true, "rotate_db_password": true,
-	"repair_site": true,
+	"repair_site": true, "import_site": true,
 }
 
 func ValidateKind(k string) error {

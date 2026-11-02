@@ -81,7 +81,38 @@ func OpenMySQL(dsn string) (*Store, error) {
 	return finishOpen(db, "mysql")
 }
 
+// ensureTablePrefixColumn applies migration 002 (websites.table_prefix,
+// the WordPress table prefix of imported sites) when the column is
+// not there yet. It probes first instead of relying on duplicate-
+// column error dialects, so it is idempotent on SQLite and MySQL.
+func ensureTablePrefixColumn(db *sql.DB, driver string) error {
+	var n int
+	var err error
+	if driver == "mysql" {
+		err = db.QueryRow(`SELECT COUNT(*) FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name='websites' AND column_name='table_prefix'`).Scan(&n)
+	} else {
+		err = db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('websites') WHERE name='table_prefix'`).Scan(&n)
+	}
+	if err != nil {
+		return fmt.Errorf("checking table_prefix column: %w", err)
+	}
+	if n > 0 {
+		return nil
+	}
+	ddl := `ALTER TABLE websites ADD COLUMN table_prefix TEXT NOT NULL DEFAULT 'wp_'`
+	if driver == "mysql" {
+		ddl = "ALTER TABLE websites ADD COLUMN table_prefix VARCHAR(32) NOT NULL DEFAULT 'wp_'"
+	}
+	if _, err := db.Exec(ddl); err != nil {
+		return fmt.Errorf("migration 002 (table_prefix): %w", err)
+	}
+	return nil
+}
+
 func finishOpen(db *sql.DB, driver string) (*Store, error) {
+	if err := ensureTablePrefixColumn(db, driver); err != nil {
+		return nil, err
+	}
 	s := &Store{DB: db, driver: driver}
 	// Crash recovery. Execution is driven by in-process goroutines
 	// (and in-memory retry timers), so after a restart NOTHING will
@@ -328,6 +359,7 @@ type Website struct {
 	DBName          string
 	DBUser          string
 	DBPasswordEnc   string
+	TablePrefix     string
 	AdminUsername   string
 	AdminEmail      string
 	SiteDir         string
@@ -335,19 +367,22 @@ type Website struct {
 	UpdatedAt       string
 }
 
-const siteCols = `id,site_id,name,domain,admin_domain,title,status,php_version,wp_version,resource_profile,cpu_limit,mem_limit_mb,container_name,container_id,db_name,db_user,db_password_enc,admin_username,admin_email,site_dir,created_at,updated_at`
+const siteCols = `id,site_id,name,domain,admin_domain,title,status,php_version,wp_version,resource_profile,cpu_limit,mem_limit_mb,container_name,container_id,db_name,db_user,db_password_enc,table_prefix,admin_username,admin_email,site_dir,created_at,updated_at`
 
 func scanSite(row interface{ Scan(...any) error }) (*Website, error) {
 	var w Website
-	err := row.Scan(&w.ID, &w.SiteID, &w.Name, &w.Domain, &w.AdminDomain, &w.Title, &w.Status, &w.PHPVersion, &w.WPVersion, &w.ResourceProfile, &w.CPULimit, &w.MemLimitMB, &w.ContainerName, &w.ContainerID, &w.DBName, &w.DBUser, &w.DBPasswordEnc, &w.AdminUsername, &w.AdminEmail, &w.SiteDir, &w.CreatedAt, &w.UpdatedAt)
+	err := row.Scan(&w.ID, &w.SiteID, &w.Name, &w.Domain, &w.AdminDomain, &w.Title, &w.Status, &w.PHPVersion, &w.WPVersion, &w.ResourceProfile, &w.CPULimit, &w.MemLimitMB, &w.ContainerName, &w.ContainerID, &w.DBName, &w.DBUser, &w.DBPasswordEnc, &w.TablePrefix, &w.AdminUsername, &w.AdminEmail, &w.SiteDir, &w.CreatedAt, &w.UpdatedAt)
 	return &w, err
 }
 
 func (s *Store) CreateWebsite(w *Website) (int64, error) {
 	now := Now()
 	w.CreatedAt, w.UpdatedAt = now, now
-	res, err := s.DB.Exec(`INSERT INTO websites(site_id,name,domain,admin_domain,title,status,php_version,wp_version,resource_profile,cpu_limit,mem_limit_mb,container_name,container_id,db_name,db_user,db_password_enc,admin_username,admin_email,site_dir,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		w.SiteID, w.Name, w.Domain, w.AdminDomain, w.Title, w.Status, w.PHPVersion, w.WPVersion, w.ResourceProfile, w.CPULimit, w.MemLimitMB, w.ContainerName, w.ContainerID, w.DBName, w.DBUser, w.DBPasswordEnc, w.AdminUsername, w.AdminEmail, w.SiteDir, now, now)
+	if w.TablePrefix == "" {
+		w.TablePrefix = "wp_"
+	}
+	res, err := s.DB.Exec(`INSERT INTO websites(site_id,name,domain,admin_domain,title,status,php_version,wp_version,resource_profile,cpu_limit,mem_limit_mb,container_name,container_id,db_name,db_user,db_password_enc,table_prefix,admin_username,admin_email,site_dir,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		w.SiteID, w.Name, w.Domain, w.AdminDomain, w.Title, w.Status, w.PHPVersion, w.WPVersion, w.ResourceProfile, w.CPULimit, w.MemLimitMB, w.ContainerName, w.ContainerID, w.DBName, w.DBUser, w.DBPasswordEnc, w.TablePrefix, w.AdminUsername, w.AdminEmail, w.SiteDir, now, now)
 	if err != nil {
 		return 0, err
 	}
@@ -446,7 +481,7 @@ func (s *Store) UpdateWebsite(siteID string, fields map[string]any) error {
 	var args []any
 	for k, v := range fields {
 		switch k {
-		case "status", "wp_version", "container_id", "container_name", "title", "domain", "admin_domain", "php_version", "resource_profile", "cpu_limit", "mem_limit_mb", "db_password_enc", "db_user", "db_name":
+		case "status", "wp_version", "container_id", "container_name", "title", "domain", "admin_domain", "php_version", "resource_profile", "cpu_limit", "mem_limit_mb", "db_password_enc", "db_user", "db_name", "table_prefix":
 			sets = append(sets, k+"=?")
 			args = append(args, v)
 		default:

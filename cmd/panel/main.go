@@ -185,6 +185,7 @@ func main() {
 	mux.HandleFunc("GET /audit-logs", app.requireAuth(app.auditList))
 	mux.HandleFunc("GET /settings/security", app.requireAuth(app.accountPage))
 	mux.HandleFunc("GET /websites/import", app.requireAuth(app.importPage))
+	mux.HandleFunc("POST /websites/import", app.requireAuth(app.importSubmit))
 	mux.HandleFunc("GET /websites/{site}/wordpress", app.requireAuth(app.siteDetailTab("wp")))
 	mux.HandleFunc("GET /websites/{site}/domains", app.requireAuth(app.siteDetailTab("domain")))
 	mux.HandleFunc("GET /websites/{site}/performance", app.requireAuth(app.performancePage))
@@ -436,7 +437,18 @@ func (a *App) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 		}
 		// CSRF: every authenticated POST must carry the session CSRF token.
 		if r.Method == http.MethodPost {
-			_ = r.ParseForm()
+			// For multipart bodies, ParseForm alone leaves r.Form
+			// holding only the query string, so a csrf_token field
+			// inside an upload form would be invisible to FormValue
+			// and every file upload would 403. Parse the multipart
+			// body first (file parts beyond the memory cap spill to
+			// temp files; the handler re-reads them from
+			// r.MultipartForm and cleans them up).
+			if strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/form-data") {
+				_ = r.ParseMultipartForm(32 << 20)
+			} else {
+				_ = r.ParseForm()
+			}
 			got := r.FormValue("csrf_token")
 			if got == "" {
 				got = r.Header.Get("X-CSRF-Token")

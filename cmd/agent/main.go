@@ -200,6 +200,8 @@ func (a *Agent) execute(w http.ResponseWriter, r *http.Request) {
 		resp, err = a.siteLogs(ctx, req)
 	case agentproto.OpRepairSite:
 		resp, err = a.repairSite(ctx, req)
+	case agentproto.OpImportSite:
+		resp, err = a.importSite(ctx, req)
 	}
 	if err != nil {
 		if resp == nil {
@@ -245,6 +247,11 @@ func validateSite(s agentproto.SiteSpec, requireSecrets bool) error {
 	}
 	if err := security.ValidateDBUser(s.DBUser); err != nil {
 		return err
+	}
+	if s.TablePrefix != "" {
+		if err := security.ValidateTablePrefix(s.TablePrefix); err != nil {
+			return err
+		}
 	}
 	if requireSecrets && (s.DBPassword == "" || s.AdminPassword == "") {
 		return fmt.Errorf("missing required secret material for provisioning")
@@ -538,6 +545,7 @@ func (a *Agent) createSite(ctx context.Context, req agentproto.Request) (*agentp
 		DBName: s.DBName, DBUser: effDBUser, DBPassword: effDBPassword, DBHost: a.db.InternalHost(),
 		AdminUser: s.AdminUser, AdminEmail: s.AdminEmail, PHPVersion: s.PHPVersion,
 		Profile: profile, SiteDir: siteDir, ContainerName: s.ContainerName, Network: network,
+		TablePrefix: s.TablePrefix,
 	}
 	composeYAML, err := configgen.GenerateCompose(spec)
 	if err != nil {

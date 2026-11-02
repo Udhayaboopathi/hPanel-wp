@@ -5,12 +5,18 @@ versioned migrations, config-version race, restore-chain restart
 behaviour, unwired S3/alert/retention settings, WP-CLI argv note)
 plus the KR Host UI release:
 
-1. **Migration is guided, not one-click.** `/websites/import`
-   composes create + file manager + database import. A true
-   one-click importer (upload archive → provision → restore,
-   including cross-server backups, which are currently tied to
-   their origin site) needs a cross-site restore path in the
-   agent — future work.
+1. ~~**Migration is guided, not one-click.**~~ **Resolved
+   2026-11-02 (one-upload importer):** `/websites/import` now
+   accepts a wp-content ZIP (WPvivid layout included, database
+   dump embedded or separate) and deploys it as an `import_site`
+   job — provision → file install → database import → domain
+   search-replace → admin creation, with the source table prefix
+   detected and carried into the site's configuration
+   (`websites.table_prefix`, migration 002). Still open: direct
+   restore of a KR Host backup archive into a DIFFERENT site
+   (backups remain tied to their origin site), and imports whose
+   total runtime exceeds the agent's ~11-minute per-operation
+   window on very large sites (the import is safe to re-run).
 2. ~~**Performance history granularity.**~~ **Resolved in the
    live-monitoring follow-up:** a background sampler records host
    and per-site samples every minute, and the dashboard and server
@@ -36,3 +42,10 @@ plus the KR Host UI release:
 6. **Deployment pending.** As with the audit release, everything
    is verified locally; production verification happens after the
    owner provides a fresh GitHub token and the push deploys.
+7. **Multipart CSRF (fixed 2026-11-02, found during the importer
+   build).** The auth middleware read the CSRF token via
+   `ParseForm` + `FormValue`, which cannot see body fields of
+   multipart forms — every authenticated file upload (File
+   Manager included) was rejected with 403. The middleware now
+   parses multipart bodies before the token check, with a
+   regression test (`TestRequireAuthCSRFMultipart`).

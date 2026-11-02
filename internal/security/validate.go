@@ -90,6 +90,19 @@ func ValidateSQLIdentifier(name string) error {
 	return nil
 }
 
+var tablePrefixRe = regexp.MustCompile(`^[A-Za-z0-9_]{1,32}$`)
+
+// ValidateTablePrefix checks a WordPress table prefix detected in an
+// imported SQL dump before it is written into the site's generated
+// configuration (WORDPRESS_TABLE_PREFIX). The value is interpolated
+// into generated files, so the charset is deliberately minimal.
+func ValidateTablePrefix(p string) error {
+	if !tablePrefixRe.MatchString(p) {
+		return fmt.Errorf("table prefix %q must be 1-32 chars of [A-Za-z0-9_]", p)
+	}
+	return nil
+}
+
 func ValidateAdminUsername(u string) error {
 	if !usernameRe.MatchString(u) {
 		return fmt.Errorf("username must be 3-60 chars of letters, digits, _ . -")

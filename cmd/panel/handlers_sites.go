@@ -284,7 +284,7 @@ func (a *App) agentSpec(site *store.Website, withSecrets bool) (agentproto.SiteS
 		SiteID: site.SiteID, Domain: site.Domain, AdminDomain: site.AdminDomain, Title: site.Title,
 		DBName: site.DBName, DBUser: site.DBUser, AdminUser: site.AdminUsername, AdminEmail: site.AdminEmail,
 		PHPVersion: site.PHPVersion, Profile: site.ResourceProfile, CPULimit: site.CPULimit, MemLimitMB: site.MemLimitMB,
-		SiteDir: site.SiteDir, ContainerName: site.ContainerName,
+		SiteDir: site.SiteDir, ContainerName: site.ContainerName, TablePrefix: site.TablePrefix,
 	}
 	if withSecrets {
 		pw, err := a.box.Decrypt(site.DBPasswordEnc)
