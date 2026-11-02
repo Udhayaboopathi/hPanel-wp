@@ -25,6 +25,17 @@ func TestAdminSessionAndAuditFlow(t *testing.T) {
 		t.Fatalf("expected 1 admin, got %d", n)
 	}
 	a, err := s.GetAdminByUsername("admin")
+	if err != nil {
+		t.Fatalf("GetAdminByUsername: %v", err)
+	}
+	byEmail, err := s.GetAdminByLogin("a@example.com")
+	if err != nil || byEmail.ID != a.ID {
+		t.Fatalf("GetAdminByLogin(email) = %+v, %v; want admin id %d", byEmail, err, a.ID)
+	}
+	byName, err := s.GetAdminByLogin("admin")
+	if err != nil || byName.ID != a.ID {
+		t.Fatalf("GetAdminByLogin(username) = %+v, %v; want admin id %d", byName, err, a.ID)
+	}
 	if err != nil || a.ID != id {
 		t.Fatalf("admin lookup failed: %v", err)
 	}

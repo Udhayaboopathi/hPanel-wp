@@ -131,7 +131,7 @@ func (a *App) loginSubmit(w http.ResponseWriter, r *http.Request) {
 		a.render(w, "login.html", pageData{Title: "Login", CSRF: a.preCSRF(w, r), Error: "Too many failed login attempts. Try again in 15 minutes."})
 		return
 	}
-	admin, err := a.store.GetAdminByUsername(username)
+	admin, err := a.store.GetAdminByLogin(username)
 	if err != nil || !auth.VerifyPassword(admin.PasswordHash, password) {
 		_ = a.store.RecordLoginAttempt(username, ip, false)
 		_ = a.store.AddAudit(0, "auth.login_failed", username, "invalid credentials", ip)
@@ -216,7 +216,7 @@ func (a *App) recoverSubmit(w http.ResponseWriter, r *http.Request) {
 		a.render(w, "recover.html", pageData{Title: "Account recovery", CSRF: a.preCSRF(w, r), Error: "Too many failed attempts. Try again in 15 minutes."})
 		return
 	}
-	admin, err := a.store.GetAdminByUsername(username)
+	admin, err := a.store.GetAdminByLogin(username)
 	if err != nil {
 		a.render(w, "recover.html", pageData{Title: "Account recovery", CSRF: a.preCSRF(w, r), Error: "Recovery failed. Check the username and code."})
 		return

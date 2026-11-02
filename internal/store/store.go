@@ -208,6 +208,15 @@ const adminCols = `id,username,email,password_hash,totp_secret,totp_enabled,crea
 func (s *Store) GetAdminByUsername(u string) (*Admin, error) {
 	return scanAdmin(s.DB.QueryRow(`SELECT `+adminCols+` FROM administrators WHERE username=?`, u))
 }
+
+// GetAdminByLogin resolves a login identifier that may be the
+// account's username OR its email address. Operators naturally
+// type the email they registered with; accepting only the exact
+// username locked out a valid admin with a misleading
+// "invalid credentials" error (production report, 2026-11-02).
+func (s *Store) GetAdminByLogin(login string) (*Admin, error) {
+	return scanAdmin(s.DB.QueryRow(`SELECT `+adminCols+` FROM administrators WHERE username=? OR email=?`, login, login))
+}
 func (s *Store) GetAdminByID(id int64) (*Admin, error) {
 	return scanAdmin(s.DB.QueryRow(`SELECT `+adminCols+` FROM administrators WHERE id=?`, id))
 }

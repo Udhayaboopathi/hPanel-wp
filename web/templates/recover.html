@@ -4,7 +4,7 @@
 <p class="muted">Using a recovery code signs you in, disables two-factor authentication, and revokes all existing sessions.</p>
 <form method="post" action="/login/recover">
 {{template "csrf" .CSRF}}
-  <label>Username <input name="username" required></label>
+  <label>Username or email <input name="username" required></label>
   <label>Recovery code <input name="code" required placeholder="XXXXX-XXXXX"></label>
   <button class="btn primary big" type="submit">Recover account</button>
 </form>
