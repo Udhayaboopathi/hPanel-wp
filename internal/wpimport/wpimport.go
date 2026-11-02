@@ -46,6 +46,104 @@ func IsGzipHeader(head []byte) bool {
 	return len(head) >= 2 && head[0] == 0x1f && head[1] == 0x8b
 }
 
+// PartKind classifies one file of a WPvivid multi-part backup set
+// by its name: WPvivid delivers a site as one archive per wp-content
+// piece (…-plugins.zip, …-themes.zip, …-uploads.zip,
+// …-mu-plugins.zip, …-others.zip) plus the database (…-db[.gz]).
+// Returns "" for a name that is not a WPvivid part.
+func PartKind(name string) string {
+	base := strings.ToLower(filepath.Base(name))
+	if IsDBBackupName(base) {
+		return "db"
+	}
+	// mu-plugins must be checked before plugins: its suffix
+	// contains the plugins suffix.
+	for _, kind := range []string{"mu-plugins", "plugins", "themes", "uploads", "others"} {
+		if strings.HasSuffix(base, "-"+kind+".zip") {
+			return kind
+		}
+	}
+	return ""
+}
+
+// MergePart is one classified WPvivid part archive on disk.
+type MergePart struct {
+	Kind string // plugins | themes | uploads | mu-plugins | others
+	Path string
+}
+
+// MergeWPvividParts combines WPvivid part archives into a single
+// ZIP whose entries form one wp-content tree (the shape
+// FindContentRoot/ExtractContent consume). Part archives may store
+// their folder at the top ("plugins/akismet/…") or bare
+// ("akismet/…"); entries are re-rooted so both forms land under
+// "<kind>/…". "others" entries are wp-content root items and keep
+// their names. Entries are stored uncompressed: the parts are
+// mostly media, and the merged file is a transport container that
+// is extracted once and deleted.
+func MergeWPvividParts(dstPath string, parts []MergePart) (int, error) {
+	out, err := os.Create(dstPath)
+	if err != nil {
+		return 0, err
+	}
+	zw := zip.NewWriter(out)
+	written := 0
+	for _, part := range parts {
+		zr, err := zip.OpenReader(part.Path)
+		if err != nil {
+			zw.Close()
+			out.Close()
+			return 0, fmt.Errorf("part %s is not a readable ZIP: %w", filepath.Base(part.Path), err)
+		}
+		for _, f := range zr.File {
+			name := strings.TrimPrefix(f.Name, "./")
+			if name == "" || strings.HasSuffix(name, "/") {
+				continue
+			}
+			rel := name
+			switch part.Kind {
+			case "plugins", "themes", "uploads", "mu-plugins":
+				if name != part.Kind && !strings.HasPrefix(name, part.Kind+"/") {
+					rel = part.Kind + "/" + name
+				}
+			}
+			hdr := &zip.FileHeader{Name: rel, Method: zip.Store}
+			w, err := zw.CreateHeader(hdr)
+			if err != nil {
+				zr.Close()
+				zw.Close()
+				out.Close()
+				return 0, err
+			}
+			rc, err := f.Open()
+			if err != nil {
+				zr.Close()
+				zw.Close()
+				out.Close()
+				return 0, err
+			}
+			_, err = io.Copy(w, rc)
+			rc.Close()
+			if err != nil {
+				zr.Close()
+				zw.Close()
+				out.Close()
+				return 0, err
+			}
+			written++
+		}
+		zr.Close()
+	}
+	if err := zw.Close(); err != nil {
+		out.Close()
+		return 0, err
+	}
+	if err := out.Close(); err != nil {
+		return 0, err
+	}
+	return written, nil
+}
+
 // FindContentRoot returns the ZIP-entry prefix ("" or "a/b/") of the
 // wp-content directory inside an archive: the shallowest directory
 // that contains both plugins/ and themes/. Uploads in the wild nest

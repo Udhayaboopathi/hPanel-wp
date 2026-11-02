@@ -4,12 +4,12 @@
 
 <section class="card">
 <h2>One-upload import (WPvivid &amp; standard backups)</h2>
-<p>Upload the site's <strong>wp-content as one ZIP</strong> — a WPvivid backup layout works as-is: if the ZIP also contains the WPvivid database file (the <code>…-db</code> file WPvivid leaves inside wp-content), the database is taken from there. Otherwise add the database export (<code>.sql</code>, <code>.sql.gz</code>, or a ZIP of one) as the second file. KR Host then deploys the site as a tracked job: it provisions the container and a fresh database, installs your files, imports the database, rewrites the old domain to the new one, and creates the administrator account below in the imported site.</p>
+<p>Two ways in: <strong>(1)</strong> upload the site's <strong>wp-content as one ZIP</strong> (if it also contains the WPvivid database file — the <code>…-db</code> file — the database is taken from there), or <strong>(2)</strong> if your backup is a <strong>WPvivid multi-part set</strong> (the separate <code>…-plugins.zip</code>, <code>…-themes.zip</code>, <code>…-uploads.zip</code>, <code>…-mu-plugins.zip</code>, <code>…-others.zip</code> and <code>…-db.gz</code> files), select <strong>all of them at once</strong> in the file field — KR Host combines them itself. A database export (<code>.sql</code>, <code>.sql.gz</code>, or a ZIP of one) can also be added as the second file. KR Host then deploys the site as a tracked job: it provisions the container and a fresh database, installs your files, imports the database, rewrites the old domain to the new one, and creates the administrator account below in the imported site.</p>
 <form method="post" action="/websites/import" enctype="multipart/form-data">
 {{template "csrf" .CSRF}}
 <label>New domain <input name="domain" required placeholder="example.com"></label>
 <label>Site title <input name="title" placeholder="(defaults to the domain)"></label>
-<label>wp-content ZIP (required, up to 2 GB) <input type="file" name="files_zip" accept=".zip" required></label>
+<label>wp-content ZIP — or ALL WPvivid backup parts selected together (required, up to 2 GB total) <input type="file" name="files_zip" accept=".zip,.gz,.sql" multiple required></label>
 <label>Database file (optional if the ZIP contains the WPvivid dump) <input type="file" name="db_file" accept=".sql,.gz,.zip"></label>
 <label>WordPress admin username <input name="admin_user" required autocomplete="username"></label>
 <label>WordPress admin email <input name="admin_email" type="email" required autocomplete="email"></label>

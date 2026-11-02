@@ -91,6 +91,92 @@ func TestDetectPrefixAndSiteURL(t *testing.T) {
 	}
 }
 
+func TestPartKind(t *testing.T) {
+	p := "backup_2026-10-31-0813_First_Crops_Montessori_Kids_Scho_243d0f49addc"
+	cases := map[string]string{
+		p + "-db.gz":          "db",
+		p + "-db":             "db",
+		p + "-plugins.zip":    "plugins",
+		p + "-themes.zip":     "themes",
+		p + "-uploads.zip":    "uploads",
+		p + "-mu-plugins.zip": "mu-plugins",
+		p + "-others.zip":     "others",
+		"random.zip":          "",
+		"notes.txt":           "",
+	}
+	for name, want := range cases {
+		if got := PartKind(name); got != want {
+			t.Errorf("PartKind(%q) = %q, want %q", name, got, want)
+		}
+	}
+}
+
+func writeZip(t *testing.T, path string, files map[string]string) {
+	t.Helper()
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zw := zip.NewWriter(f)
+	for name, body := range files {
+		w, err := zw.Create(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.Write([]byte(body)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestMergeWPvividParts(t *testing.T) {
+	dir := t.TempDir()
+	// plugins part stores its folder at the top; themes part is
+	// bare; uploads part is prefixed; others is root items.
+	pluginsZip := filepath.Join(dir, "x-plugins.zip")
+	writeZip(t, pluginsZip, map[string]string{"plugins/akismet/akismet.php": "<?php p"})
+	themesZip := filepath.Join(dir, "x-themes.zip")
+	writeZip(t, themesZip, map[string]string{"oceanwp/style.css": "/* t */"})
+	uploadsZip := filepath.Join(dir, "x-uploads.zip")
+	writeZip(t, uploadsZip, map[string]string{"uploads/2025/01/a.jpg": "jpg"})
+	othersZip := filepath.Join(dir, "x-others.zip")
+	writeZip(t, othersZip, map[string]string{"index.php": "<?php // silence"})
+
+	merged := filepath.Join(dir, "merged.zip")
+	n, err := MergeWPvividParts(merged, []MergePart{
+		{Kind: "plugins", Path: pluginsZip},
+		{Kind: "themes", Path: themesZip},
+		{Kind: "uploads", Path: uploadsZip},
+		{Kind: "others", Path: othersZip},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 4 {
+		t.Errorf("merged %d files, want 4", n)
+	}
+	// The merged archive must behave exactly like a wp-content ZIP.
+	dest := filepath.Join(dir, "wp-content")
+	stats, err := ExtractContent(merged, dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Files != 4 {
+		t.Errorf("extracted %d files, want 4", stats.Files)
+	}
+	for _, want := range []string{"plugins/akismet/akismet.php", "themes/oceanwp/style.css", "uploads/2025/01/a.jpg", "index.php"} {
+		if _, err := os.Stat(filepath.Join(dest, want)); err != nil {
+			t.Errorf("missing %s after merge+extract", want)
+		}
+	}
+}
+
 func TestExtractContent(t *testing.T) {
 	dir := t.TempDir()
 	zipPath := filepath.Join(dir, "site.zip")

@@ -71,19 +71,84 @@ func (a *App) importSubmit(w http.ResponseWriter, r *http.Request) {
 	fields["admin_password"] = r.FormValue("admin_password") // never trimmed
 	var zipPath, dbRawPath string
 	var zipSize, dbSize int64
-	zipFile, _, err := r.FormFile("files_zip")
-	if err != nil {
+	zipPath = filepath.Join(importDir, "upload.zip")
+	fileHeaders := r.MultipartForm.File["files_zip"]
+	switch {
+	case len(fileHeaders) == 0:
 		abort("The wp-content ZIP file is required.")
 		return
+	case len(fileHeaders) == 1:
+		zipFile, err := fileHeaders[0].Open()
+		if err != nil {
+			abort(err.Error())
+			return
+		}
+		zipSize, err = streamToFile(zipFile, zipPath, maxImportZipBytes)
+		zipFile.Close()
+		if err != nil {
+			abort(err.Error())
+			return
+		}
+	default:
+		// WPvivid multi-part backup set: classify every file,
+		// merge the content parts into one wp-content ZIP and
+		// keep the database part aside for the normal DB flow.
+		var parts []wpimport.MergePart
+		var total int64
+		kindsSeen := map[string]bool{}
+		for i, fh := range fileHeaders {
+			kind := wpimport.PartKind(fh.Filename)
+			if kind == "" {
+				abort(fmt.Sprintf("The file %q is not a WPvivid backup part (expected names ending in -plugins.zip, -themes.zip, -uploads.zip, -mu-plugins.zip, -others.zip, or the -db database file). Select the complete backup set, or upload one combined wp-content ZIP instead.", fh.Filename))
+				return
+			}
+			src, err := fh.Open()
+			if err != nil {
+				abort(err.Error())
+				return
+			}
+			staged := filepath.Join(importDir, fmt.Sprintf("part-%d", i))
+			n, err := streamToFile(src, staged, maxImportZipBytes)
+			src.Close()
+			if err != nil {
+				abort(err.Error())
+				return
+			}
+			total += n
+			if total > maxImportZipBytes {
+				abort("The backup parts together exceed the 2 GB limit.")
+				return
+			}
+			if kind == "db" {
+				if dbRawPath != "" {
+					abort("Two database files were included in the backup set; keep only one.")
+					return
+				}
+				dbRawPath, dbSize = staged, n
+				continue
+			}
+			kindsSeen[kind] = true
+			parts = append(parts, wpimport.MergePart{Kind: kind, Path: staged})
+		}
+		if !kindsSeen["plugins"] || !kindsSeen["themes"] {
+			abort("The backup set is incomplete: both the -plugins.zip and -themes.zip parts are required. Select every file of the WPvivid backup.")
+			return
+		}
+		if _, err := wpimport.MergeWPvividParts(zipPath, parts); err != nil {
+			abort("The backup parts could not be combined: " + err.Error())
+			return
+		}
+		st, err := os.Stat(zipPath)
+		if err != nil {
+			abort(err.Error())
+			return
+		}
+		zipSize = st.Size()
+		for _, p := range parts {
+			_ = os.Remove(p.Path)
+		}
 	}
-	zipPath = filepath.Join(importDir, "upload.zip")
-	zipSize, err = streamToFile(zipFile, zipPath, maxImportZipBytes)
-	zipFile.Close()
-	if err != nil {
-		abort(err.Error())
-		return
-	}
-	if dbFile, _, err := r.FormFile("db_file"); err == nil {
+	if dbFile, _, err := r.FormFile("db_file"); err == nil && dbRawPath == "" {
 		dbRawPath = filepath.Join(importDir, "db-raw")
 		dbSize, err = streamToFile(dbFile, dbRawPath, maxImportDBBytes)
 		dbFile.Close()

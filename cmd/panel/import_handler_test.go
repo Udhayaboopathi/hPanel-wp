@@ -181,6 +181,106 @@ func TestImportSubmitWPvividLayout(t *testing.T) {
 	}
 }
 
+// WPvivid multi-part mode: an unknown file in the set, or a set
+// missing a required part, must be rejected with a precise error
+// before anything is created.
+func TestImportSubmitPartsModeRejections(t *testing.T) {
+	build := func(t *testing.T) (*App, string) {
+		dir := t.TempDir()
+		sitesDir := filepath.Join(dir, "websites")
+		st, err := store.Open(filepath.Join(dir, "panel.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { st.Close() })
+		box, err := secrets.LoadOrCreateKey(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tmpl, err := template.New("").Funcs(template.FuncMap{
+			"list":       func(items ...string) []string { return items },
+			"add":        func(a, b int) int { return a + b },
+			"sub":        func(a, b int) int { return a - b },
+			"humanBytes": humanBytes,
+			"pct":        func(used, total uint64) float64 { return 0 },
+			"since":      func(ts string) string { return ts },
+		}).ParseFS(web.FS, "templates/*.html")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return &App{
+			cfg:   Config{SitesDir: sitesDir, SiteDBHost: "wordpress-mariadb"},
+			store: st, box: box, tmpl: tmpl,
+			log:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+			runner: provisioning.New(st, nil),
+		}, sitesDir
+	}
+	zipBytes := func(files map[string]string) []byte {
+		var buf bytes.Buffer
+		zw := zip.NewWriter(&buf)
+		for name, body := range files {
+			w, _ := zw.Create(name)
+			_, _ = w.Write([]byte(body))
+		}
+		_ = zw.Close()
+		return buf.Bytes()
+	}
+	post := func(t *testing.T, app *App, parts map[string][]byte) *httptest.ResponseRecorder {
+		var body bytes.Buffer
+		mw := multipart.NewWriter(&body)
+		_ = mw.WriteField("domain", "parts.example.com")
+		_ = mw.WriteField("admin_user", "chef")
+		_ = mw.WriteField("admin_email", "a@b.co")
+		_ = mw.WriteField("admin_password", "a-very-long-password")
+		for name, data := range parts {
+			fw, _ := mw.CreateFormFile("files_zip", name)
+			_, _ = fw.Write(data)
+		}
+		_ = mw.Close()
+		req := httptest.NewRequest("POST", "/websites/import", &body)
+		req.Header.Set("Content-Type", mw.FormDataContentType())
+		ctx := context.WithValue(req.Context(), ctxKey(2), &store.Session{CSRFToken: "tok"})
+		ctx = context.WithValue(ctx, ctxAdmin, &store.Admin{Username: "root"})
+		req = req.WithContext(ctx)
+		rec := httptest.NewRecorder()
+		app.importSubmit(rec, req)
+		return rec
+	}
+
+	plugins := zipBytes(map[string]string{"plugins/akismet/akismet.php": "<?php"})
+	themes := zipBytes(map[string]string{"themes/oceanwp/style.css": "/* t */"})
+
+	t.Run("unknown file in set", func(t *testing.T) {
+		app, sitesDir := build(t)
+		rec := post(t, app, map[string][]byte{
+			"backup_x-plugins.zip": plugins,
+			"holiday.mp4":          []byte("video"),
+		})
+		if !strings.Contains(rec.Body.String(), "not a WPvivid backup part") {
+			t.Errorf("want part-classification error; body: %.300s", rec.Body.String())
+		}
+		if _, err := app.store.GetWebsiteByDomain("parts.example.com"); err == nil {
+			t.Error("no website may be created")
+		}
+		entries, _ := os.ReadDir(sitesDir)
+		if len(entries) != 0 {
+			t.Errorf("staging not cleaned: %v", entries)
+		}
+	})
+
+	t.Run("themes part missing", func(t *testing.T) {
+		app, _ := build(t)
+		rec := post(t, app, map[string][]byte{
+			"backup_x-plugins.zip": plugins,
+			"backup_x-uploads.zip": zipBytes(map[string]string{"uploads/a.jpg": "x"}),
+		})
+		_ = themes
+		if !strings.Contains(rec.Body.String(), "incomplete") {
+			t.Errorf("want incompleteness error; body: %.300s", rec.Body.String())
+		}
+	})
+}
+
 // A ZIP without a wp-content tree must be rejected with a clear
 // error and leave nothing behind.
 func TestImportSubmitRejectsNonWordPressZip(t *testing.T) {
