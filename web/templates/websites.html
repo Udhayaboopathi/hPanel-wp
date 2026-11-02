@@ -1,6 +1,6 @@
 {{template "header" .}}
 {{$d := .Data}}
-<div class="row-between"><h1>Websites</h1><a class="btn primary big" href="/websites/new">+ Create New WordPress Site</a></div>
+<div class="row-between"><h1>Websites</h1><span><a class="btn big" href="/websites/import">Migrate an existing site</a> <a class="btn primary big" href="/websites/new">+ Create New WordPress Site</a></span></div>
 <form method="get" action="/websites" class="toolbar">
   <input name="q" value="{{$d.Q}}" placeholder="Search domain, name or site id">
   <select name="status">
@@ -33,5 +33,5 @@
 <p class="muted">Page {{$d.Page}} of {{if $d.Pages}}{{$d.Pages}}{{else}}1{{end}} · {{$d.Total}} websites
 {{if gt $d.Page 1}}<a href="/websites?page={{sub $d.Page 1}}&q={{$d.Q}}&status={{$d.Status}}">← Prev</a>{{end}}
 {{if lt $d.Page $d.Pages}}<a href="/websites?page={{add $d.Page 1}}&q={{$d.Q}}&status={{$d.Status}}">Next →</a>{{end}}</p>
-{{else}}<section class="card"><p>No websites found. <a href="/websites/new">Create your first WordPress site</a>.</p></section>{{end}}
+{{else}}<section class="card"><p>No websites found. <a href="/websites/new">Create your first WordPress site</a>, or <a href="/websites/import">migrate an existing site</a> from a backup.</p></section>{{end}}
 {{template "footer" .}}

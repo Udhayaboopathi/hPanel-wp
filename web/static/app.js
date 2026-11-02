@@ -24,6 +24,7 @@
       (key === "/account" && (path === "/account" || path === "/settings/security"));
     if (key === "/server/containers" && path === "/server/containers") hit = true;
     if (key === "/server" && path === "/server/containers") hit = false;
+    if (key === "/websites" && path === "/websites/import") hit = false;
     if (hit) a.classList.add("active");
   });
 
