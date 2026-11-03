@@ -45,20 +45,28 @@ func VerifyPassword(encoded, password string) bool {
 	if len(parts) != 5 || parts[0] != "argon2id" {
 		return false
 	}
-	var m, t, p uint32
-	if _, err := fmt.Sscanf(parts[1], "v=19"); err != nil {
-		// parts[1] is version segment; params are parts[2]
-		_ = err
+	if parts[1] != "v=19" {
+		return false
 	}
+	var m, t, p uint32
 	if _, err := fmt.Sscanf(parts[2], "m=%d,t=%d,p=%d", &m, &t, &p); err != nil {
 		return false
 	}
+	// The stored parameters size the Argon2 allocation directly,
+	// so they are clamped to sane bounds before use: a corrupt or
+	// hostile stored hash must not be able to force a huge
+	// allocation (or a uint8-truncated parallelism) at login.
+	// Legitimate hashes are produced by HashPassword (m=65536,
+	// t=3, p=2, 16-byte salt, 32-byte key) — well inside these.
+	if m < 1024 || m > 1<<20 || t < 1 || t > 10 || p < 1 || p > 32 {
+		return false
+	}
 	salt, err := base64.RawStdEncoding.DecodeString(parts[3])
-	if err != nil {
+	if err != nil || len(salt) < 8 || len(salt) > 64 {
 		return false
 	}
 	want, err := base64.RawStdEncoding.DecodeString(parts[4])
-	if err != nil {
+	if err != nil || len(want) < 16 || len(want) > 64 {
 		return false
 	}
 	got := argon2.IDKey([]byte(password), salt, t, m, uint8(p), uint32(len(want)))
@@ -117,6 +125,33 @@ func GenerateTOTPSecret(account string) (secret, url string, err error) {
 
 func ValidateTOTP(secret, code string) bool {
 	return totp.Validate(strings.TrimSpace(code), secret)
+}
+
+// ValidateTOTPStep validates a TOTP code and reports WHICH
+// 30-second time-step it belongs to, so the caller can consume
+// that step and reject a replay of the same code (codes otherwise
+// stay valid for their whole ~90-second skew window). Each
+// candidate step is checked with zero skew so exactly one step
+// can match.
+func ValidateTOTPStep(secret, code string) (int64, bool) {
+	code = strings.TrimSpace(code)
+	if secret == "" || code == "" {
+		return 0, false
+	}
+	now := time.Now()
+	for _, offset := range []time.Duration{-30 * time.Second, 0, 30 * time.Second} {
+		t := now.Add(offset)
+		ok, err := totp.ValidateCustom(code, secret, t, totp.ValidateOpts{
+			Period:    30,
+			Skew:      0,
+			Digits:    otp.DigitsSix,
+			Algorithm: otp.AlgorithmSHA1,
+		})
+		if err == nil && ok {
+			return t.Unix() / 30, true
+		}
+	}
+	return 0, false
 }
 
 // Recovery codes: shown once to the user, stored only as SHA-256 hashes.

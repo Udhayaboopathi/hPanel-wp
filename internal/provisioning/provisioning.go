@@ -10,7 +10,9 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -27,12 +29,11 @@ type Runner struct {
 	Sem   chan struct{} // bounds concurrent provisioning jobs to 2
 
 	mu      sync.Mutex
-	secrets map[string]string // jobID -> wp admin password (memory only)
 	cancels map[string]context.CancelFunc
 }
 
 func New(st *store.Store, agent *agentclient.Client) *Runner {
-	return &Runner{Store: st, Agent: agent, Sem: make(chan struct{}, 2), secrets: map[string]string{}, cancels: map[string]context.CancelFunc{}}
+	return &Runner{Store: st, Agent: agent, Sem: make(chan struct{}, 2), cancels: map[string]context.CancelFunc{}}
 }
 
 type CreatePayload struct {
@@ -43,16 +44,13 @@ func (r *Runner) Enqueue(site *store.Website, kind string, spec agentproto.SiteS
 	if err := jobs.ValidateKind(kind); err != nil {
 		return nil, err
 	}
-	if kind == "create_site" {
-		// One active job per site across ALL kinds: a create must
-		// never race a delete/backup/lifecycle job for the same site.
-		active, err := r.Store.HasActiveJobForSite(site.SiteID, "")
-		if err != nil {
-			return nil, err
-		}
-		if active {
-			return nil, fmt.Errorf("another job is already active for site %s; wait for it to finish first", site.SiteID)
-		}
+	// One active job per site across ALL kinds, for every kind
+	// this entry point may carry: parallel jobs against one site's
+	// container/database are how resources get corrupted.
+	if active, err := r.Store.HasActiveJobForSite(site.SiteID, ""); err != nil {
+		return nil, err
+	} else if active {
+		return nil, fmt.Errorf("another job is already active for site %s; wait for it to finish first", site.SiteID)
 	}
 	// Payload stored in the DB never contains passwords.
 	specCopy := spec
@@ -68,11 +66,6 @@ func (r *Runner) Enqueue(site *store.Website, kind string, spec agentproto.SiteS
 	}
 	if err := r.Store.CreateJob(job); err != nil {
 		return nil, err
-	}
-	if adminPassword != "" {
-		r.mu.Lock()
-		r.secrets[job.ID] = adminPassword
-		r.mu.Unlock()
 	}
 	_ = r.Store.AddEvent(job.ID, "info", "job queued: "+kind)
 	go r.run(job.ID, spec, adminPassword)
@@ -111,9 +104,6 @@ func (r *Runner) run(jobID string, spec agentproto.SiteSpec, adminPassword strin
 	op := agentproto.OpCreateSite
 	req := agentproto.Request{Op: op, Site: spec, JobID: jobID}
 	r.execute(jobID, req, "create_site")
-	r.mu.Lock()
-	delete(r.secrets, jobID)
-	r.mu.Unlock()
 }
 
 // ImportMeta carries the non-secret import parameters of an
@@ -154,11 +144,6 @@ func (r *Runner) EnqueueImport(site *store.Website, spec agentproto.SiteSpec, ad
 	if err := r.Store.CreateJob(job); err != nil {
 		return nil, err
 	}
-	if adminPassword != "" {
-		r.mu.Lock()
-		r.secrets[job.ID] = adminPassword
-		r.mu.Unlock()
-	}
 	_ = r.Store.AddEvent(job.ID, "info", "job queued: import_site")
 	go r.runImport(job.ID, spec, adminPassword, meta)
 	return job, nil
@@ -171,9 +156,6 @@ func (r *Runner) runImport(jobID string, spec agentproto.SiteSpec, adminPassword
 		ImportZipPath: meta.ZipPath, ImportDBPath: meta.DBPath, ImportSourceURL: meta.SourceURL,
 	}
 	r.execute(jobID, req, "import_site")
-	r.mu.Lock()
-	delete(r.secrets, jobID)
-	r.mu.Unlock()
 }
 
 func (r *Runner) execute(jobID string, req agentproto.Request, kind string) {
@@ -183,14 +165,52 @@ func (r *Runner) execute(jobID string, req agentproto.Request, kind string) {
 	if err != nil {
 		return
 	}
-	if err := jobs.ValidateTransition(job.Status, "running"); err != nil && job.Status != "queued" {
-		_ = r.Store.AddEvent(jobID, "error", "cannot start job: "+err.Error())
+	// scrubImport removes the staged database dump of an import
+	// job once the job is finished for good. db.sql carries every
+	// WordPress password hash of the migrated site; it must not
+	// sit on disk indefinitely after a failed or finished import.
+	// (The ZIP holds only wp-content files and is kept for
+	// diagnosis; a re-import is always a fresh upload anyway.)
+	scrubImport := func() {
+		if kind == "import_site" && req.ImportDBPath != "" {
+			_ = os.Remove(req.ImportDBPath)
+		}
+	}
+	// The call context is registered BEFORE the claim so Cancel()
+	// can abort the job from the moment it starts (previously
+	// Cancel only changed the row and the running goroutine
+	// overwrote it with its own outcome).
+	callCtx, stopCall := context.WithCancel(context.Background())
+	r.mu.Lock()
+	r.cancels[jobID] = stopCall
+	r.mu.Unlock()
+	defer func() {
+		stopCall()
+		r.mu.Lock()
+		delete(r.cancels, jobID)
+		r.mu.Unlock()
+	}()
+	// Claim the job with a compare-and-swap (queued -> running).
+	// A cancel that landed before this point flipped the row to
+	// 'cancelled', so the claim matches nothing and the operation
+	// never starts — the executor's old unconditional start-write
+	// silently overwrote such a cancellation and ran anyway.
+	claimed, err := r.Store.ClaimJob(jobID)
+	if err != nil || !claimed {
+		_ = r.Store.AddEvent(jobID, "info", "job not started: it was cancelled or is no longer queued")
+		scrubImport()
 		return
 	}
 	_ = r.Store.BumpJobAttempts(jobID)
 	job.Attempts++ // BumpJobAttempts just incremented it in the store
-	_ = r.Store.UpdateJob(jobID, "running", 5, "provisioning started", "")
 	_ = r.Store.AddEvent(jobID, "info", "provisioning started")
+	// A cancel can still race in between the claim and the call:
+	// honour it before any agent operation is sent.
+	if cur, gerr := r.Store.GetJob(jobID); gerr == nil && cur.Status == "cancelled" {
+		_ = r.Store.AddEvent(jobID, "warn", "job cancelled by operator before the operation started")
+		scrubImport()
+		return
+	}
 	// lastProgress tracks the furthest step actually reached, so a
 	// FAILED job never displays 100% (which must mean success only).
 	lastProgress := 5
@@ -204,15 +224,20 @@ func (r *Runner) execute(jobID string, req agentproto.Request, kind string) {
 	// guard refusals, bad config) are never auto-retried: repeating
 	// them cannot succeed and could compound side effects.
 	fail := func(msg string, retryable bool) {
+		failProgress := lastProgress
+		if failProgress > 99 {
+			failProgress = 99 // 100 is reserved for success
+		}
 		if retryable && job.MaxAttempts > 0 && job.Attempts < job.MaxAttempts {
 			backoff := time.Duration(job.Attempts*job.Attempts) * 10 * time.Second
 			_ = r.Store.AddEvent(jobID, "warn", fmt.Sprintf("attempt %d failed (transient): %s - retry %d/%d scheduled in %s", job.Attempts, msg, job.Attempts+1, job.MaxAttempts, backoff))
-			_ = r.Store.UpdateJob(jobID, "queued", lastProgress, "retry scheduled", "")
+			_ = r.Store.UpdateJob(jobID, "queued", failProgress, "retry scheduled", "")
 			time.AfterFunc(backoff, func() { r.execute(jobID, req, kind) })
 			return
 		}
-		_ = r.Store.UpdateJob(jobID, "failed", lastProgress, "failed", msg)
+		_ = r.Store.UpdateJob(jobID, "failed", failProgress, "failed", msg)
 		_ = r.Store.AddEvent(jobID, "error", msg)
+		scrubImport()
 		if kind == "create_site" || kind == "import_site" {
 			_ = r.Store.UpdateWebsite(req.Site.SiteID, map[string]any{"status": "failed"})
 		}
@@ -221,19 +246,6 @@ func (r *Runner) execute(jobID string, req agentproto.Request, kind string) {
 		fail("provisioning agent socket is not available; deploy the agent (see docs/DEPLOYMENT.md) - no resources were created", true)
 		return
 	}
-	// The call context is registered so Cancel() can actually abort
-	// an in-flight job (previously Cancel only changed the row and
-	// the running goroutine overwrote it with its own outcome).
-	callCtx, stopCall := context.WithCancel(context.Background())
-	r.mu.Lock()
-	r.cancels[jobID] = stopCall
-	r.mu.Unlock()
-	defer func() {
-		stopCall()
-		r.mu.Lock()
-		delete(r.cancels, jobID)
-		r.mu.Unlock()
-	}()
 	ctx, cancel := context.WithTimeout(callCtx, 12*time.Minute)
 	defer cancel()
 	resp, err := r.Agent.Call(ctx, req)
@@ -243,9 +255,17 @@ func (r *Runner) execute(jobID string, req agentproto.Request, kind string) {
 		// action the agent had already sent may still have completed -
 		// the event says so honestly.)
 		_ = r.Store.AddEvent(jobID, "warn", "job cancelled by operator; the agent result was discarded (an already-sent Docker action may still have taken effect)")
+		scrubImport()
 		return
 	}
 	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			// The outcome is UNKNOWN, not failed: the agent may
+			// have completed the operation before the timeout.
+			// The bounded retry below relies on the agent's
+			// operations being idempotent, and the job log says so.
+			_ = r.Store.AddEvent(jobID, "warn", "the agent call timed out; the operation may already have completed on the agent side - a retry is safe only because agent operations are idempotent")
+		}
 		fail(err.Error(), true) // transport failure: agent/daemon hiccup, retryable
 		return
 	}
@@ -254,7 +274,14 @@ func (r *Runner) execute(jobID string, req agentproto.Request, kind string) {
 		if ev.Progress > lastProgress {
 			lastProgress = ev.Progress
 		}
-		_ = r.Store.UpdateJob(jobID, "running", ev.Progress, ev.Message, "")
+		// Persisted progress is monotonic and capped at 99 while
+		// the job is running: agent events can carry 100 mid-flight
+		// or arrive out of order, and 100 must mean success only.
+		p := lastProgress
+		if p > 99 {
+			p = 99
+		}
+		_ = r.Store.UpdateJob(jobID, "running", p, ev.Message, "")
 	}
 	if resp.UsedCommonDBUser {
 		// The agent fell back to the common DB user for this site
@@ -279,6 +306,7 @@ func (r *Runner) execute(jobID string, req agentproto.Request, kind string) {
 	}
 	_ = r.Store.UpdateJob(jobID, "succeeded", 100, "completed", "")
 	_ = r.Store.AddEvent(jobID, "info", "completed")
+	scrubImport()
 	if kind == "backup_site" && req.BackupID > 0 && resp.BackupPath != "" {
 		// Record the agent's authoritative artifact facts (exact
 		// path + checksum + size) on the backup record. The panel's
@@ -326,6 +354,11 @@ func (r *Runner) Cancel(jobID string) error {
 	job, err := r.Store.GetJob(jobID)
 	if err != nil {
 		return err
+	}
+	if jobs.IsTerminal(job.Status) {
+		// Cancelling a finished job is not a no-op success: the job
+		// page must hear that there was nothing to cancel.
+		return fmt.Errorf("job is already %s; nothing to cancel", job.Status)
 	}
 	if err := jobs.ValidateTransition(job.Status, "cancelled"); err != nil {
 		return err

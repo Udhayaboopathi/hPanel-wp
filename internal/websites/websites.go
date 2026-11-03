@@ -4,15 +4,27 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"math"
 	"strings"
+	"time"
 
 	"github.com/Udhayaboopathi/hPanel-wp/internal/security"
 )
 
-// GenerateSiteID returns e.g. wp-a1b2c3d4 (unique internal identifier).
+// GenerateSiteID returns e.g. wp-a1b2c3d4e5f60718 (unique internal
+// identifier). 64 bits of randomness: the previous 32-bit IDs made
+// collisions a matter of time as the fleet grows, and the ignored
+// rand error could silently mint an all-zero ID.
 func GenerateSiteID() string {
-	b := make([]byte, 4)
-	_, _ = rand.Read(b)
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err != nil {
+		// crypto/rand failure is practically unreachable; fall
+		// back to time-derived bytes rather than zeros.
+		n := time.Now().UnixNano()
+		for i := range b {
+			b[i] = byte(n >> (8 * (i % 8)))
+		}
+	}
 	return "wp-" + hex.EncodeToString(b)
 }
 
@@ -82,6 +94,26 @@ func (in *CreateInput) Validate() error {
 	}
 	if in.Profile == "" {
 		in.Profile = "lightweight"
+	}
+	// Validate end to end, as documented: unsupported PHP
+	// versions, unknown profiles and invalid custom resources are
+	// rejected HERE instead of relying on every later caller to
+	// re-check them downstream.
+	if in.PHPVersion != "8.3" && in.PHPVersion != "8.2" {
+		return fmt.Errorf("PHP version %q is not supported (use 8.3 or 8.2)", in.PHPVersion)
+	}
+	switch in.Profile {
+	case "lightweight", "standard", "custom":
+	default:
+		return fmt.Errorf("unknown resource profile %q", in.Profile)
+	}
+	if in.Profile == "custom" {
+		if math.IsNaN(in.CPULimit) || math.IsInf(in.CPULimit, 0) || in.CPULimit < 0.1 || in.CPULimit > 4 {
+			return fmt.Errorf("cpu limit must be between 0.1 and 4")
+		}
+		if in.MemLimitMB < 256 || in.MemLimitMB > 4096 {
+			return fmt.Errorf("memory limit must be between 256 MB and 4096 MB")
+		}
 	}
 	return nil
 }

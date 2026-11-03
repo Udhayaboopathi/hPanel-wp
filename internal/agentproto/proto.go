@@ -59,9 +59,15 @@ type Request struct {
 	Op    string   `json:"op"`
 	Site  SiteSpec `json:"site"`
 	JobID string   `json:"job_id"`
-	// WPCLI action/arg (allowlisted in internal/wordpress)
+	// WPCLI action (allowlisted in internal/wordpress)
 	Action string `json:"action,omitempty"`
-	Arg    string `json:"arg,omitempty"`
+	// Arg is a per-op auxiliary string, NOT a free-form WP-CLI
+	// argument: for OpWPCLI it is the action's argument (validated
+	// by the wordpress allowlist builders); for OpApplyConfig it
+	// carries the site's PREVIOUS domain so the agent can
+	// search-replace URLs after a domain change. Other ops ignore
+	// it.
+	Arg string `json:"arg,omitempty"`
 	// Backup/restore
 	BackupID      int64  `json:"backup_id,omitempty"`
 	BackupPath    string `json:"backup_path,omitempty"`

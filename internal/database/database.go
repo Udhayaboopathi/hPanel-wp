@@ -12,8 +12,12 @@ import (
 )
 
 // EscapeLiteral escapes a generated password for a single-quoted MySQL literal.
+// Quotes are escaped by DOUBLING (”) — the SQL-standard form that
+// stays correct even if the session runs with NO_BACKSLASH_ESCAPES,
+// where \' stops being an escape and a backslash-escaped quote
+// would break out of the literal.
 func EscapeLiteral(s string) string {
-	r := strings.NewReplacer("\\", "\\\\", "'", "\\'", "\x00", "")
+	r := strings.NewReplacer("\\", "\\\\", "'", "''", "\x00", "")
 	return r.Replace(s)
 }
 

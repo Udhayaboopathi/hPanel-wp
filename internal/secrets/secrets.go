@@ -36,7 +36,16 @@ func LoadOrCreateKey(dir string) (*Box, error) {
 		return nil, err
 	}
 	enc := base64.RawStdEncoding.EncodeToString(key)
-	if err := os.WriteFile(p, []byte(enc), 0o600); err != nil {
+	// Write via a temp file + rename: a crash mid-write with a
+	// bare WriteFile leaves a truncated key file, and the next
+	// boot then hard-fails with "corrupt panel encryption key
+	// file", orphaning every encrypted site DB password.
+	tmp := p + ".tmp"
+	if err := os.WriteFile(tmp, []byte(enc), 0o600); err != nil {
+		return nil, err
+	}
+	if err := os.Rename(tmp, p); err != nil {
+		_ = os.Remove(tmp)
 		return nil, err
 	}
 	return &Box{key: key}, nil

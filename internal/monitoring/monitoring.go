@@ -24,11 +24,12 @@ type HostStats struct {
 }
 
 var (
-	mu      sync.Mutex
-	lastCPU cpuTimes
-	lastAt  time.Time
-	cached  HostStats
-	cacheAt time.Time
+	mu            sync.Mutex
+	lastCPU       cpuTimes
+	lastAt        time.Time
+	cached        HostStats
+	cacheAt       time.Time
+	cacheDiskPath string
 )
 
 type cpuTimes struct{ total, idle uint64 }
@@ -108,7 +109,18 @@ func Sample(diskPath string) HostStats {
 	mu.Lock()
 	defer mu.Unlock()
 	if time.Since(cacheAt) < 5*time.Second && !cached.SampledAt.IsZero() {
-		return cached
+		if diskPath == cacheDiskPath {
+			return cached
+		}
+		// CPU/memory are path-independent, but the disk figures
+		// belong to whichever path was sampled FIRST within the
+		// cache window — a caller asking about a different
+		// filesystem got another filesystem's numbers. Re-stat the
+		// requested path and patch a copy.
+		out := cached
+		dt, df := Disk(diskPath)
+		out.DiskTotal, out.DiskFree, out.DiskUsed = dt, df, dt-df
+		return out
 	}
 	cur := readCPU()
 	var pct float64
@@ -136,6 +148,7 @@ func Sample(diskPath string) HostStats {
 		Load1: readLoad(), UptimeSec: up, SampledAt: time.Now(),
 	}
 	cacheAt = time.Now()
+	cacheDiskPath = diskPath
 	return cached
 }
 

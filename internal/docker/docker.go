@@ -253,6 +253,19 @@ func (c *Client) ConnectNetwork(ctx context.Context, network, container string) 
 	return err
 }
 
+// DisconnectNetwork detaches a container from a network (used when
+// a site is deleted: the shared MariaDB container is attached to
+// every site network and must be detached before the network can
+// be removed).
+func (c *Client) DisconnectNetwork(ctx context.Context, network, container string) error {
+	return c.do(ctx, "POST", "/v1.47/networks/"+network+"/disconnect", map[string]any{"Container": container, "Force": true}, nil)
+}
+
+// RemoveNetwork deletes a network by name or ID.
+func (c *Client) RemoveNetwork(ctx context.Context, name string) error {
+	return c.do(ctx, "DELETE", "/v1.47/networks/"+name, nil, nil)
+}
+
 type CreateConfig struct {
 	Image            string              `json:"Image"`
 	Cmd              []string            `json:"Cmd,omitempty"`
@@ -475,7 +488,12 @@ func (c *Client) StatsOneShot(ctx context.Context, id string) (*Stats, error) {
 	}
 	if cs, ok := raw["cpu_stats"].(map[string]any); ok {
 		if pre, ok := raw["precpu_stats"].(map[string]any); ok {
-			cpuDelta := num(cs["cpu_usage"].(map[string]any)["total_usage"]) - num(pre["cpu_usage"].(map[string]any)["total_usage"])
+			// Nested maps are asserted with comma-ok throughout: a
+			// partial stats object from the daemon must degrade to
+			// zero values, never panic the agent.
+			cpuUsage, _ := cs["cpu_usage"].(map[string]any)
+			preUsage, _ := pre["cpu_usage"].(map[string]any)
+			cpuDelta := num(cpuUsage["total_usage"]) - num(preUsage["total_usage"])
 			sysDelta := num(cs["system_cpu_usage"]) - num(pre["system_cpu_usage"])
 			cpus := num(cs["online_cpus"])
 			if cpus == 0 {
@@ -499,6 +517,10 @@ func (c *Client) Logs(ctx context.Context, id string, tail int) (string, error) 
 		return "", err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return "", fmt.Errorf("docker logs request failed: %s: %s", resp.Status, strings.TrimSpace(string(snippet)))
+	}
 	return readMultiplexed(resp.Body)
 }
 
@@ -594,6 +616,11 @@ func (c *Client) execRunEnv(ctx context.Context, container string, argv []string
 		return "", -1, err
 	}
 	defer conn.Close()
+	// A stalled daemon stream must not outlive the caller's
+	// context: close the connection when the context ends so the
+	// read below unblocks instead of hanging past the deadline.
+	stopWatch := context.AfterFunc(ctx, func() { conn.Close() })
+	defer stopWatch()
 	payload, _ := json.Marshal(map[string]any{"Detach": false, "Tty": false})
 	fmt.Fprintf(conn, "POST /v1.47/exec/%s/start HTTP/1.1\r\nHost: docker\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", created.ID, len(payload), payload)
 	br := bufio.NewReader(conn)
@@ -611,21 +638,34 @@ func (c *Client) execRunEnv(ctx context.Context, container string, argv []string
 	if err != nil {
 		return out, -1, err
 	}
-	var insp struct {
+	// The exit code starts at -1 and an inspection error is
+	// propagated: defaulting to the zero value would report a
+	// failed or uninspectable exec as exit code 0 (success).
+	insp := struct {
 		ExitCode int `json:"ExitCode"`
+	}{ExitCode: -1}
+	if err := c.do(ctx, "GET", "/v1.47/exec/"+created.ID+"/json", nil, &insp); err != nil {
+		return out, -1, fmt.Errorf("inspecting exec result: %w", err)
 	}
-	_ = c.do(ctx, "GET", "/v1.47/exec/"+created.ID+"/json", nil, &insp)
 	return out, insp.ExitCode, nil
 }
+
+// maxStreamBytes bounds the total output one logs/exec call can
+// accumulate in memory; individual frames were already capped,
+// but the stream as a whole was not.
+const maxStreamBytes = 32 << 20
 
 func readMultiplexed(r io.Reader) (string, error) {
 	var sb strings.Builder
 	hdr := make([]byte, 8)
 	for {
+		if sb.Len() > maxStreamBytes {
+			return sb.String(), fmt.Errorf("docker output exceeded the %d MB safety cap", maxStreamBytes>>20)
+		}
 		if _, err := io.ReadFull(r, hdr); err != nil {
 			if err == io.EOF || err == io.ErrUnexpectedEOF {
 				// Possibly a non-multiplexed (TTY) stream remainder.
-				rest, _ := io.ReadAll(r)
+				rest, _ := io.ReadAll(io.LimitReader(r, maxStreamBytes))
 				sb.Write(rest)
 				return sb.String(), nil
 			}
@@ -635,7 +675,7 @@ func readMultiplexed(r io.Reader) (string, error) {
 		if size < 0 || size > 16<<20 {
 			// Not a framed stream; treat header bytes as content and drain.
 			sb.Write(hdr)
-			rest, _ := io.ReadAll(r)
+			rest, _ := io.ReadAll(io.LimitReader(r, maxStreamBytes))
 			sb.Write(rest)
 			return sb.String(), nil
 		}
