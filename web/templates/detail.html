@@ -190,8 +190,8 @@
 <table class="kv"><tr><th>Domain</th><td>{{$s.Domain}}</td></tr>
 <tr><th>Admin alias</th><td>{{$s.AdminDomain}} → https://{{$s.Domain}}/wp-admin/</td></tr></table>
 <h3>Cloudflare DNS records (manual)</h3>
-<pre id="dns-records-{{$s.SiteID}}">Type: A    Name: @        Value: {{$.ServerIP}}
-Type: A    Name: wpadmin  Value: {{$.ServerIP}}</pre>
+<pre id="dns-records-{{$s.SiteID}}">Type: A    Name: {{$s.Domain}}        Value: {{$.ServerIP}}
+Type: A    Name: {{$s.AdminDomain}}  Value: {{$.ServerIP}}</pre>
 <button type="button" class="btn" data-copy="#dns-records-{{$s.SiteID}}">Copy DNS Records</button>
 <p class="muted">Use DNS-only mode first so the origin Let's Encrypt certificate can be issued, then switch Cloudflare SSL to Full (strict). A proxied domain resolves to Cloudflare addresses — the checker understands that and does not report it as an error.</p>
 <form method="post" action="/websites/{{$s.SiteID}}/check">{{template "csrf" $csrf}}<button class="btn primary" type="submit">Check DNS &amp; SSL now</button></form>

@@ -20,9 +20,15 @@
 <form method="post" action="/account/totp/disable">{{template "csrf" .CSRF}}
 <label>Current password <input name="current_password" type="password" required></label>
 <button class="btn" type="submit">Disable two-factor</button></form>
+<form method="post" action="/account/totp/setup">{{template "csrf" .CSRF}}
+<label>Current password <input name="current_password" type="password" required></label>
+<label>Current two-factor code <input name="code" required inputmode="numeric"></label>
+<button class="btn" type="submit">Generate a new TOTP secret (replaces the current one)</button></form>
 {{else}}
-<form method="post" action="/account/totp/setup">{{template "csrf" .CSRF}}<button class="btn" type="submit">Generate a new TOTP secret</button></form>
-{{if .Data.TOTPSecret}}<p>Secret: <code>{{.Data.TOTPSecret}}</code><br><a href="{{.Data.TOTPURL}}">{{.Data.TOTPURL}}</a></p>
+<form method="post" action="/account/totp/setup">{{template "csrf" .CSRF}}
+<label>Current password <input name="current_password" type="password" required></label>
+<button class="btn" type="submit">Generate a new TOTP secret</button></form>
+{{if .Data.TOTPSecret}}<p>Secret: <code>{{.Data.TOTPSecret}}</code><br>Authenticator link: <code>{{.Data.TOTPURL}}</code></p>
 <form method="post" action="/account/totp/enable">{{template "csrf" .CSRF}}
 <label>Enter the 6-digit code from your authenticator <input name="code" required inputmode="numeric"></label>
 <button class="btn primary" type="submit">Enable two-factor</button></form>{{end}}
@@ -30,6 +36,8 @@
 </section>
 <section class="card"><h2>Recovery codes</h2>
 <p class="muted">Regenerating invalidates all previous codes.</p>
-<form method="post" action="/account/recovery/regenerate">{{template "csrf" .CSRF}}<button class="btn" type="submit">Regenerate recovery codes</button></form>
+<form method="post" action="/account/recovery/regenerate">{{template "csrf" .CSRF}}
+<label>Current password <input name="current_password" type="password" required></label>
+<button class="btn" type="submit">Regenerate recovery codes</button></form>
 </section>
 {{template "footer" .}}

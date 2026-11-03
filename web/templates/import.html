@@ -33,7 +33,7 @@
   <button class="btn" type="submit">Open File Manager</button>
 </form>
 <h3>Step 3 — Import the database</h3>
-<p>Connect to the new site's database with your database tool (the external endpoint is shown on the site's <strong>Database</strong> page) and import the old dump there, or simply use the one-upload import above, which does this for you. Afterwards update the site URL inside WordPress (Settings → General) or with the WordPress tab's WP-CLI tools if the domain changed, and flush permalinks once.</p>
+<p>Connect to the new site's database with your database tool (the external endpoint is shown on the site's <strong>Database</strong> page) and import the old dump there, or simply use the one-upload import above, which does this for you. If the domain changed, use the site's <strong>Domains &amp; SSL</strong> page → <strong>Change domain</strong> afterwards — it rewrites the site's internal URLs to the new domain for you — and flush permalinks once.</p>
 <h3>Step 4 — Verify, then point DNS</h3>
 <p>Open the site, check pages, forms and media, then point the domain's DNS A records at this server (the exact records are shown on the site's <strong>Domains &amp; SSL</strong> page). Keep the old hosting live until DNS has propagated.</p>
 </section>

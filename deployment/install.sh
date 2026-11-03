@@ -115,6 +115,15 @@ if [[ ! -f "$BASE/secrets/mariadb_root_password.txt" ]]; then
   openssl rand -hex 24 > "$BASE/secrets/mariadb_root_password.txt"; chmod 600 "$BASE/secrets/mariadb_root_password.txt"
   echo "MariaDB root password generated into $BASE/secrets/mariadb_root_password.txt (0600, never printed)"
 fi
+# A supplied DB_ADMIN_PASSWORD is materialised into the 0600
+# secret file the stack actually reads: previously it only
+# suppressed the warning below, and the stack then started
+# without a usable panel database credential.
+if [[ ! -f "$BASE/secrets/db_admin_password.txt" && -n "${DB_ADMIN_PASSWORD:-}" ]]; then
+  printf '%s' "$DB_ADMIN_PASSWORD" > "$BASE/secrets/db_admin_password.txt"
+  chmod 600 "$BASE/secrets/db_admin_password.txt"
+  echo "DB admin credential stored into $BASE/secrets/db_admin_password.txt (0600, never printed)"
+fi
 if [[ ! -f "$BASE/secrets/db_admin_password.txt" && -z "${DB_ADMIN_PASSWORD:-}" ]]; then
   echo "WARNING: no DB admin credential found ($BASE/secrets/db_admin_password.txt missing and DB_ADMIN_PASSWORD unset)."
   echo "         The agent/panel will not be able to provision databases until it is provided (0600 file, never printed)."
@@ -156,7 +165,12 @@ fi
 # pre-existing production containers are never started/stopped by it).
 : "${PANEL_DOMAIN:?Set PANEL_DOMAIN, e.g. PANEL_DOMAIN=panel.example.com}"
 export PANEL_DOMAIN
-docker compose up -d --build
+# Start the stack from THIS checkout's compose file, explicitly:
+# running bare `docker compose up` in the caller's working
+# directory could pick up an unrelated project (or fail) when the
+# installer is invoked from somewhere else.
+COMPOSE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+docker compose -f "$COMPOSE_DIR/compose.yaml" --project-directory "$COMPOSE_DIR" up -d --build
 
 echo "--- containers AFTER (compare with the BEFORE snapshot) ---"
 docker ps -a --format '{{.ID}} {{.Names}} {{.Image}} {{.Status}}'

@@ -40,7 +40,9 @@ case "$MARIADB_USER" in
     ;;
 esac
 
-mariadb -uroot -p"$MARIADB_ROOT_PASSWORD" <<-EOSQL
+# The root password travels via MYSQL_PWD, never in argv (where
+# any process listing could read it).
+MYSQL_PWD="$MARIADB_ROOT_PASSWORD" mariadb -uroot <<-EOSQL
 	GRANT ALL PRIVILEGES ON *.* TO '${MARIADB_USER}'@'%' WITH GRANT OPTION;
 	GRANT ALL PRIVILEGES ON *.* TO '${MARIADB_USER}'@'localhost' WITH GRANT OPTION;
 	FLUSH PRIVILEGES;

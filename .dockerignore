@@ -1,0 +1,17 @@
+# Keep the build context minimal and secret-free: the deploy
+# directory contains a generated .env and staged secrets, and none
+# of it may enter the build-stage image history. The Go build only
+# needs the sources below.
+.git
+.env
+.env.*
+secrets
+data
+design-reference
+bin
+*.md
+*.tar.gz
+*.db
+*.db-wal
+*.db-shm
+.muse-github-snapshot-sync.json

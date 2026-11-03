@@ -6,7 +6,7 @@
 {{if .Data.TOTPSecret}}
 <p><strong>Two-factor secret:</strong> add this to your authenticator app (or open the otpauth link on your phone):</p>
 <p><code>{{.Data.TOTPSecret}}</code></p>
-<p><a href="{{.Data.TOTPURL}}">{{.Data.TOTPURL}}</a></p>
+<p>Authenticator link: <code>{{.Data.TOTPURL}}</code></p>
 {{end}}
 <p><a class="btn primary" href="/">Continue to the dashboard</a></p>
 </section>

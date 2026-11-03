@@ -1,10 +1,16 @@
 /bin/
 /data/
 .env
+.env.*
+!/.env.example
 *.db
 *.db-wal
 *.db-shm
 /secrets/
+*.key
+*.pem
+*credentials*
+*secret*.txt
 *.tar.gz
 .DS_Store
 # Stitch design downloads (re-fetchable via the connector; ~26 MB)

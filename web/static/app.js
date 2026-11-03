@@ -61,6 +61,11 @@
     if (profile) profile.addEventListener("change", function () {
       document.getElementById("custom-resources").hidden = profile.value !== "custom";
     });
+    function esc(s) {
+      return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
+        return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+      });
+    }
     function loadPreview() {
       var form = document.getElementById("create-form");
       var box = document.getElementById("preview-box");
@@ -69,15 +74,15 @@
       fetch("/websites/preview", { method: "POST", body: new URLSearchParams(fd), credentials: "same-origin" })
         .then(function (r) { return r.json(); })
         .then(function (d) {
-          if (d.error) { box.innerHTML = "<p class='error-box'>" + d.error + "</p>"; return; }
+          if (d.error) { box.innerHTML = "<p class='error-box'>" + esc(d.error) + "</p>"; return; }
           var dns = (d.dns_records || []).map(function (r) { return "Type: A    Name: " + r[1] + "    Value: " + r[2]; }).join("\n");
           box.innerHTML = "<table class='kv'>" +
-            "<tr><th>Domain</th><td>" + d.domain + "</td></tr>" +
-            "<tr><th>Admin URL</th><td>" + d.admin_url + "</td></tr>" +
-            "<tr><th>Admin alias</th><td>" + (d.admin_domain || "") + " → " + d.admin_domain_target + "</td></tr>" +
-            "<tr><th>Database</th><td>" + (d.db_name || "(auto-generated)") + "</td></tr>" +
-            "<tr><th>PHP</th><td>" + d.php_version + "</td></tr>" +
-            "<tr><th>Resources</th><td>" + d.cpu + " CPU max · " + d.mem_mb + " MB RAM max</td></tr></table>";
+            "<tr><th>Domain</th><td>" + esc(d.domain) + "</td></tr>" +
+            "<tr><th>Admin URL</th><td>" + esc(d.admin_url) + "</td></tr>" +
+            "<tr><th>Admin alias</th><td>" + esc(d.admin_domain || "") + " → " + esc(d.admin_domain_target) + "</td></tr>" +
+            "<tr><th>Database</th><td>" + esc(d.db_name || "(auto-generated)") + "</td></tr>" +
+            "<tr><th>PHP</th><td>" + esc(d.php_version) + "</td></tr>" +
+            "<tr><th>Resources</th><td>" + esc(d.cpu) + " CPU max · " + esc(d.mem_mb) + " MB RAM max</td></tr></table>";
           var pre = document.getElementById("dns-records");
           if (pre && dns) pre.textContent = dns;
         })
@@ -156,5 +161,4 @@
     setTimeout(function () { if (!document.hidden) location.reload(); }, 5000);
   }
 
-  if (window.htmx) { document.body.addEventListener("htmx:configRequest", function () {}); }
 })();
