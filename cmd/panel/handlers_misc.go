@@ -163,7 +163,16 @@ func (a *App) apiJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	events, _ := a.store.ListEvents(job.ID, 200)
-	writeJSON(w, 200, map[string]any{"job": job, "events": events})
+	// An explicit projection: serialising the raw Job record also
+	// published PayloadJSON (site specs with database names,
+	// usernames, filesystem paths and import origins) to any
+	// holder of a session. The job page needs status fields only.
+	writeJSON(w, 200, map[string]any{"job": map[string]any{
+		"id": job.ID, "site_id": job.SiteID, "kind": job.Kind, "status": job.Status,
+		"progress": job.Progress, "message": job.Message, "error": job.Error,
+		"attempts": job.Attempts, "max_attempts": job.MaxAttempts,
+		"created_at": job.CreatedAt, "updated_at": job.UpdatedAt,
+	}, "events": events})
 }
 
 // ---------- audit ----------
@@ -259,6 +268,22 @@ func (a *App) accountPassword(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) accountTOTPSetup(w http.ResponseWriter, r *http.Request) {
 	admin := adminFrom(r)
+	// Step-up authentication: generating a new seed REPLACES the
+	// second factor (and disables 2FA until the new seed is
+	// confirmed), so a hijacked session alone must not be enough —
+	// the current password is always required, and when 2FA is
+	// currently enabled, a current TOTP code as well. (Password
+	// change and TOTP disable already required the password; this
+	// handler was the odd one out.)
+	_ = r.ParseForm()
+	if !auth.VerifyPassword(admin.PasswordHash, r.FormValue("current_password")) {
+		http.Redirect(w, r, "/account?flash=Current password is incorrect.", http.StatusSeeOther)
+		return
+	}
+	if admin.TOTPEnabled && !a.validateTOTPOnce(admin, r.FormValue("code")) {
+		http.Redirect(w, r, "/account?flash=Enter a valid current two-factor code to replace the secret.", http.StatusSeeOther)
+		return
+	}
 	secret, url, err := auth.GenerateTOTPSecret(admin.Username)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
@@ -267,14 +292,22 @@ func (a *App) accountTOTPSetup(w http.ResponseWriter, r *http.Request) {
 	// Stored disabled until the admin confirms with a valid code.
 	// The seed is stored ENCRYPTED (the panel DB must not hand out
 	// second factors in plaintext) and shown once via server-side
-	// one-time storage - never in the redirect URL.
-	stored := secret
-	if a.box != nil {
-		if enc, err := a.box.Encrypt(secret); err == nil {
-			stored = enc
-		}
+	// one-time storage - never in the redirect URL. An encryption
+	// failure fails the request: the previous silent fallback
+	// stored the seed in PLAINTEXT.
+	if a.box == nil {
+		http.Error(w, "panel encryption is unavailable; the two-factor secret cannot be stored safely", 500)
+		return
 	}
-	_ = a.store.UpdateAdminTOTP(admin.ID, stored, false)
+	stored, err := a.box.Encrypt(secret)
+	if err != nil {
+		http.Error(w, "could not protect the two-factor secret: "+err.Error(), 500)
+		return
+	}
+	if err := a.store.UpdateAdminTOTP(admin.ID, stored, false); err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
 	a.setOnce(fmt.Sprintf("totp_secret:%d", admin.ID), secret)
 	a.setOnce(fmt.Sprintf("totp_url:%d", admin.ID), url)
 	http.Redirect(w, r, "/account", http.StatusSeeOther)
@@ -288,7 +321,7 @@ func (a *App) accountTOTPEnable(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/account?flash=Generate a TOTP secret first.", http.StatusSeeOther)
 		return
 	}
-	if !auth.ValidateTOTP(a.totpSecret(fresh), r.FormValue("code")) {
+	if !a.validateTOTPOnce(fresh, r.FormValue("code")) {
 		http.Redirect(w, r, "/account?flash=Invalid TOTP code; two-factor remains disabled.", http.StatusSeeOther)
 		return
 	}
@@ -311,6 +344,15 @@ func (a *App) accountTOTPDisable(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) accountRecovery(w http.ResponseWriter, r *http.Request) {
 	admin := adminFrom(r)
+	// Regenerating invalidates the owner's existing codes and
+	// mints new ones — an account-takeover primitive from a
+	// hijacked session — so it requires the current password,
+	// exactly like disabling two-factor does.
+	_ = r.ParseForm()
+	if !auth.VerifyPassword(admin.PasswordHash, r.FormValue("current_password")) {
+		http.Redirect(w, r, "/account?flash=Current password is incorrect.", http.StatusSeeOther)
+		return
+	}
 	plains, hashes, err := auth.GenerateRecoveryCodes(10)
 	if err != nil {
 		http.Error(w, err.Error(), 500)

@@ -267,8 +267,9 @@ func main() {
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           securityHeaders(mux),
+		Handler:           securityHeaders(limitBody(mux)),
 		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 	ln, err := net.Listen("tcp", cfg.Addr)
 	if err != nil {
@@ -322,6 +323,27 @@ func openStore(log *slog.Logger, dataDir string) (*store.Store, error) {
 	}
 }
 
+// limitBody caps request bodies so a single request cannot fill
+// the panel host's disk. ParseMultipartForm spools file parts to
+// temp files as it parses, so without this ceiling the panel's
+// per-file caps — enforced only when copying OUT of the spool —
+// could never honour their guarantee. Multipart uploads (site
+// imports, the file manager) get room for the panel's own caps
+// (2 GB archive + 1 GB database file) plus form overhead; every
+// other write is a small form post.
+func limitBody(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost || r.Method == http.MethodPut {
+			limit := int64(2 << 20)
+			if strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/form-data") {
+				limit = (3 << 30) + (256 << 20)
+			}
+			r.Body = http.MaxBytesReader(w, r.Body, limit)
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 func securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -369,6 +391,11 @@ func humanBytes(v any) string {
 func (a *App) render(w http.ResponseWriter, name string, d pageData) {
 	d.ServerIP = a.cfg.ServerIP
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	// Rendered pages carry sensitive one-time material (recovery
+	// codes, TOTP seeds, generated passwords) and live account
+	// state: they must never be stored by a browser or proxy cache.
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Pragma", "no-cache")
 	if err := a.tmpl.ExecuteTemplate(w, name, d); err != nil {
 		a.log.Error("render", "template", name, "err", err)
 	}
@@ -426,7 +453,13 @@ func (a *App) session(r *http.Request) (*store.Session, *store.Admin) {
 
 func (a *App) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if n, _ := a.store.CountAdmins(); n == 0 {
+		// Fail closed: a store error must not be read as "no
+		// administrators yet" (which would route an authenticated
+		// area into the first-run setup flow).
+		if n, err := a.store.CountAdmins(); err != nil {
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		} else if n == 0 {
 			http.Redirect(w, r, "/setup", http.StatusSeeOther)
 			return
 		}
@@ -537,7 +570,14 @@ func (a *App) getPending(r *http.Request) (int64, bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	p, ok := a.pending[c.Value]
-	if !ok || time.Now().After(p.ExpiresAt) {
+	if !ok {
+		return 0, false
+	}
+	if time.Now().After(p.ExpiresAt) {
+		// Delete expired entries on sight: without this the
+		// pending map grows by one entry per password-valid login
+		// that never completes (or abandons) the TOTP step.
+		delete(a.pending, c.Value)
 		return 0, false
 	}
 	return p.AdminID, true

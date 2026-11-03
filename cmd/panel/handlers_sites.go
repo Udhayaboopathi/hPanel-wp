@@ -82,14 +82,20 @@ func (a *App) websitesList(w http.ResponseWriter, r *http.Request) {
 		page = 1
 	}
 	const perPage = 10
-	sites, total, err := a.store.ListWebsites(q, status, perPage, (page-1)*perPage)
+	// The domain sort is applied in the store query, before
+	// pagination (sorting the page slice here ordered only the
+	// current page's rows).
+	var sites []*store.Website
+	var total int
+	var err error
+	if r.URL.Query().Get("sort") == "domain" {
+		sites, total, err = a.store.ListWebsitesOrdered(q, status, perPage, (page-1)*perPage, "domain")
+	} else {
+		sites, total, err = a.store.ListWebsites(q, status, perPage, (page-1)*perPage)
+	}
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
-	}
-	// Optional server-side sort by domain (default: newest first from store).
-	if r.URL.Query().Get("sort") == "domain" {
-		sort.Slice(sites, func(i, j int) bool { return sites[i].Domain < sites[j].Domain })
 	}
 	a.render(w, "websites.html", pageData{Title: "Websites", Admin: adminFrom(r), CSRF: sessionFrom(r).CSRFToken, Data: map[string]any{
 		"Sites": sites, "Total": total, "Page": page, "Pages": (total + perPage - 1) / perPage,
@@ -174,28 +180,22 @@ func (a *App) createSubmit(w http.ResponseWriter, r *http.Request) {
 		fail(err.Error())
 		return
 	}
-	if _, err := a.store.GetWebsiteByDomain(in.Domain); err == nil {
-		fail("A website with domain " + in.Domain + " already exists in the panel.")
-		return
-	}
 	// Domain/alias collisions in EVERY direction must fail loudly:
 	// previously an admin-domain collision was silently swallowed by
 	// an INSERT OR IGNORE while the site still published a Traefik
 	// router for the alias, so two sites could fight over one Host().
-	if all, _, _ := a.store.ListWebsites("", "all", 1000, 0); all != nil {
-		for _, s := range all {
-			if s.Domain == in.AdminDomain || s.AdminDomain == in.AdminDomain {
-				fail("The admin domain " + in.AdminDomain + " is already used by " + s.Domain + ". Choose a different admin alias.")
-				return
-			}
-			if s.AdminDomain == in.Domain {
-				fail("Domain " + in.Domain + " is already used as the admin alias of " + s.Domain + ".")
-				return
-			}
-		}
+	// Indexed lookups now (the old first-1000-rows scans silently
+	// stopped checking beyond 1000 sites).
+	if other, err := a.store.FindWebsiteByDomainOrAdmin(in.Domain); err == nil {
+		fail("Domain " + in.Domain + " is already used by " + other.Domain + " (as its domain or its admin alias).")
+		return
+	}
+	if other, err := a.store.FindWebsiteByDomainOrAdmin(in.AdminDomain); err == nil {
+		fail("The admin domain " + in.AdminDomain + " is already used by " + other.Domain + ". Choose a different admin alias.")
+		return
 	}
 	// Capacity checks against real host state.
-	host := monitoring.Sample("/")
+	host := monitoring.Sample(a.cfg.SitesDir)
 	if host.DiskTotal > 0 && host.DiskFree < 2<<30 {
 		fail("Less than 2 GB of free disk space remains; refusing to create a new website.")
 		return
@@ -210,13 +210,9 @@ func (a *App) createSubmit(w http.ResponseWriter, r *http.Request) {
 		dbName = websites.DBNameFor(siteID)
 	}
 	// DB name uniqueness across sites.
-	if sites, _, _ := a.store.ListWebsites("", "all", 1000, 0); sites != nil {
-		for _, s := range sites {
-			if s.DBName == dbName {
-				fail("Database name " + dbName + " is already used by " + s.Domain + ".")
-				return
-			}
-		}
+	if other, err := a.store.FindWebsiteByDBName(dbName); err == nil {
+		fail("Database name " + dbName + " is already used by " + other.Domain + ".")
+		return
 	}
 	dbUser := websites.DBUserFor(siteID)
 	dbPW, err := genDBPassword()
@@ -252,7 +248,12 @@ func (a *App) createSubmit(w http.ResponseWriter, r *http.Request) {
 	}
 	composeYAML, err := configgen.GenerateCompose(spec)
 	if err != nil {
-		fail(err.Error())
+		// The website row exists already; leaving it in
+		// 'provisioning' with no job (the old behaviour) wedged
+		// the site and burned its domain. Mark it failed so the
+		// operator can repair or delete it.
+		_ = a.store.UpdateWebsite(siteID, map[string]any{"status": "failed"})
+		fail("Could not generate the site configuration: " + err.Error())
 		return
 	}
 	envJSON, _ := json.Marshal(map[string]string{
@@ -502,6 +503,14 @@ func (a *App) siteRestore(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "backup not found", 404)
 		return
 	}
+	// Only a COMPLETED backup may be restored: a 'creating' or
+	// 'failed' record points at a partial or missing artifact, and
+	// queueing a restore from it would overwrite the live site
+	// with whatever happens to be on disk.
+	if backup.Status != "ready" || backup.Path == "" || backup.SHA256 == "" {
+		http.Redirect(w, r, "/websites/"+site.SiteID+"?tab=backups&flash=That backup is not complete (status: "+backup.Status+"), so it cannot be restored.", http.StatusSeeOther)
+		return
+	}
 	_ = r.ParseForm()
 	if r.FormValue("confirm") != "RESTORE" {
 		http.Redirect(w, r, "/websites/"+site.SiteID+"?tab=backups&flash=Type RESTORE to confirm restoring this backup.", http.StatusSeeOther)
@@ -679,8 +688,16 @@ func (a *App) siteChangeDomain(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, back+"That is already the site's domain.", http.StatusSeeOther)
 		return
 	}
-	if _, err := a.store.GetWebsiteByDomain(newDomain); err == nil {
-		http.Redirect(w, r, back+"Domain already in use.", http.StatusSeeOther)
+	// Collision checks in every direction, like create/import: the
+	// new domain AND the generated wpadmin. alias must both be free
+	// as primary and admin names across all OTHER sites.
+	newAdminDomain := "wpadmin." + newDomain
+	if other, err := a.store.FindWebsiteByDomainOrAdmin(newDomain); err == nil && other.SiteID != site.SiteID {
+		http.Redirect(w, r, back+"Domain "+newDomain+" is already used by "+other.Domain+".", http.StatusSeeOther)
+		return
+	}
+	if other, err := a.store.FindWebsiteByDomainOrAdmin(newAdminDomain); err == nil && other.SiteID != site.SiteID {
+		http.Redirect(w, r, back+"The admin alias "+newAdminDomain+" is already used by "+other.Domain+".", http.StatusSeeOther)
 		return
 	}
 	// The whole change rides in ONE apply_config job (the runner
@@ -691,14 +708,27 @@ func (a *App) siteChangeDomain(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	old := site.Domain
-	if err := a.store.UpdateWebsite(site.SiteID, map[string]any{"domain": newDomain, "admin_domain": "wpadmin." + newDomain}); err != nil {
+	oldAdmin := site.AdminDomain
+	// rollback undoes the store-side domain move when a later step
+	// fails, so the panel never points at a domain the running
+	// site does not actually use (a stranded half-change also lost
+	// the old domain the URL rewrite needs).
+	rollback := func(msg string) {
+		if rerr := a.store.ChangeWebsiteDomain(site.SiteID, old, oldAdmin); rerr != nil {
+			a.log.Error("change-domain rollback failed", "site", site.SiteID, "err", rerr)
+			http.Redirect(w, r, back+msg+" The rollback also failed — check the site's domain settings before retrying.", http.StatusSeeOther)
+			return
+		}
+		http.Redirect(w, r, back+msg+" The domain was left unchanged.", http.StatusSeeOther)
+	}
+	if err := a.store.ChangeWebsiteDomain(site.SiteID, newDomain, newAdminDomain); err != nil {
 		http.Redirect(w, r, back+"Could not save the new domain: "+err.Error(), http.StatusSeeOther)
 		return
 	}
 	a.audit(r, "website.change_domain", site.SiteID, old+" -> "+newDomain)
 	updated, err := a.store.GetWebsiteBySiteID(site.SiteID)
 	if err != nil {
-		http.Redirect(w, r, back+"Domain saved. Apply the configuration to rebuild the site under it.", http.StatusSeeOther)
+		rollback("Preparing the rebuild failed: " + err.Error())
 		return
 	}
 	// Regenerate the site's configuration under the new domain and
@@ -708,7 +738,7 @@ func (a *App) siteChangeDomain(w http.ResponseWriter, r *http.Request) {
 	// job — a domain change is complete in one step.
 	spec, err := a.agentSpec(updated, true)
 	if err != nil {
-		http.Redirect(w, r, back+"Domain saved, but preparing the rebuild failed: "+err.Error(), http.StatusSeeOther)
+		rollback("Preparing the rebuild failed: " + err.Error())
 		return
 	}
 	profile, _ := configgen.ProfileFor(updated.ResourceProfile, updated.CPULimit, updated.MemLimitMB)
@@ -718,17 +748,21 @@ func (a *App) siteChangeDomain(w http.ResponseWriter, r *http.Request) {
 		envJSON = latest.EnvJSON
 	}
 	_ = json.Unmarshal([]byte(envJSON), &env)
+	domainTitle := updated.Title
+	if v := strings.TrimSpace(env["SITE_TITLE"]); v != "" {
+		domainTitle = v
+	}
 	cs := configgen.SiteSpec{
-		SiteID: updated.SiteID, Domain: newDomain, AdminDomain: updated.AdminDomain, Title: updated.Title,
+		SiteID: updated.SiteID, Domain: newDomain, AdminDomain: updated.AdminDomain, Title: domainTitle,
 		DBName: updated.DBName, DBUser: updated.DBUser, DBPassword: spec.DBPassword, DBHost: a.cfg.SiteDBHost,
 		PHPVersion: updated.PHPVersion, Profile: profile, SiteDir: updated.SiteDir,
 		ContainerName: updated.ContainerName, Network: websites.NetworkName(updated.SiteID),
-		PHPMemory: env["PHP_MEMORY_LIMIT"], UploadSize: env["UPLOAD_MAX_FILESIZE"], Debug: env["WORDPRESS_DEBUG"] == "1",
+		PHPMemory: env["PHP_MEMORY_LIMIT"], UploadSize: env["UPLOAD_MAX_FILESIZE"], PostMax: env["POST_MAX_SIZE"], Debug: env["WORDPRESS_DEBUG"] == "1",
 		TablePrefix: updated.TablePrefix,
 	}
 	composeYAML, err := configgen.GenerateCompose(cs)
 	if err != nil {
-		http.Redirect(w, r, back+"Domain saved, but generating its configuration failed: "+err.Error(), http.StatusSeeOther)
+		rollback("Generating the new configuration failed: " + err.Error())
 		return
 	}
 	spec.ComposeYAML = composeYAML
@@ -738,7 +772,7 @@ func (a *App) siteChangeDomain(w http.ResponseWriter, r *http.Request) {
 	}
 	job, err := a.runner.EnqueueSimple(updated, "apply_config", agentproto.Request{Op: agentproto.OpApplyConfig, Site: spec, Arg: old})
 	if err != nil {
-		http.Redirect(w, r, back+"Domain saved, but the rebuild could not be started: "+err.Error(), http.StatusSeeOther)
+		rollback("The rebuild could not be started: " + err.Error())
 		return
 	}
 	http.Redirect(w, r, "/jobs/"+job.ID, http.StatusSeeOther)

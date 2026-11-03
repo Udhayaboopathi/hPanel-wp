@@ -23,7 +23,9 @@ import (
 	"archive/tar"
 	"compress/gzip"
 	"context"
+	"crypto/rand"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -87,6 +89,14 @@ func main() {
 		log.Error("cannot read agent token file", "err", err)
 		os.Exit(1)
 	}
+	// Fail closed on a weak token: an empty or short token file
+	// (a botched secret mount) must never leave the socket guarded
+	// by a guessable bearer token — with an empty stored token, an
+	// empty presented token would otherwise compare equal.
+	if len(strings.TrimSpace(string(tokenBytes))) < 32 {
+		log.Error("agent token file is empty or too short (need at least 32 characters); refusing to start")
+		os.Exit(1)
+	}
 	// Dedicated-MariaDB configuration. Legacy AGENT_MARIADB_* names are honoured
 	// as a fallback so older systemd units keep working during the upgrade.
 	if os.Getenv("DB_ADMIN_PASSWORD_FILE") == "" && os.Getenv("AGENT_MARIADB_ROOT_PASSWORD_FILE") != "" {
@@ -127,7 +137,10 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("ok")) })
 	mux.HandleFunc("POST /execute", a.auth(a.execute))
-	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	// No Read/Write timeouts: legitimate operations run for
+	// minutes and stream their result at the end. IdleTimeout
+	// still reaps dead connections.
+	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 120 * time.Second}
 	log.Info("own-hpanel agent listening", "socket", socketPath)
 	if err := srv.Serve(ln); err != nil {
 		log.Error("serve", "err", err)
@@ -138,7 +151,7 @@ func main() {
 func (a *Agent) auth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-		if len(got) != len(a.token) || subtle.ConstantTimeCompare([]byte(got), []byte(a.token)) != 1 {
+		if got == "" || len(got) != len(a.token) || subtle.ConstantTimeCompare([]byte(got), []byte(a.token)) != 1 {
 			writeResp(w, http.StatusUnauthorized, agentproto.Response{Error: "unauthorized"})
 			return
 		}
@@ -224,6 +237,9 @@ func (a *Agent) execute(w http.ResponseWriter, r *http.Request) {
 		a.log.Warn("operation failed", "op", req.Op, "site", req.Site.SiteID, "err", resp.Error)
 		writeResp(w, 200, *resp) // operational failures are data, not transport errors
 		return
+	}
+	if resp == nil {
+		resp = &agentproto.Response{OK: true}
 	}
 	writeResp(w, 200, *resp)
 }
@@ -378,6 +394,17 @@ func (a *Agent) discovery(ctx context.Context) (*agentproto.Response, error) {
 	return resp, nil
 }
 
+// helperSuffix returns 8 random hex characters for helper
+// container names; on a (practically impossible) rand failure it
+// falls back to a nanosecond timestamp so the name still differs.
+func helperSuffix() string {
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b[:])
+}
+
 // ---- one-shot helper containers (WP-CLI / MariaDB client) ----
 
 // runOneShot creates, runs and removes a labelled helper container attached
@@ -402,12 +429,20 @@ func (a *Agent) runOneShot(ctx context.Context, s agentproto.SiteSpec, image str
 			"EndpointsConfig": map[string]any{network: map[string]any{}},
 		},
 	}
-	name := fmt.Sprintf("own-hpanel-%s-helper-%d", s.SiteID, time.Now().Unix())
+	// The random suffix prevents a same-second name collision with
+	// a previous helper whose removal failed; cleanup runs on a
+	// FRESH context because the operation context is usually the
+	// thing that just expired when cleanup matters most.
+	name := fmt.Sprintf("own-hpanel-%s-helper-%d-%s", s.SiteID, time.Now().Unix(), helperSuffix())
 	id, err := a.docker.CreateContainer(ctx, name, cfg)
 	if err != nil {
 		return "", fmt.Errorf("creating helper container: %w", err)
 	}
-	defer func() { _ = a.docker.RemoveAny(ctx, id, true) }()
+	defer func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		_ = a.docker.RemoveAny(cleanupCtx, id, true)
+	}()
 	if err := a.docker.StartUnchecked(ctx, id); err != nil {
 		return "", err
 	}
@@ -626,8 +661,13 @@ func (a *Agent) createSite(ctx context.Context, req agentproto.Request) (*agentp
 	}
 	resp.ContainerID = containerID
 
-	// Wait briefly for Apache to accept connections (best effort).
+	// Wait for Apache to accept connections. This wait used to be
+	// cosmetic — on timeout provisioning proceeded and reported a
+	// running container anyway, so a dead container produced a
+	// "successful" create whose WP-CLI install ran against files
+	// and MariaDB alone. Now the deadline is enforced.
 	deadline := time.Now().Add(90 * time.Second)
+	ready := false
 	for time.Now().Before(deadline) {
 		info, err := a.docker.Inspect(ctx, containerID)
 		if err == nil {
@@ -635,9 +675,11 @@ func (a *Agent) createSite(ctx context.Context, req agentproto.Request) (*agentp
 				if running, _ := st["Running"].(bool); running {
 					if h, ok := st["Health"].(map[string]any); ok {
 						if hs, _ := h["Status"].(string); hs == "healthy" || hs == "" {
+							ready = true
 							break
 						}
 					} else {
+						ready = true
 						break
 					}
 				}
@@ -648,6 +690,9 @@ func (a *Agent) createSite(ctx context.Context, req agentproto.Request) (*agentp
 			return resp, ctx.Err()
 		case <-time.After(2 * time.Second):
 		}
+	}
+	if !ready {
+		return resp, fmt.Errorf("WordPress container did not become ready within 90 seconds (it may be crash-looping); check the site logs")
 	}
 	add(75, "WordPress container is running")
 
@@ -900,6 +945,20 @@ func (a *Agent) deleteSite(ctx context.Context, req agentproto.Request) (*agentp
 	} else {
 		resp.Events = append(resp.Events, agentproto.Event{Progress: 70, Message: "site database and user dropped", Level: "info"})
 	}
+	// Remove the per-site network. The shared MariaDB container is
+	// attached to every site network, so detach it first; without
+	// this step, networks and DB-container attachments accumulate
+	// forever across create/delete cycles. Best effort: a network
+	// that cannot be removed must not block the deletion itself.
+	network := websites.NetworkName(s.SiteID)
+	if exists, nerr := a.docker.NetworkExists(ctx, network); nerr == nil && exists {
+		_ = a.docker.DisconnectNetwork(ctx, network, a.db.Container)
+		if rerr := a.docker.RemoveNetwork(ctx, network); rerr != nil {
+			resp.Events = append(resp.Events, agentproto.Event{Progress: 80, Message: "could not remove the site network " + network + " (" + trimOut(rerr.Error()) + "); it may still have endpoints attached", Level: "warn"})
+		} else {
+			resp.Events = append(resp.Events, agentproto.Event{Progress: 80, Message: "site network removed", Level: "info"})
+		}
+	}
 	// Remove only this site's directory (derived from the validated site id).
 	siteDir, err := a.siteDirFor(s)
 	if err != nil {
@@ -1013,11 +1072,62 @@ func (a *Agent) restoreSite(ctx context.Context, req agentproto.Request) (*agent
 	if err != nil {
 		return resp, fmt.Errorf("extracting backup: %w", err)
 	}
-	// Restore files into the site data dir.
+	// Restore files by SWAPPING the data directory, not by
+	// overlaying the backup on top: an overlay leaves files that
+	// were created after the backup in place, so the "restored"
+	// site is not the backup. The container is stopped first
+	// (its bind mount follows the old directory's inode), the old
+	// tree is kept aside until the whole restore succeeds, and
+	// any failure rolls the original tree back untouched.
 	filesDir := filepath.Join(stage, "files")
+	dataDir := filepath.Join(siteDir, "data")
+	asideDir := filepath.Join(siteDir, "data.pre-restore")
+	// Recover from a restore that died mid-swap: if the live data
+	// dir is missing but the set-aside tree exists, it IS the data.
+	if _, err := os.Stat(dataDir); os.IsNotExist(err) {
+		if _, err := os.Stat(asideDir); err == nil {
+			_ = os.Rename(asideDir, dataDir)
+		}
+	}
+	haveFiles := false
 	if st, err := os.Stat(filesDir); err == nil && st.IsDir() {
-		if err := copyTree(filesDir, filepath.Join(siteDir, "data")); err != nil {
+		haveFiles = true
+	}
+	var container *docker.Container
+	if c, cerr := a.resolveSiteContainer(ctx, s); cerr == nil {
+		container = c
+	}
+	rollbackFiles := func() {}
+	if haveFiles {
+		if container != nil {
+			_ = a.docker.Stop(ctx, container.ID, 15)
+		}
+		_ = os.RemoveAll(asideDir)
+		movedAside := false
+		if _, err := os.Stat(dataDir); err == nil {
+			if err := os.Rename(dataDir, asideDir); err != nil {
+				if container != nil {
+					_ = a.docker.Start(ctx, container.ID)
+				}
+				return resp, fmt.Errorf("setting the current files aside for restore: %w", err)
+			}
+			movedAside = true
+		}
+		rollbackFiles = func() {
+			_ = os.RemoveAll(dataDir)
+			if movedAside {
+				_ = os.Rename(asideDir, dataDir)
+			}
+			if container != nil {
+				_ = a.docker.Start(ctx, container.ID)
+			}
+		}
+		if err := copyTree(filesDir, dataDir); err != nil {
+			rollbackFiles()
 			return resp, err
+		}
+		if err := chownTree(dataDir, 33, 33); err != nil {
+			resp.Events = append(resp.Events, agentproto.Event{Progress: 45, Message: "could not set www-data ownership on the restored files (" + trimOut(err.Error()) + "); check the File Manager if uploads misbehave", Level: "warn"})
 		}
 		resp.Events = append(resp.Events, agentproto.Event{Progress: 50, Message: "files restored", Level: "info"})
 	}
@@ -1026,9 +1136,18 @@ func (a *Agent) restoreSite(ctx context.Context, req agentproto.Request) (*agent
 			a.db.InternalHost(), s.DBUser, s.DBName)
 		if _, err := a.runOneShot(ctx, s, "mariadb:11.4", []string{"sh", "-c", importCmd}, []string{"MYSQL_PWD=" + s.DBPassword},
 			[]string{stage + ":/stage:ro"}, websites.NetworkName(s.SiteID)); err != nil {
+			rollbackFiles()
 			return resp, fmt.Errorf("database restore failed: %w", err)
 		}
 		resp.Events = append(resp.Events, agentproto.Event{Progress: 90, Message: "database restored", Level: "info"})
+	}
+	if haveFiles {
+		_ = os.RemoveAll(asideDir)
+		if container != nil {
+			if err := a.docker.Start(ctx, container.ID); err != nil {
+				return resp, fmt.Errorf("files and database restored, but restarting the site container failed: %w", err)
+			}
+		}
 	}
 	resp.OK = true
 	resp.Events = append(resp.Events, agentproto.Event{Progress: 100, Message: "restore completed", Level: "info"})
@@ -1129,7 +1248,7 @@ func copyTree(src, dst string) error {
 
 func (a *Agent) wpcli(ctx context.Context, req agentproto.Request) (*agentproto.Response, error) {
 	s := req.Site
-	if err := security.ValidateSiteID(s.SiteID); err != nil {
+	if err := validateSiteBasic(s); err != nil {
 		return nil, err
 	}
 	// Password reset is handled specially: the new password arrives in the
@@ -1189,21 +1308,21 @@ func (a *Agent) applyConfig(ctx context.Context, req agentproto.Request) (*agent
 	if err := os.WriteFile(filepath.Join(siteDir, "compose.yaml"), []byte(req.Site.ComposeYAML), 0o640); err != nil {
 		return resp, err
 	}
-	// Recreate ONLY this site's container from the validated spec.
+	// Recreate ONLY this site's container from the validated
+	// spec. createSite deliberately REUSES an existing container
+	// (idempotent retries), so calling it alone would report
+	// success while the running container keeps the old labels,
+	// env and limits — the previous behaviour. Remove the existing
+	// container explicitly first, then let createSite build the
+	// replacement from the new spec.
+	if existing, rerr := a.resolveSiteContainer(ctx, s); rerr == nil && existing != nil {
+		_ = a.docker.Stop(ctx, existing.ID, 15)
+		if rerr := a.docker.Remove(ctx, existing.ID, false); rerr != nil {
+			return resp, fmt.Errorf("removing the previous container for recreation: %w", rerr)
+		}
+	}
 	if _, err := a.createSite(ctx, agentproto.Request{Op: agentproto.OpCreateSite, Site: s}); err != nil {
-		// createSite is idempotent and will reuse a running container; a config
-		// change that alters the container spec requires explicit recreation:
-		c, ferr := a.resolveSiteContainer(ctx, s)
-		if ferr != nil || c == nil {
-			return resp, err
-		}
-		_ = a.docker.Stop(ctx, c.ID, 15)
-		if rerr := a.docker.Remove(ctx, c.ID, false); rerr != nil {
-			return resp, rerr
-		}
-		if _, err2 := a.createSite(ctx, agentproto.Request{Op: agentproto.OpCreateSite, Site: s}); err2 != nil {
-			return resp, err2
-		}
+		return resp, err
 	}
 	// A domain change rides along in Arg (the previous domain):
 	// routing has moved to the new name, but every URL inside
@@ -1294,8 +1413,7 @@ func (a *Agent) dbSize(ctx context.Context, req agentproto.Request) (*agentproto
 	if err != nil {
 		return nil, err
 	}
-	out, err := a.mariadbExec(ctx, []string{"SELECT COALESCE(SUM(data_length+index_length),0) FROM information_schema.tables WHERE table_schema='" + s.DBName + "';"})
-	_ = q
+	out, err := a.mariadbExec(ctx, []string{q})
 	if err != nil {
 		return nil, err
 	}

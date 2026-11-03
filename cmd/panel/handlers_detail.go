@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Udhayaboopathi/hPanel-wp/internal/agentproto"
@@ -141,29 +142,42 @@ func (a *App) siteDetail(w http.ResponseWriter, r *http.Request) {
 	if len(d.Jobs) > 0 {
 		d.LatestJob = d.Jobs[0] // ListJobsForSite is newest-first
 	}
-	// Live monitoring for the simple overview: one read-only stats
-	// call to the agent (running containers only). Best effort - the
-	// page must render fine with the agent down or the site stopped.
+	// Live monitoring for the simple overview: read-only stats
+	// calls to the agent (running containers only). Best effort -
+	// the page must render fine with the agent down or the site
+	// stopped. The two calls run CONCURRENTLY: sequentially they
+	// could stack two 8-second timeouts into a ~16 s page load.
 	if d.AgentUp && site.ContainerName != "" {
-		ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
-		if resp, err := a.agent.Call(ctx, agentproto.Request{Op: agentproto.OpStats}); err == nil && resp.OK {
-			d.Live = parseSiteStats(resp.Output, site.SiteID)
-			if d.Live != nil {
-				_ = a.store.AddResourceSample("site", site.SiteID, d.Live.CPUPercent, int64(d.Live.MemUsage))
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
+			defer cancel()
+			if resp, err := a.agent.Call(ctx, agentproto.Request{Op: agentproto.OpStats}); err == nil && resp.OK {
+				if live := parseSiteStats(resp.Output, site.SiteID); live != nil {
+					d.Live = live
+					_ = a.store.AddResourceSample("site", site.SiteID, live.CPUPercent, int64(live.MemUsage))
+				}
 			}
-		}
-		cancel()
-		// Refresh the cached database size from the agent (it was
-		// previously never measured at all, so the UI showed 0
-		// forever). Best effort; persist for other views.
-		if spec, err := a.agentSpec(site, false); err == nil {
-			ctx2, cancel2 := context.WithTimeout(r.Context(), 8*time.Second)
-			if resp, err := a.agent.Call(ctx2, agentproto.Request{Op: agentproto.OpDBSize, Site: spec}); err == nil && resp.OK && resp.DBSizeBytes > 0 {
+		}()
+		go func() {
+			defer wg.Done()
+			// Refresh the cached database size from the agent (it
+			// was previously never measured at all, so the UI
+			// showed 0 forever). Best effort; persist for others.
+			spec, err := a.agentSpec(site, false)
+			if err != nil {
+				return
+			}
+			ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
+			defer cancel()
+			if resp, err := a.agent.Call(ctx, agentproto.Request{Op: agentproto.OpDBSize, Site: spec}); err == nil && resp.OK && resp.DBSizeBytes > 0 {
 				d.DBSize = resp.DBSizeBytes
 				_ = a.store.UpdateDBSize(site.SiteID, resp.DBSizeBytes)
 			}
-			cancel2()
-		}
+		}()
+		wg.Wait()
 	}
 	d.Backups, _ = a.store.ListBackups(site.SiteID, 50)
 	d.Configs, _ = a.store.ListConfigVersions(site.ID)
@@ -415,16 +429,26 @@ func (a *App) siteApplyConfig(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	// Rebuild env text from the approved env schema only.
+	// Rebuild env text from the approved env schema only. Every
+	// approved key is wired through: POST_MAX_SIZE and SITE_TITLE
+	// used to be accepted by the editor and then silently dropped
+	// here, and TablePrefix was lost entirely — applying a config
+	// to an imported site removed its WORDPRESS_TABLE_PREFIX and
+	// broke it.
 	env := map[string]string{}
 	_ = json.Unmarshal([]byte(latest.EnvJSON), &env)
 	profile, _ := configgen.ProfileFor(site.ResourceProfile, site.CPULimit, site.MemLimitMB)
+	title := site.Title
+	if v := strings.TrimSpace(env["SITE_TITLE"]); v != "" {
+		title = v
+	}
 	cs := configgen.SiteSpec{
-		SiteID: site.SiteID, Domain: site.Domain, AdminDomain: site.AdminDomain, Title: site.Title,
+		SiteID: site.SiteID, Domain: site.Domain, AdminDomain: site.AdminDomain, Title: title,
 		DBName: site.DBName, DBUser: site.DBUser, DBPassword: spec.DBPassword, DBHost: a.cfg.SiteDBHost,
 		PHPVersion: site.PHPVersion, Profile: profile, SiteDir: site.SiteDir,
 		ContainerName: site.ContainerName, Network: websites.NetworkName(site.SiteID),
-		PHPMemory: env["PHP_MEMORY_LIMIT"], UploadSize: env["UPLOAD_MAX_FILESIZE"], Debug: env["WORDPRESS_DEBUG"] == "1",
+		PHPMemory: env["PHP_MEMORY_LIMIT"], UploadSize: env["UPLOAD_MAX_FILESIZE"], PostMax: env["POST_MAX_SIZE"], Debug: env["WORDPRESS_DEBUG"] == "1",
+		TablePrefix: site.TablePrefix,
 	}
 	spec.ComposeYAML = latest.ComposeYAML
 	spec.EnvText = configgen.GenerateEnv(cs)
@@ -456,6 +480,15 @@ func (a *App) siteDBRotate(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/websites/"+site.SiteID+"?tab=db&flash=Provisioning agent is not available; password not changed.", http.StatusSeeOther)
 		return
 	}
+	// Encrypt BEFORE rotating: the old order rotated in MariaDB
+	// first and only then discovered encryption or storage
+	// failures, leaving the database with a password the panel did
+	// not hold — the site then broke on its next restart.
+	enc, err := a.box.Encrypt(newPW)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 	defer cancel()
 	resp, err := a.agent.Call(ctx, agentproto.Request{Op: agentproto.OpRotateDBPassword, Site: spec, NewDBPassword: newPW})
@@ -469,12 +502,23 @@ func (a *App) siteDBRotate(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/websites/"+site.SiteID+"?tab=db&flash="+msg, http.StatusSeeOther)
 		return
 	}
-	enc, err := a.box.Encrypt(newPW)
-	if err != nil {
-		http.Error(w, err.Error(), 500)
+	if err := a.store.UpdateWebsite(site.SiteID, map[string]any{"db_password_enc": enc}); err != nil {
+		// MariaDB has the new password but the panel could not
+		// record it. Roll the database back to the previous
+		// password (spec carries it) so panel and database agree
+		// again, and say so loudly either way.
+		rbCtx, rbCancel := context.WithTimeout(r.Context(), 60*time.Second)
+		rbResp, rbErr := a.agent.Call(rbCtx, agentproto.Request{Op: agentproto.OpRotateDBPassword, Site: spec, NewDBPassword: spec.DBPassword})
+		rbCancel()
+		if rbErr != nil || rbResp == nil || !rbResp.OK {
+			a.audit(r, "website.db_rotate_password", site.SiteID, "CRITICAL: rotation succeeded in MariaDB but storing it failed, and the rollback also failed; the panel record and the database password may differ")
+			http.Redirect(w, r, "/websites/"+site.SiteID+"?tab=db&flash=The password was rotated in MariaDB but could not be saved in the panel, and rolling it back failed too. The site may break on restart — contact support before restarting it.", http.StatusSeeOther)
+			return
+		}
+		a.audit(r, "website.db_rotate_password", site.SiteID, "rotation rolled back: storing the new password failed ("+err.Error()+")")
+		http.Redirect(w, r, "/websites/"+site.SiteID+"?tab=db&flash=The new password could not be saved in the panel, so the rotation was rolled back. The password is unchanged.", http.StatusSeeOther)
 		return
 	}
-	_ = a.store.UpdateWebsite(site.SiteID, map[string]any{"db_password_enc": enc})
 	a.audit(r, "website.db_rotate_password", site.SiteID, "database password rotated")
 	http.Redirect(w, r, "/websites/"+site.SiteID+"?tab=db&flash=Database password rotated in MariaDB. Restart the website to apply the updated credentials.", http.StatusSeeOther)
 }
@@ -535,7 +579,7 @@ func (a *App) fileSave(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.audit(r, "file.edit", site.SiteID, "path="+rel)
-	http.Redirect(w, r, "/websites/"+site.SiteID+"?tab=files&path="+filepath.Dir(rel)+"&flash=File saved.", http.StatusSeeOther)
+	http.Redirect(w, r, "/websites/"+site.SiteID+"?tab=files&path="+url.QueryEscape(filepath.Dir(rel))+"&flash=File saved.", http.StatusSeeOther)
 }
 
 func (a *App) fileUpload(w http.ResponseWriter, r *http.Request) {
@@ -586,7 +630,7 @@ func (a *App) fileUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.audit(r, "file.upload", site.SiteID, "path="+filepath.Join(dir, filepath.Base(hdr.Filename)))
-	http.Redirect(w, r, "/websites/"+site.SiteID+"?tab=files&path="+dir+"&flash=Upload complete.", http.StatusSeeOther)
+	http.Redirect(w, r, "/websites/"+site.SiteID+"?tab=files&path="+url.QueryEscape(dir)+"&flash=Upload complete.", http.StatusSeeOther)
 }
 
 func (a *App) fileMkdir(w http.ResponseWriter, r *http.Request) {
@@ -605,7 +649,7 @@ func (a *App) fileMkdir(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.audit(r, "file.mkdir", site.SiteID, "path="+r.FormValue("name"))
-	http.Redirect(w, r, "/websites/"+site.SiteID+"?tab=files&path="+r.FormValue("path"), http.StatusSeeOther)
+	http.Redirect(w, r, "/websites/"+site.SiteID+"?tab=files&path="+url.QueryEscape(r.FormValue("path")), http.StatusSeeOther)
 }
 
 func (a *App) fileRename(w http.ResponseWriter, r *http.Request) {
@@ -614,6 +658,14 @@ func (a *App) fileRename(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_ = r.ParseForm()
+	// Rename must honour the sensitive-file rule on BOTH sides:
+	// without it, renaming wp-config.php to wp-config.txt made it
+	// downloadable (database credentials included), and renaming
+	// another file OVER wp-config.php destroyed it.
+	if security.IsSensitiveFile(r.FormValue("path")) || security.IsSensitiveFile(r.FormValue("new_name")) {
+		http.Error(w, "sensitive files cannot be renamed from the panel", 403)
+		return
+	}
 	root := a.siteRoot(site)
 	from, err := security.SafeJoin(root, r.FormValue("path"))
 	if err != nil {
@@ -630,7 +682,7 @@ func (a *App) fileRename(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.audit(r, "file.rename", site.SiteID, "from="+r.FormValue("path")+" to="+r.FormValue("new_name"))
-	http.Redirect(w, r, "/websites/"+site.SiteID+"?tab=files&path="+filepath.Dir(r.FormValue("path")), http.StatusSeeOther)
+	http.Redirect(w, r, "/websites/"+site.SiteID+"?tab=files&path="+url.QueryEscape(filepath.Dir(r.FormValue("path"))), http.StatusSeeOther)
 }
 
 func (a *App) fileDelete(w http.ResponseWriter, r *http.Request) {
@@ -654,7 +706,7 @@ func (a *App) fileDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.audit(r, "file.delete", site.SiteID, "path="+rel)
-	http.Redirect(w, r, "/websites/"+site.SiteID+"?tab=files&path="+filepath.Dir(rel)+"&flash=Deleted.", http.StatusSeeOther)
+	http.Redirect(w, r, "/websites/"+site.SiteID+"?tab=files&path="+url.QueryEscape(filepath.Dir(rel))+"&flash=Deleted.", http.StatusSeeOther)
 }
 
 var _ = auth.GenerateSecurePassword

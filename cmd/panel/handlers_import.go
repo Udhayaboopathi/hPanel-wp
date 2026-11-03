@@ -71,7 +71,7 @@ func (a *App) importSubmit(w http.ResponseWriter, r *http.Request) {
 	}
 	fields["admin_password"] = r.FormValue("admin_password") // never trimmed
 	var zipPath, dbRawPath string
-	var zipSize, dbSize int64
+	var zipSize int64
 	zipPath = filepath.Join(importDir, "upload.zip")
 	fileHeaders := r.MultipartForm.File["files_zip"]
 	switch {
@@ -95,7 +95,7 @@ func (a *App) importSubmit(w http.ResponseWriter, r *http.Request) {
 		// merge the content parts into one wp-content ZIP and
 		// keep the database part aside for the normal DB flow.
 		var parts []wpimport.MergePart
-		var total int64
+		var contentTotal int64
 		kindsSeen := map[string]bool{}
 		for i, fh := range fileHeaders {
 			kind := wpimport.PartKind(fh.Filename)
@@ -109,23 +109,35 @@ func (a *App) importSubmit(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			staged := filepath.Join(importDir, fmt.Sprintf("part-%d", i))
-			n, err := streamToFile(src, staged, maxImportZipBytes)
+			// Each part streams against the REMAINING budget, not
+			// the full cap: the database part has its own 1 GB
+			// budget, and the content parts share the 2 GB budget,
+			// so the staged total can never overshoot the limits
+			// before the cumulative check gets a chance to run.
+			limit := maxImportZipBytes - contentTotal
+			if kind == "db" {
+				limit = maxImportDBBytes
+			}
+			if limit <= 0 {
+				src.Close()
+				abort("The backup parts together exceed the 2 GB limit.")
+				return
+			}
+			n, err := streamToFile(src, staged, limit)
 			src.Close()
 			if err != nil {
 				abort(err.Error())
 				return
 			}
-			total += n
-			if total > maxImportZipBytes {
-				abort("The backup parts together exceed the 2 GB limit.")
-				return
+			if kind != "db" {
+				contentTotal += n
 			}
 			if kind == "db" {
 				if dbRawPath != "" {
 					abort("Two database files were included in the backup set; keep only one.")
 					return
 				}
-				dbRawPath, dbSize = staged, n
+				dbRawPath = staged
 				continue
 			}
 			kindsSeen[kind] = true
@@ -149,9 +161,18 @@ func (a *App) importSubmit(w http.ResponseWriter, r *http.Request) {
 			_ = os.Remove(p.Path)
 		}
 	}
-	if dbFile, _, err := r.FormFile("db_file"); err == nil && dbRawPath == "" {
+	dbOverridden := false
+	if dbFile, _, err := r.FormFile("db_file"); err == nil {
+		// An explicitly uploaded database file wins over the
+		// backup set's own -db part — silently ignoring it (the old
+		// behaviour when a set was present) deployed a database the
+		// operator did not intend.
+		if dbRawPath != "" {
+			_ = os.Remove(dbRawPath)
+			dbOverridden = true
+		}
 		dbRawPath = filepath.Join(importDir, "db-raw")
-		dbSize, err = streamToFile(dbFile, dbRawPath, maxImportDBBytes)
+		_, err = streamToFile(dbFile, dbRawPath, maxImportDBBytes)
 		dbFile.Close()
 		if err != nil {
 			abort(err.Error())
@@ -247,14 +268,13 @@ func (a *App) importSubmit(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		dbRawPath = filepath.Join(importDir, "db-raw")
-		n, err := streamToFile(rc, dbRawPath, maxImportDBBytes)
+		_, err = streamToFile(rc, dbRawPath, maxImportDBBytes)
 		rc.Close()
 		if err != nil {
 			zr.Close()
 			abort(err.Error())
 			return
 		}
-		dbSize = n
 	}
 	zr.Close()
 
@@ -319,25 +339,37 @@ func (a *App) importSubmit(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Same collision and capacity discipline as a normal create.
-	if _, err := a.store.GetWebsiteByDomain(in.Domain); err == nil {
-		abort("A website with domain " + in.Domain + " already exists in the panel.")
+	// Indexed lookups in both directions (a new primary domain may
+	// not equal another site's admin alias, and vice versa) — the
+	// old first-1000-rows scans silently stopped checking at scale.
+	if _, err := a.store.FindWebsiteByDomainOrAdmin(in.Domain); err == nil {
+		abort("Domain " + in.Domain + " is already used by another website in the panel (as its domain or its admin alias).")
 		return
 	}
-	if all, _, _ := a.store.ListWebsites("", "all", 1000, 0); all != nil {
-		for _, s := range all {
-			if s.Domain == in.AdminDomain || s.AdminDomain == in.AdminDomain {
-				abort("The admin domain " + in.AdminDomain + " is already used by " + s.Domain + ". Choose a different domain.")
-				return
-			}
-			if s.AdminDomain == in.Domain {
-				abort("Domain " + in.Domain + " is already used as the admin alias of " + s.Domain + ".")
-				return
-			}
-		}
+	if _, err := a.store.FindWebsiteByDomainOrAdmin(in.AdminDomain); err == nil {
+		abort("The admin domain " + in.AdminDomain + " is already used by another website in the panel. Choose a different domain.")
+		return
 	}
-	host := monitoring.Sample("/")
-	needFree := uint64(zipSize + dbSize + (2 << 30))
-	if host.DiskTotal > 0 && host.DiskFree < needFree {
+	// Capacity check against the WEBSITES volume (not "/"), with
+	// an honest budget: staged uploads plus working headroom
+	// (10% of the payload, at least 256 MB) for the running
+	// stack. Unknown capacity fails closed — importing blind is
+	// how a full disk takes every site down.
+	host := monitoring.Sample(a.cfg.SitesDir)
+	var sqlSize int64
+	if st, err := os.Stat(dbSQLPath); err == nil {
+		sqlSize = st.Size()
+	}
+	headroom := uint64(zipSize+sqlSize) / 10
+	if headroom < 256<<20 {
+		headroom = 256 << 20
+	}
+	needFree := uint64(zipSize+sqlSize) + headroom
+	if host.DiskTotal == 0 {
+		abort("Could not determine the free disk space on the websites volume; refusing to start the import blind.")
+		return
+	}
+	if host.DiskFree < needFree {
 		abort("Not enough free disk space for this import (the upload plus working room exceeds what is free).")
 		return
 	}
@@ -347,13 +379,9 @@ func (a *App) importSubmit(w http.ResponseWriter, r *http.Request) {
 	}
 
 	dbName := websites.DBNameFor(siteID)
-	if sites, _, _ := a.store.ListWebsites("", "all", 1000, 0); sites != nil {
-		for _, s := range sites {
-			if s.DBName == dbName {
-				abort("Database name collision; please retry the import.")
-				return
-			}
-		}
+	if _, err := a.store.FindWebsiteByDBName(dbName); err == nil {
+		abort("Database name collision; please retry the import.")
+		return
 	}
 	dbUser := websites.DBUserFor(siteID)
 	dbPW, err := genDBPassword()
@@ -416,6 +444,9 @@ func (a *App) importSubmit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_ = a.store.AddEvent(job.ID, "info", fmt.Sprintf("backup analysed: database format %s, table prefix %q, source URL %s", format, prefix, orNone(sourceURL)))
+	if dbOverridden {
+		_ = a.store.AddEvent(job.ID, "info", "the separately uploaded database file was used instead of the backup set's own database part")
+	}
 	http.Redirect(w, r, "/websites/"+siteID+"?flash=Import started. Follow progress in Deployment Jobs.", http.StatusSeeOther)
 }
 

@@ -251,16 +251,18 @@ func (a *App) fetchSiteLogs(ctx context.Context, site *store.Website) (string, s
 // apiLogs serves plain-text logs for the logs page's live polling.
 func (a *App) apiLogs(w http.ResponseWriter, r *http.Request) {
 	sel := r.URL.Query().Get("site")
-	sites, _, _ := a.store.ListWebsites("", "all", 500, 0)
+	// Direct lookup: this endpoint is polled every few seconds, so
+	// scanning a 500-row website list per poll (the old behaviour)
+	// was pure waste. The list is only needed for the default
+	// (no site selected) case, and one row suffices there.
 	var site *store.Website
-	for _, s := range sites {
-		if s.SiteID == sel {
-			site = s
-			break
-		}
+	if sel != "" {
+		site, _ = a.store.GetWebsiteBySiteID(sel)
 	}
-	if site == nil && len(sites) > 0 {
-		site = sites[0]
+	if site == nil {
+		if sites, _, _ := a.store.ListWebsites("", "all", 1, 0); len(sites) > 0 {
+			site = sites[0]
+		}
 	}
 	if site == nil {
 		http.Error(w, "no websites", http.StatusNotFound)

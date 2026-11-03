@@ -4,12 +4,36 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Udhayaboopathi/hPanel-wp/internal/auth"
 	"github.com/Udhayaboopathi/hPanel-wp/internal/security"
 	"github.com/Udhayaboopathi/hPanel-wp/internal/store"
 )
+
+// dummyPasswordHash is a real Argon2id hash of a throwaway
+// password, computed once. Login verifies against it when the
+// account does not exist, so "no such user" costs the same work
+// as "wrong password" and the response time leaks nothing about
+// which accounts exist.
+var dummyPasswordHash = sync.OnceValue(func() string {
+	h, _ := auth.HashPassword("timing-equalization-dummy")
+	return h
+})
+
+// validateTOTPOnce validates a TOTP code AND consumes its
+// time-step for this admin, so a code that was used once — at
+// login or in the account page — cannot be replayed inside its
+// validity window in another session.
+func (a *App) validateTOTPOnce(admin *store.Admin, code string) bool {
+	step, ok := auth.ValidateTOTPStep(a.totpSecret(admin), code)
+	if !ok {
+		return false
+	}
+	consumed, err := a.store.ConsumeTOTPStep(admin.ID, step)
+	return err == nil && consumed
+}
 
 func (a *App) setupForm(w http.ResponseWriter, r *http.Request) {
 	if n, _ := a.store.CountAdmins(); n > 0 {
@@ -20,7 +44,17 @@ func (a *App) setupForm(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) setupSubmit(w http.ResponseWriter, r *http.Request) {
-	if n, _ := a.store.CountAdmins(); n > 0 {
+	// First-run setup is a claim, and it must be atomic within the
+	// panel process: two concurrent submissions could otherwise
+	// both observe zero admins and both create a persistent
+	// administrator account. The lock spans count-check through
+	// account creation.
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if n, err := a.store.CountAdmins(); err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	} else if n > 0 {
 		http.Error(w, "setup already completed", http.StatusForbidden)
 		return
 	}
@@ -60,10 +94,20 @@ func (a *App) setupSubmit(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	storedTOTPSecret := totpSecret
-	if enableTOTP && a.box != nil {
-		if enc, err := a.box.Encrypt(totpSecret); err == nil {
-			storedTOTPSecret = enc // the seed is displayed once below, stored encrypted
+	if enableTOTP {
+		// The seed is stored ENCRYPTED or not at all: silently
+		// falling back to a plaintext row (the old behaviour when
+		// encryption failed) contradicts the storage guarantee.
+		if a.box == nil {
+			a.render(w, "setup.html", pageData{Title: "First-run setup", Error: "Panel encryption is unavailable, so two-factor authentication cannot be set up safely. Fix the panel secrets configuration and try again."})
+			return
 		}
+		enc, err := a.box.Encrypt(totpSecret)
+		if err != nil {
+			a.render(w, "setup.html", pageData{Title: "First-run setup", Error: "Could not protect the two-factor secret: " + err.Error()})
+			return
+		}
+		storedTOTPSecret = enc // the seed is displayed once below, stored encrypted
 	}
 	id, err := a.store.CreateAdmin(username, email, hash, storedTOTPSecret, enableTOTP)
 	if err != nil {
@@ -79,7 +123,11 @@ func (a *App) setupSubmit(w http.ResponseWriter, r *http.Request) {
 		a.render(w, "setup.html", pageData{Title: "First-run setup", Error: err.Error()})
 		return
 	}
-	admin, _ := a.store.GetAdminByID(id)
+	admin, err := a.store.GetAdminByID(id)
+	if err != nil || admin == nil {
+		http.Error(w, "the administrator was created but could not be loaded; try logging in", http.StatusInternalServerError)
+		return
+	}
 	_ = a.store.AddAudit(id, "admin.setup", username, "first administrator created", clientIP(r))
 	if err := a.startSession(w, r, admin); err != nil {
 		http.Error(w, err.Error(), 500)
@@ -132,7 +180,11 @@ func (a *App) loginSubmit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	admin, err := a.store.GetAdminByLogin(username)
-	if err != nil || !auth.VerifyPassword(admin.PasswordHash, password) {
+	hash := dummyPasswordHash()
+	if err == nil && admin != nil {
+		hash = admin.PasswordHash
+	}
+	if err != nil || !auth.VerifyPassword(hash, password) {
 		_ = a.store.RecordLoginAttempt(username, ip, false)
 		_ = a.store.AddAudit(0, "auth.login_failed", username, "invalid credentials", ip)
 		a.render(w, "login.html", pageData{Title: "Login", CSRF: a.preCSRF(w, r), Error: "Invalid username or password."})
@@ -185,7 +237,7 @@ func (a *App) totpSubmit(w http.ResponseWriter, r *http.Request) {
 		a.render(w, "login.html", pageData{Title: "Login", CSRF: a.preCSRF(w, r), Error: "Too many failed attempts. Try again in 15 minutes."})
 		return
 	}
-	if !auth.ValidateTOTP(a.totpSecret(admin), r.FormValue("code")) {
+	if !a.validateTOTPOnce(admin, r.FormValue("code")) {
 		_ = a.store.RecordLoginAttempt(admin.Username, clientIP(r), false)
 		a.render(w, "totp.html", pageData{Title: "Two-factor authentication", CSRF: a.preCSRF(w, r), Error: "Invalid code. Check your authenticator app and try again."})
 		return
@@ -229,8 +281,18 @@ func (a *App) recoverSubmit(w http.ResponseWriter, r *http.Request) {
 	}
 	// Recovery sign-in also disables TOTP until the admin re-enables it, and
 	// kills every existing session - the safe response to a lost device.
-	_ = a.store.UpdateAdminTOTP(admin.ID, "", false)
-	_ = a.store.DeleteAllSessions(admin.ID)
+	// Both steps are checked: proceeding (and auditing that they
+	// happened) when either failed would leave a supposedly
+	// recovered account still protected by the lost second factor
+	// or still signed in elsewhere.
+	if err := a.store.UpdateAdminTOTP(admin.ID, "", false); err != nil {
+		a.render(w, "recover.html", pageData{Title: "Account recovery", CSRF: a.preCSRF(w, r), Error: "Recovery could not complete: two-factor authentication could not be disabled. Please try again."})
+		return
+	}
+	if err := a.store.DeleteAllSessions(admin.ID); err != nil {
+		a.render(w, "recover.html", pageData{Title: "Account recovery", CSRF: a.preCSRF(w, r), Error: "Recovery could not complete: existing sessions could not be revoked. Please try again."})
+		return
+	}
 	_ = a.store.AddAudit(admin.ID, "auth.recovery_used", username, "recovery code used; TOTP disabled; all sessions revoked", clientIP(r))
 	if err := a.startSession(w, r, admin); err != nil {
 		http.Error(w, err.Error(), 500)

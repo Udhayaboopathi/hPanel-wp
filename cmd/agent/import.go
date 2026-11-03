@@ -68,6 +68,13 @@ func (a *Agent) importSite(ctx context.Context, req agentproto.Request) (*agentp
 	// default install whose tables step 3 replaces wholesale).
 	createReq := req
 	createReq.Op = agentproto.OpCreateSite
+	// An import supplies WordPress itself (files + database from
+	// the backup), so the fresh-create admin-password gate does not
+	// apply: when the operator kept the backup's original admin the
+	// password is legitimately empty. RepairMode expresses exactly
+	// that; the post-import finalize still ensures the form's admin
+	// account when one was supplied.
+	createReq.RepairMode = true
 	createResp, createErr := a.createSite(ctx, createReq)
 	for _, ev := range createResp.Events {
 		p := 5 + ev.Progress*45/100
@@ -123,24 +130,25 @@ func (a *Agent) importSite(ctx context.Context, req agentproto.Request) (*agentp
 	}
 	add(70, "wp-content installed (plugins, themes, uploads, mu-plugins)")
 
-	// 3. Database: empty the fresh database, then import the dump.
+	// 3. Database: import the dump into a SCRATCH database first
+	// and swap its tables in only on success. Dropping the fresh
+	// database's tables first (the old flow) meant a corrupt or
+	// truncated dump left the site with an empty database; now
+	// the fresh install survives any failed import untouched.
 	if err := security.ValidateDBName(s.DBName); err != nil {
 		return resp, err
 	}
-	drop := []string{
-		"SET FOREIGN_KEY_CHECKS=0",
-		"SET SESSION group_concat_max_len = 1000000",
-		"SET @t := (SELECT GROUP_CONCAT(CONCAT('`', table_name, '`')) FROM information_schema.tables WHERE table_schema = '" + s.DBName + "' AND table_type = 'BASE TABLE')",
-		"SET @s := IF(@t IS NULL, 'SELECT 1', CONCAT('DROP TABLE IF EXISTS ', @t))",
-		"PREPARE st FROM @s",
-		"EXECUTE st",
-		"DEALLOCATE PREPARE st",
-		"SET FOREIGN_KEY_CHECKS=1",
+	scratch := s.DBName + "_import"
+	if err := security.ValidateDBName(scratch); err != nil {
+		return resp, err
 	}
-	if _, err := a.mariadbExec(ctx, drop); err != nil {
-		return resp, fmt.Errorf("emptying the fresh database before import: %w", err)
+	if _, err := a.mariadbExec(ctx, []string{
+		"DROP DATABASE IF EXISTS `" + scratch + "`",
+		"CREATE DATABASE `" + scratch + "`",
+	}); err != nil {
+		return resp, fmt.Errorf("preparing the import database: %w", err)
 	}
-	add(76, "fresh database emptied; importing the uploaded dump")
+	add(76, "importing the uploaded dump into a scratch database")
 	stage := filepath.Join(importDir, "stage")
 	if err := os.MkdirAll(stage, 0o750); err != nil {
 		return resp, err
@@ -149,10 +157,30 @@ func (a *Agent) importSite(ctx context.Context, req agentproto.Request) (*agentp
 		return resp, err
 	}
 	network := websites.NetworkName(s.SiteID)
-	importCmd := fmt.Sprintf("mariadb -h %s -u %s %s < /stage/db.sql", a.db.InternalHost(), effDBUser, s.DBName)
+	importCmd := fmt.Sprintf("mariadb -h %s -u %s %s < /stage/db.sql", a.db.InternalHost(), a.db.AdminUser, scratch)
 	if _, err := a.runOneShot(ctx, s, "mariadb:11.4", []string{"sh", "-c", importCmd},
-		[]string{"MYSQL_PWD=" + effDBPassword}, []string{stage + ":/stage:ro"}, network); err != nil {
-		return resp, fmt.Errorf("database import failed: %w", err)
+		[]string{"MYSQL_PWD=" + a.db.AdminPassword}, []string{stage + ":/stage:ro"}, network); err != nil {
+		_, _ = a.mariadbExec(ctx, []string{"DROP DATABASE IF EXISTS `" + scratch + "`"})
+		return resp, fmt.Errorf("database import failed (the site's database was left untouched): %w", err)
+	}
+	swap := []string{
+		"SET FOREIGN_KEY_CHECKS=0",
+		"SET SESSION group_concat_max_len = 1000000",
+		"SET @t := (SELECT GROUP_CONCAT(CONCAT('`', table_name, '`')) FROM information_schema.tables WHERE table_schema = '" + s.DBName + "' AND table_type = 'BASE TABLE')",
+		"SET @s := IF(@t IS NULL, 'SELECT 1', CONCAT('DROP TABLE IF EXISTS ', @t))",
+		"PREPARE st FROM @s",
+		"EXECUTE st",
+		"DEALLOCATE PREPARE st",
+		"SET @p := (SELECT GROUP_CONCAT(CONCAT('`" + scratch + "`.`', table_name, '` TO `" + s.DBName + "`.`', table_name, '`')) FROM information_schema.tables WHERE table_schema = '" + scratch + "' AND table_type = 'BASE TABLE')",
+		"SET @r := IF(@p IS NULL, 'SELECT 1', CONCAT('RENAME TABLE ', @p))",
+		"PREPARE st2 FROM @r",
+		"EXECUTE st2",
+		"DEALLOCATE PREPARE st2",
+		"DROP DATABASE `" + scratch + "`",
+		"SET FOREIGN_KEY_CHECKS=1",
+	}
+	if _, err := a.mariadbExec(ctx, swap); err != nil {
+		return resp, fmt.Errorf("moving the imported tables into the site database: %w", err)
 	}
 	add(88, "database imported")
 
@@ -173,8 +201,15 @@ func (a *Agent) importSite(ctx context.Context, req agentproto.Request) (*agentp
 			add(92, "domain rewritten throughout the imported content: "+req.ImportSourceURL+" -> "+newURL)
 		}
 	}
-	_ = runWP([]string{"wp", "option", "update", "siteurl", newURL, "--allow-root"})
-	_ = runWP([]string{"wp", "option", "update", "home", newURL, "--allow-root"})
+	// siteurl/home are the site's canonical address: if they
+	// cannot be set the site is broken at its new domain, so a
+	// failure here fails the import instead of being discarded.
+	if err := runWP([]string{"wp", "option", "update", "siteurl", newURL, "--allow-root"}); err != nil {
+		return resp, fmt.Errorf("setting the site URL after import: %w", err)
+	}
+	if err := runWP([]string{"wp", "option", "update", "home", newURL, "--allow-root"}); err != nil {
+		return resp, fmt.Errorf("setting the home URL after import: %w", err)
+	}
 	if s.AdminUser != "" && s.AdminPassword != "" {
 		createArgs := []string{"wp", "user", "create", s.AdminUser, s.AdminEmail,
 			"--role=administrator", "--user_pass=" + s.AdminPassword, "--allow-root"}
