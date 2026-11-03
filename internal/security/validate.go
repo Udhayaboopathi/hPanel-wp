@@ -117,13 +117,18 @@ func ValidateSiteID(id string) error {
 	return nil
 }
 
+// emailLocalRe is the RFC 5322 atext set for the local part. The
+// local part used to go unchecked entirely, so values with spaces
+// or control characters passed as long as the domain validated.
+var emailLocalRe = regexp.MustCompile(`^[A-Za-z0-9.!#$%&'*+/=?^_` + "`" + `{|}~-]{1,64}$`)
+
 func ValidateEmail(e string) error {
 	e = strings.TrimSpace(e)
 	if len(e) < 5 || len(e) > 254 || !strings.Contains(e, "@") {
 		return fmt.Errorf("invalid email address")
 	}
 	parts := strings.Split(e, "@")
-	if len(parts) != 2 || parts[0] == "" {
+	if len(parts) != 2 || !emailLocalRe.MatchString(parts[0]) {
 		return fmt.Errorf("invalid email address")
 	}
 	return ValidateDomain(parts[1])

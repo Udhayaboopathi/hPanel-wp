@@ -2,6 +2,7 @@ package configgen
 
 import (
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 
@@ -36,7 +37,10 @@ func ProfileFor(name string, cpu float64, memMB int) (Profile, error) {
 }
 
 func ValidateResources(cpu float64, memMB int) error {
-	if cpu <= 0 || cpu > 4 {
+	// NaN fails every comparison below and would otherwise sail
+	// through into a generated "NaN" CPU value; the stated
+	// minimum is 0.1, not "anything above zero".
+	if math.IsNaN(cpu) || math.IsInf(cpu, 0) || cpu < 0.1 || cpu > 4 {
 		return fmt.Errorf("cpu limit must be between 0.1 and 4")
 	}
 	if memMB < 256 || memMB > 4096 {
@@ -77,7 +81,13 @@ type SiteSpec struct {
 	Network       string // per-site network
 	PHPMemory     string
 	UploadSize    string
-	Debug         bool
+	// PostMax is the PHP post_max_size; empty means "same as
+	// UploadSize" (the historical behaviour). The env editor
+	// exposes POST_MAX_SIZE separately, so it needs its own field —
+	// without one the editor's value was saved and silently
+	// ignored on apply.
+	PostMax string
+	Debug   bool
 	// TablePrefix is the WordPress table prefix for the site ("" or
 	// "wp_" = default). Set for imported sites whose database dump
 	// uses a custom prefix; emitted as WORDPRESS_TABLE_PREFIX.
@@ -133,6 +143,10 @@ func EnvMap(s SiteSpec) map[string]string {
 	if upload == "" {
 		upload = "64M"
 	}
+	postMax := s.PostMax
+	if postMax == "" {
+		postMax = upload
+	}
 	m := map[string]string{
 		"WORDPRESS_DB_HOST":     s.DBHost,
 		"WORDPRESS_DB_NAME":     s.DBName,
@@ -141,7 +155,7 @@ func EnvMap(s SiteSpec) map[string]string {
 		"WORDPRESS_DEBUG":       debug,
 		"PHP_MEMORY_LIMIT":      phpMem,
 		"UPLOAD_MAX_FILESIZE":   upload,
-		"POST_MAX_SIZE":         upload,
+		"POST_MAX_SIZE":         postMax,
 		"SITE_DOMAIN":           s.Domain,
 		"SITE_TITLE":            s.Title,
 	}
@@ -256,9 +270,14 @@ networks:
 }
 
 // DNSRecords returns the manual Cloudflare records for a domain.
+// The names are the site's actual fully-qualified domains: the
+// previous "@"/"wpadmin" pair was only correct for an apex domain
+// whose admin alias is exactly wpadmin.<apex> — for a subdomain
+// site (cloud.example.com) it instructed records for the wrong
+// names entirely.
 func DNSRecords(domain, serverIP string) [][3]string {
 	return [][3]string{
-		{"A", "@", serverIP},
-		{"A", "wpadmin", serverIP},
+		{"A", domain, serverIP},
+		{"A", "wpadmin." + domain, serverIP},
 	}
 }

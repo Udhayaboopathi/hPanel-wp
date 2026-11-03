@@ -51,7 +51,7 @@ func TestMigrationsCreateSameTables(t *testing.T) {
 // Column names for shared tables must also match, because every query in
 // store.go runs unchanged against both drivers.
 func TestMigrationColumnsMatchForCoreTables(t *testing.T) {
-	for _, table := range []string{"websites", "jobs", "administrators", "system_settings"} {
+	for _, table := range []string{"administrators", "recovery_codes", "sessions", "login_attempts", "websites", "website_domains", "website_configurations", "website_databases", "deployments", "deployment_events", "jobs", "backups", "ssl_checks", "resource_samples", "audit_logs", "system_settings"} {
 		liteCols := columnsOf(t, migration001, table)
 		myCols := columnsOf(t, migration001MySQL, table)
 		if strings.Join(liteCols, ",") != strings.Join(myCols, ",") {
@@ -76,12 +76,60 @@ func columnsOf(t *testing.T, sqlText, table string) []string {
 		first := strings.Fields(strings.TrimSuffix(ln, ","))[0]
 		first = strings.Trim(first, "`")
 		upper := strings.ToUpper(first)
-		if upper == "UNIQUE" || upper == "PRIMARY" || upper == "REFERENCES" || upper == "CONSTRAINT" {
+		if upper == "UNIQUE" || upper == "PRIMARY" || upper == "REFERENCES" || upper == "CONSTRAINT" || upper == "FOREIGN" || upper == "KEY" || upper == "INDEX" {
 			continue
 		}
 		cols = append(cols, first)
 	}
 	return cols
+}
+
+var defaultRe = regexp.MustCompile(`(?i)\bDEFAULT\s+('[^']*'|[^\s,)]+)`)
+
+// Column DEFAULTs must match across dialects too: a NOT NULL column
+// that has a default in SQLite but none in MariaDB is a strict-mode
+// insert failure waiting for the first insert that omits the column
+// (the same dialect-divergence family as the 2026-10-31 outage).
+func TestMigrationDefaultsMatch(t *testing.T) {
+	for _, table := range []string{"administrators", "recovery_codes", "sessions", "login_attempts", "websites", "website_domains", "website_configurations", "website_databases", "deployments", "deployment_events", "jobs", "backups", "ssl_checks", "resource_samples", "audit_logs", "system_settings"} {
+		lite := defaultsOf(t, migration001, table)
+		my := defaultsOf(t, migration001MySQL, table)
+		for col, dv := range lite {
+			if my[col] != dv {
+				t.Errorf("table %s column %s: sqlite DEFAULT %s, mysql DEFAULT %s", table, col, dv, my[col])
+			}
+		}
+		for col, dv := range my {
+			if lite[col] != dv {
+				t.Errorf("table %s column %s: mysql DEFAULT %s, sqlite DEFAULT %s", table, col, dv, lite[col])
+			}
+		}
+	}
+}
+
+func defaultsOf(t *testing.T, sqlText, table string) map[string]string {
+	t.Helper()
+	re := regexp.MustCompile(`(?is)CREATE TABLE IF NOT EXISTS ` + "`?" + table + "`?" + `\((.*?)\n\);`)
+	m := re.FindStringSubmatch(sqlText)
+	if m == nil {
+		t.Fatalf("table %s not found", table)
+	}
+	out := map[string]string{}
+	for _, ln := range strings.Split(m[1], "\n") {
+		ln = strings.TrimSpace(ln)
+		if ln == "" {
+			continue
+		}
+		first := strings.Trim(strings.Fields(strings.TrimSuffix(ln, ","))[0], "`")
+		switch strings.ToUpper(first) {
+		case "UNIQUE", "PRIMARY", "REFERENCES", "CONSTRAINT", "FOREIGN", "KEY", "INDEX":
+			continue
+		}
+		if dm := defaultRe.FindStringSubmatch(ln); dm != nil {
+			out[first] = dm[1]
+		}
+	}
+	return out
 }
 
 func TestSplitStatements(t *testing.T) {

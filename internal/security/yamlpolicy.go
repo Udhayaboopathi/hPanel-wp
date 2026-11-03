@@ -54,6 +54,19 @@ type composeService struct {
 	SecurityOpt []string          `yaml:"security_opt"`
 	Container   string            `yaml:"container_name"`
 	Networks    any               `yaml:"networks"`
+	// Dangerous settings the decoder previously did not model at
+	// all (KnownFields is off), so Compose honoured them while the
+	// policy never saw them. They are modelled now so the checks
+	// below can reject them. Generated site files use none of them.
+	VolumesFrom       []string          `yaml:"volumes_from"`
+	DeviceCgroupRules []string          `yaml:"device_cgroup_rules"`
+	User              string            `yaml:"user"`
+	Entrypoint        any               `yaml:"entrypoint"`
+	Command           any               `yaml:"command"`
+	Runtime           string            `yaml:"runtime"`
+	Sysctls           map[string]string `yaml:"sysctls"`
+	GroupAdd          []string          `yaml:"group_add"`
+	LabelFile         any               `yaml:"label_file"`
 }
 
 // AllowedCapAdd is the tiny capability allowlist.
@@ -140,6 +153,15 @@ func ValidateComposePolicy(yamlText, siteDir string, allowedHosts ...string) err
 		}
 		if len(svc.Devices) > 0 {
 			return fmt.Errorf("service %s: devices are forbidden", name)
+		}
+		if len(svc.VolumesFrom) > 0 {
+			return fmt.Errorf("service %s: volumes_from is forbidden (it can attach another container's volumes, including the database's)", name)
+		}
+		if len(svc.DeviceCgroupRules) > 0 || len(svc.GroupAdd) > 0 || len(svc.Sysctls) > 0 {
+			return fmt.Errorf("service %s: device_cgroup_rules, group_add and sysctls are forbidden", name)
+		}
+		if svc.User != "" || svc.Entrypoint != nil || svc.Command != nil || svc.Runtime != "" || svc.LabelFile != nil {
+			return fmt.Errorf("service %s: user, entrypoint, command, runtime and label_file overrides are forbidden; the approved image's own entrypoint runs as-is", name)
 		}
 		if len(svc.Ports) > 0 {
 			return fmt.Errorf("service %s: published ports are forbidden; Traefik routes traffic", name)

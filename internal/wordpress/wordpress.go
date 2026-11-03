@@ -65,7 +65,11 @@ func InstallArgs(url, title, adminUser, adminPassword, adminEmail string) []stri
 }
 
 func ResetPasswordArgs(user, newPassword string) []string {
-	return []string{"wp", "user", "reset-password", user, "--new-pass=" + newPassword, "--skip-email", "--allow-root"}
+	// `wp user reset-password` has no --new-pass option (it
+	// generates a random password), so the previous form of this
+	// command failed every time the panel tried to reset an admin
+	// password. Setting a chosen password is `wp user update`.
+	return []string{"wp", "user", "update", user, "--user_pass=" + newPassword, "--skip-email", "--allow-root"}
 }
 
 // SearchReplaceArgs is serialization-safe URL replacement for migrations.

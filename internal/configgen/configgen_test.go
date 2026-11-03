@@ -83,7 +83,7 @@ func TestProfilesAndResourceValidation(t *testing.T) {
 
 func TestDNSRecords(t *testing.T) {
 	recs := DNSRecords("example.com", "130.210.42.20")
-	if len(recs) != 2 || recs[0] != [3]string{"A", "@", "130.210.42.20"} || recs[1] != [3]string{"A", "wpadmin", "130.210.42.20"} {
+	if len(recs) != 2 || recs[0] != [3]string{"A", "example.com", "130.210.42.20"} || recs[1] != [3]string{"A", "wpadmin.example.com", "130.210.42.20"} {
 		t.Errorf("unexpected DNS records: %v", recs)
 	}
 }

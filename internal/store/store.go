@@ -109,8 +109,38 @@ func ensureTablePrefixColumn(db *sql.DB, driver string) error {
 	return nil
 }
 
+// ensureTOTPColumn applies migration 003 (administrators.
+// totp_last_step, the replay-protection counter for TOTP codes)
+// with the same probe-first idempotency as migration 002.
+func ensureTOTPColumn(db *sql.DB, driver string) error {
+	var n int
+	var err error
+	if driver == "mysql" {
+		err = db.QueryRow(`SELECT COUNT(*) FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name='administrators' AND column_name='totp_last_step'`).Scan(&n)
+	} else {
+		err = db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('administrators') WHERE name='totp_last_step'`).Scan(&n)
+	}
+	if err != nil {
+		return fmt.Errorf("checking totp_last_step column: %w", err)
+	}
+	if n > 0 {
+		return nil
+	}
+	ddl := `ALTER TABLE administrators ADD COLUMN totp_last_step INTEGER NOT NULL DEFAULT 0`
+	if driver == "mysql" {
+		ddl = "ALTER TABLE administrators ADD COLUMN totp_last_step BIGINT NOT NULL DEFAULT 0"
+	}
+	if _, err := db.Exec(ddl); err != nil {
+		return fmt.Errorf("migration 003 (totp_last_step): %w", err)
+	}
+	return nil
+}
+
 func finishOpen(db *sql.DB, driver string) (*Store, error) {
 	if err := ensureTablePrefixColumn(db, driver); err != nil {
+		return nil, err
+	}
+	if err := ensureTOTPColumn(db, driver); err != nil {
 		return nil, err
 	}
 	s := &Store{DB: db, driver: driver}
@@ -153,7 +183,12 @@ func OpenDriver(driver, target string) (*Store, error) {
 // password contains characters that are ambiguous in a DSN (notably '@',
 // '/' or '?'), supply a complete PANEL_STORE_DSN instead.
 func BuildMySQLDSN(host string, port int, dbName, user, password string) string {
-	return fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?charset=utf8mb4&parseTime=false&multiStatements=true&timeout=10s&readTimeout=30s&writeTimeout=30s",
+	// Deliberately NO multiStatements: migrations are executed
+	// statement-by-statement via SplitStatements, so the runtime
+	// connection never needs stacked queries — and without the
+	// flag, any future injection anywhere in the panel cannot
+	// escalate into a stacked-query injection.
+	return fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?charset=utf8mb4&parseTime=false&timeout=10s&readTimeout=30s&writeTimeout=30s",
 		user, password, host, port, dbName)
 }
 
@@ -246,7 +281,29 @@ func (s *Store) GetAdminByUsername(u string) (*Admin, error) {
 // username locked out a valid admin with a misleading
 // "invalid credentials" error (production report, 2026-11-02).
 func (s *Store) GetAdminByLogin(login string) (*Admin, error) {
-	return scanAdmin(s.DB.QueryRow(`SELECT `+adminCols+` FROM administrators WHERE username=? OR email=?`, login, login))
+	// An exact username match wins; email is only a fallback. A
+	// single OR query could return the WRONG account when one
+	// admin's username equals another admin's email, and the
+	// password would then be checked against that other account.
+	if a, err := s.GetAdminByUsername(login); err == nil {
+		return a, nil
+	}
+	return scanAdmin(s.DB.QueryRow(`SELECT `+adminCols+` FROM administrators WHERE email=?`, login))
+}
+
+// ConsumeTOTPStep atomically records a TOTP time-step as used for
+// the admin and reports whether it was fresh. TOTP codes stay
+// valid for their whole window (~90 s with skew); without this,
+// one observed code can be replayed in another session until it
+// expires. The conditional UPDATE makes check-and-consume a
+// single atomic step on both store backends.
+func (s *Store) ConsumeTOTPStep(adminID, step int64) (bool, error) {
+	res, err := s.DB.Exec(`UPDATE administrators SET totp_last_step=? WHERE id=? AND totp_last_step<?`, step, adminID, step)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n == 1, err
 }
 func (s *Store) GetAdminByID(id int64) (*Admin, error) {
 	return scanAdmin(s.DB.QueryRow(`SELECT `+adminCols+` FROM administrators WHERE id=?`, id))
@@ -381,7 +438,16 @@ func (s *Store) CreateWebsite(w *Website) (int64, error) {
 	if w.TablePrefix == "" {
 		w.TablePrefix = "wp_"
 	}
-	res, err := s.DB.Exec(`INSERT INTO websites(site_id,name,domain,admin_domain,title,status,php_version,wp_version,resource_profile,cpu_limit,mem_limit_mb,container_name,container_id,db_name,db_user,db_password_enc,table_prefix,admin_username,admin_email,site_dir,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+	// All four inserts are ONE transaction: previously a failure
+	// after the websites insert left a live row whose domain was
+	// burned by the UNIQUE constraint while its domain/database
+	// records were missing.
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	res, err := tx.Exec(`INSERT INTO websites(site_id,name,domain,admin_domain,title,status,php_version,wp_version,resource_profile,cpu_limit,mem_limit_mb,container_name,container_id,db_name,db_user,db_password_enc,table_prefix,admin_username,admin_email,site_dir,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		w.SiteID, w.Name, w.Domain, w.AdminDomain, w.Title, w.Status, w.PHPVersion, w.WPVersion, w.ResourceProfile, w.CPULimit, w.MemLimitMB, w.ContainerName, w.ContainerID, w.DBName, w.DBUser, w.DBPasswordEnc, w.TablePrefix, w.AdminUsername, w.AdminEmail, w.SiteDir, now, now)
 	if err != nil {
 		return 0, err
@@ -393,16 +459,19 @@ func (s *Store) CreateWebsite(w *Website) (int64, error) {
 	// let two sites publish Traefik routers for the same host - the
 	// panel validates collisions before this point, and any remaining
 	// failure must surface instead of corrupting state quietly).
-	if _, err := s.DB.Exec(`INSERT INTO website_domains(website_id,domain,kind,created_at) VALUES(?,?, 'primary', ?)`, id, w.Domain, now); err != nil {
+	if _, err := tx.Exec(`INSERT INTO website_domains(website_id,domain,kind,created_at) VALUES(?,?, 'primary', ?)`, id, w.Domain, now); err != nil {
 		return 0, fmt.Errorf("recording primary domain: %w", err)
 	}
 	if w.AdminDomain != "" {
-		if _, err := s.DB.Exec(`INSERT INTO website_domains(website_id,domain,kind,created_at) VALUES(?,?, 'admin', ?)`, id, w.AdminDomain, now); err != nil {
+		if _, err := tx.Exec(`INSERT INTO website_domains(website_id,domain,kind,created_at) VALUES(?,?, 'admin', ?)`, id, w.AdminDomain, now); err != nil {
 			return 0, fmt.Errorf("recording admin domain: %w", err)
 		}
 	}
-	if _, err := s.DB.Exec(`INSERT INTO website_databases(website_id,db_name,db_user) VALUES(?,?,?)`, id, w.DBName, w.DBUser); err != nil {
+	if _, err := tx.Exec(`INSERT INTO website_databases(website_id,db_name,db_user) VALUES(?,?,?)`, id, w.DBName, w.DBUser); err != nil {
 		return 0, fmt.Errorf("recording website database: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
 	}
 	return id, nil
 }
@@ -414,14 +483,30 @@ func (s *Store) GetWebsiteByDomain(d string) (*Website, error) {
 	return scanSite(s.DB.QueryRow(`SELECT `+siteCols+` FROM websites WHERE domain=?`, d))
 }
 
+// ListWebsitesOrdered is ListWebsites with the sort applied in
+// SQL, BEFORE pagination. (Sorting in the handler after LIMIT —
+// the old approach — ordered only the current page, so page 2 of
+// a domain sort was not actually sorted.) orderBy is whitelisted,
+// never interpolated from request input.
+func (s *Store) ListWebsitesOrdered(search, status string, limit, offset int, orderBy string) ([]*Website, int, error) {
+	return s.listWebsites(search, status, limit, offset, orderBy)
+}
+
 func (s *Store) ListWebsites(search, status string, limit, offset int) ([]*Website, int, error) {
+	return s.listWebsites(search, status, limit, offset, "")
+}
+
+func (s *Store) listWebsites(search, status string, limit, offset int, orderBy string) ([]*Website, int, error) {
 	q := `SELECT ` + siteCols + ` FROM websites WHERE 1=1`
 	cq := `SELECT COUNT(*) FROM websites WHERE 1=1`
 	var args []any
 	if search != "" {
-		q += ` AND (domain LIKE ? OR name LIKE ? OR site_id LIKE ?)`
-		cq += ` AND (domain LIKE ? OR name LIKE ? OR site_id LIKE ?)`
-		like := "%" + search + "%"
+		// Escape LIKE wildcards in the operator's text: a bare %
+		// or _ must match literally, not act as a pattern.
+		esc := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(search)
+		q += ` AND (domain LIKE ? ESCAPE '\' OR name LIKE ? ESCAPE '\' OR site_id LIKE ? ESCAPE '\')`
+		cq += ` AND (domain LIKE ? ESCAPE '\' OR name LIKE ? ESCAPE '\' OR site_id LIKE ? ESCAPE '\')`
+		like := "%" + esc + "%"
 		args = append(args, like, like, like)
 	}
 	if status != "" && status != "all" {
@@ -436,7 +521,11 @@ func (s *Store) ListWebsites(search, status string, limit, offset int) ([]*Websi
 	if limit <= 0 {
 		limit = 20
 	}
-	q += ` ORDER BY id DESC LIMIT ? OFFSET ?`
+	if orderBy == "domain" {
+		q += ` ORDER BY domain ASC, id DESC LIMIT ? OFFSET ?`
+	} else {
+		q += ` ORDER BY id DESC LIMIT ? OFFSET ?`
+	}
 	rows, err := s.DB.Query(q, append(args, limit, offset)...)
 	if err != nil {
 		return nil, 0, err
@@ -499,8 +588,84 @@ func (s *Store) DeleteWebsite(siteID string) error {
 	if err != nil {
 		return err
 	}
-	_, err = s.DB.Exec(`DELETE FROM websites WHERE id=?`, w.ID)
-	return err
+	// Child rows are deleted EXPLICITLY, in one transaction. The
+	// schema declares ON DELETE CASCADE, but on MariaDB/MySQL the
+	// foreign keys were written as column-level REFERENCES, which
+	// those servers parse and IGNORE — relying on the cascade left
+	// orphaned rows behind, including the website_domains row whose
+	// UNIQUE constraint then burned the deleted site's domain
+	// forever. History tables (jobs, backups, deployments) keep
+	// their rows with website_id nulled, mirroring ON DELETE SET
+	// NULL, so the audit trail survives the site.
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, stmt := range []string{
+		`DELETE FROM website_domains WHERE website_id=?`,
+		`DELETE FROM website_configurations WHERE website_id=?`,
+		`DELETE FROM website_databases WHERE website_id=?`,
+		`DELETE FROM ssl_checks WHERE website_id=?`,
+		`UPDATE deployments SET website_id=NULL WHERE website_id=?`,
+		`UPDATE jobs SET website_id=NULL WHERE website_id=?`,
+		`UPDATE backups SET website_id=NULL WHERE website_id=?`,
+	} {
+		if _, err := tx.Exec(stmt, w.ID); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec(`DELETE FROM websites WHERE id=?`, w.ID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// ChangeWebsiteDomain moves a site to a new primary domain,
+// keeping the website_domains registry in step with the websites
+// row in one transaction. (Change-domain previously updated only
+// the websites row: the registry kept the OLD domain reserved and
+// never recorded the new one.)
+func (s *Store) ChangeWebsiteDomain(siteID, newDomain, newAdminDomain string) error {
+	w, err := s.GetWebsiteBySiteID(siteID)
+	if err != nil {
+		return err
+	}
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`UPDATE websites SET domain=?, admin_domain=?, updated_at=? WHERE id=?`, newDomain, newAdminDomain, Now(), w.ID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM website_domains WHERE website_id=?`, w.ID); err != nil {
+		return err
+	}
+	now := Now()
+	if _, err := tx.Exec(`INSERT INTO website_domains(website_id,domain,kind,created_at) VALUES(?,?, 'primary', ?)`, w.ID, newDomain, now); err != nil {
+		return fmt.Errorf("recording primary domain: %w", err)
+	}
+	if newAdminDomain != "" {
+		if _, err := tx.Exec(`INSERT INTO website_domains(website_id,domain,kind,created_at) VALUES(?,?, 'admin', ?)`, w.ID, newAdminDomain, now); err != nil {
+			return fmt.Errorf("recording admin domain: %w", err)
+		}
+	}
+	return tx.Commit()
+}
+
+// FindWebsiteByDomainOrAdmin returns the site that uses the given
+// name as its primary OR admin domain, if any. Collision checks
+// must consider both directions: a new primary domain may not
+// equal another site's admin alias, and vice versa.
+func (s *Store) FindWebsiteByDomainOrAdmin(d string) (*Website, error) {
+	return scanSite(s.DB.QueryRow(`SELECT `+siteCols+` FROM websites WHERE domain=? OR admin_domain=?`, d, d))
+}
+
+// FindWebsiteByDBName returns the site owning a database name, if
+// any (an indexed lookup, replacing first-N-rows scans).
+func (s *Store) FindWebsiteByDBName(dbName string) (*Website, error) {
+	return scanSite(s.DB.QueryRow(`SELECT `+siteCols+` FROM websites WHERE db_name=?`, dbName))
 }
 
 func (s *Store) UpdateDBSize(siteID string, size int64) error {
@@ -516,11 +681,26 @@ func (s *Store) DBSize(siteID string) int64 {
 // ---- Config versions ----
 
 func (s *Store) SaveConfigVersion(websiteID int64, envJSON, composeYAML, note string) (int, error) {
+	// MAX(version)+1 and the insert are one transaction: outside
+	// one, two concurrent saves compute the same next version and
+	// one dies on the UNIQUE(website_id, version) constraint.
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
 	var v int
-	_ = s.DB.QueryRow(`SELECT COALESCE(MAX(version),0) FROM website_configurations WHERE website_id=?`, websiteID).Scan(&v)
+	if err := tx.QueryRow(`SELECT COALESCE(MAX(version),0) FROM website_configurations WHERE website_id=?`, websiteID).Scan(&v); err != nil {
+		return 0, err
+	}
 	v++
-	_, err := s.DB.Exec(`INSERT INTO website_configurations(website_id,version,env_json,compose_yaml,note,created_at) VALUES(?,?,?,?,?,?)`, websiteID, v, envJSON, composeYAML, note, Now())
-	return v, err
+	if _, err := tx.Exec(`INSERT INTO website_configurations(website_id,version,env_json,compose_yaml,note,created_at) VALUES(?,?,?,?,?,?)`, websiteID, v, envJSON, composeYAML, note, Now()); err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return v, nil
 }
 
 type ConfigVersion struct {
@@ -646,6 +826,23 @@ func (s *Store) UpdateJob(id, status string, progress int, message, errText stri
 		finished_at=CASE WHEN ? IN ('succeeded','failed','cancelled') THEN ? ELSE finished_at END
 		WHERE id=?`, status, progress, message, errText, now, status, now, status, now, id)
 	return err
+}
+
+// ClaimJob atomically moves a job from 'queued' to 'running' and
+// reports whether the caller won the claim. This is the
+// compare-and-swap that makes operator cancel race-safe: a cancel
+// that lands before the claim flips the row to 'cancelled', the
+// claim then matches nothing, and the executor never starts —
+// previously the executor's unconditional start-write overwrote
+// the cancellation and the operation ran anyway.
+func (s *Store) ClaimJob(id string) (bool, error) {
+	now := Now()
+	res, err := s.DB.Exec(`UPDATE jobs SET status='running', progress=5, message='provisioning started', updated_at=?, started_at=COALESCE(started_at, ?) WHERE id=? AND status='queued'`, now, now, id)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n == 1, err
 }
 
 func (s *Store) BumpJobAttempts(id string) error {
@@ -889,7 +1086,11 @@ func (s *Store) AddAudit(adminID int64, action, target, detail, ip string) error
 // common secret-bearing keys, case-insensitively, so Redact can scrub
 // EVERY occurrence (the previous implementation handled only the
 // first occurrence of four exact markers).
-var secretPattern = regexp.MustCompile(`(?i)(password|passwd|secret|token|api[-_]?key|db_password)(\s*["']?\s*[:=]\s*["']?)[^\s"',;]+`)
+// The value alternative tries a fully quoted string FIRST: the
+// bare-token class stops at the first space, which used to leak
+// the remainder of a quoted secret ("password: \"abc def\"" left
+// ` def"` behind in stored audit/event rows).
+var secretPattern = regexp.MustCompile(`(?i)(password|passwd|secret|token|api[-_]?key|db_password)(\s*["']?\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s"',;]+)`)
 
 func Redact(s string) string {
 	return secretPattern.ReplaceAllString(s, "${1}${2}***")

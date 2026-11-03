@@ -2,6 +2,7 @@ package security
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 )
@@ -23,7 +24,44 @@ func SafeJoin(root, rel string) (string, error) {
 	if joined != cleanRoot && !strings.HasPrefix(joined, cleanRoot+string(filepath.Separator)) {
 		return "", fmt.Errorf("path %q escapes the site directory", rel)
 	}
-	return joined, nil
+	// Symlink resolution: the lexical check alone is not enough —
+	// a symlink planted inside the root (a WordPress plugin can
+	// create one under uploads) would let a later open/read/write
+	// escape to anywhere on the filesystem. Resolve the deepest
+	// existing ancestor of the target and re-verify containment;
+	// not-yet-existing trailing components are re-appended so
+	// creating new files still works.
+	resolvedRoot, err := filepath.EvalSymlinks(cleanRoot)
+	if err != nil {
+		resolvedRoot = cleanRoot // root does not exist yet; lexical result stands
+	}
+	target, rest := joined, ""
+	for {
+		if _, err := os.Lstat(target); err == nil {
+			resolved, err := filepath.EvalSymlinks(target)
+			if err != nil {
+				return "", err
+			}
+			final := resolved
+			if rest != "" {
+				final = filepath.Join(resolved, rest)
+			}
+			if final != resolvedRoot && !strings.HasPrefix(final, resolvedRoot+string(filepath.Separator)) {
+				return "", fmt.Errorf("path %q escapes the site directory through a symbolic link", rel)
+			}
+			return final, nil
+		}
+		parent := filepath.Dir(target)
+		if parent == target {
+			return joined, nil
+		}
+		if rest == "" {
+			rest = filepath.Base(target)
+		} else {
+			rest = filepath.Join(filepath.Base(target), rest)
+		}
+		target = parent
+	}
 }
 
 // IsSensitiveFile reports files hidden by default in the file manager.

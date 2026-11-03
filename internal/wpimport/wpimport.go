@@ -88,6 +88,26 @@ func MergeWPvividParts(dstPath string, parts []MergePart) (int, error) {
 	}
 	zw := zip.NewWriter(out)
 	written := 0
+	// The merged archive is stored UNCOMPRESSED, so a highly
+	// compressible part set would expand far beyond its upload
+	// size. Preflight the declared uncompressed total and enforce
+	// the same ceiling during the copy.
+	var declaredTotal uint64
+	for _, part := range parts {
+		if zr, err := zip.OpenReader(part.Path); err == nil {
+			for _, f := range zr.File {
+				declaredTotal += f.UncompressedSize64
+			}
+			zr.Close()
+		}
+	}
+	if declaredTotal > MaxExtractedBytes {
+		zw.Close()
+		out.Close()
+		_ = os.Remove(dstPath)
+		return 0, fmt.Errorf("the backup parts expand to more than %d GB uncompressed; refusing (possible decompression bomb)", int64(MaxExtractedBytes)>>30)
+	}
+	var copiedTotal int64
 	for _, part := range parts {
 		zr, err := zip.OpenReader(part.Path)
 		if err != nil {
@@ -122,13 +142,21 @@ func MergeWPvividParts(dstPath string, parts []MergePart) (int, error) {
 				out.Close()
 				return 0, err
 			}
-			_, err = io.Copy(w, rc)
+			n, err := io.Copy(w, io.LimitReader(rc, int64(MaxExtractedBytes)-copiedTotal+1))
 			rc.Close()
+			copiedTotal += n
 			if err != nil {
 				zr.Close()
 				zw.Close()
 				out.Close()
 				return 0, err
+			}
+			if copiedTotal > int64(MaxExtractedBytes) {
+				zr.Close()
+				zw.Close()
+				out.Close()
+				_ = os.Remove(dstPath)
+				return 0, fmt.Errorf("the backup parts expand to more than %d GB uncompressed; refusing (possible decompression bomb)", int64(MaxExtractedBytes)>>30)
 			}
 			written++
 		}

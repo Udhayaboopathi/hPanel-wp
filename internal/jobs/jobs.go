@@ -6,8 +6,8 @@ import "fmt"
 var transitions = map[string]map[string]bool{
 	"queued":      {"running": true, "cancelled": true, "failed": true, "interrupted": true},
 	"running":     {"succeeded": true, "failed": true, "cancelled": true, "interrupted": true, "queued": true}, // queued = retry scheduled (bounded auto-retry)
-	"interrupted": {"queued": true, "failed": true, "cancelled": true},
-	"failed":      {"queued": true},
+	"interrupted": {"failed": true, "cancelled": true},
+	"failed":      {},
 	"succeeded":   {},
 	"cancelled":   {},
 }
