@@ -668,26 +668,80 @@ func (a *App) siteChangeDomain(w http.ResponseWriter, r *http.Request) {
 	if site == nil {
 		return
 	}
+	back := "/websites/" + site.SiteID + "?tab=domain&flash="
 	_ = r.ParseForm()
 	newDomain := domains.Normalize(r.FormValue("new_domain"))
 	if err := domains.Validate(newDomain); err != nil {
-		http.Redirect(w, r, "/websites/"+site.SiteID+"?tab=domain&flash="+err.Error(), http.StatusSeeOther)
+		http.Redirect(w, r, back+err.Error(), http.StatusSeeOther)
+		return
+	}
+	if newDomain == site.Domain {
+		http.Redirect(w, r, back+"That is already the site's domain.", http.StatusSeeOther)
 		return
 	}
 	if _, err := a.store.GetWebsiteByDomain(newDomain); err == nil {
-		http.Redirect(w, r, "/websites/"+site.SiteID+"?tab=domain&flash=Domain already in use.", http.StatusSeeOther)
+		http.Redirect(w, r, back+"Domain already in use.", http.StatusSeeOther)
+		return
+	}
+	// The whole change rides in ONE apply_config job (the runner
+	// allows a single active job per site), so refuse early while
+	// another job is running instead of half-applying the change.
+	if active, err := a.store.HasActiveJobForSite(site.SiteID, ""); err == nil && active {
+		http.Redirect(w, r, back+"A job is already running for this site; wait for it to finish, then change the domain.", http.StatusSeeOther)
 		return
 	}
 	old := site.Domain
-	_ = a.store.UpdateWebsite(site.SiteID, map[string]any{"domain": newDomain, "admin_domain": "wpadmin." + newDomain})
-	a.audit(r, "website.change_domain", site.SiteID, old+" -> "+newDomain)
-	// URL replacement inside WordPress is serialization-safe via WP-CLI.
-	spec, err := a.agentSpec(site, true)
-	if err == nil {
-		spec.Domain = newDomain
-		_, _ = a.runner.EnqueueSimple(site, "wpcli", agentproto.Request{Op: agentproto.OpWPCLI, Site: spec, Action: "cache_flush"})
+	if err := a.store.UpdateWebsite(site.SiteID, map[string]any{"domain": newDomain, "admin_domain": "wpadmin." + newDomain}); err != nil {
+		http.Redirect(w, r, back+"Could not save the new domain: "+err.Error(), http.StatusSeeOther)
+		return
 	}
-	http.Redirect(w, r, "/websites/"+site.SiteID+"?tab=domain&flash=Domain updated in the panel. Apply the configuration to rebuild Traefik labels, update DNS, then run a check.", http.StatusSeeOther)
+	a.audit(r, "website.change_domain", site.SiteID, old+" -> "+newDomain)
+	updated, err := a.store.GetWebsiteBySiteID(site.SiteID)
+	if err != nil {
+		http.Redirect(w, r, back+"Domain saved. Apply the configuration to rebuild the site under it.", http.StatusSeeOther)
+		return
+	}
+	// Regenerate the site's configuration under the new domain and
+	// apply it. The agent rebuilds routing (Traefik labels) and,
+	// because the old domain rides along in Arg, rewrites the
+	// site's internal WordPress URLs to the new domain in the same
+	// job — a domain change is complete in one step.
+	spec, err := a.agentSpec(updated, true)
+	if err != nil {
+		http.Redirect(w, r, back+"Domain saved, but preparing the rebuild failed: "+err.Error(), http.StatusSeeOther)
+		return
+	}
+	profile, _ := configgen.ProfileFor(updated.ResourceProfile, updated.CPULimit, updated.MemLimitMB)
+	envJSON := `{"PHP_MEMORY_LIMIT":"256M","UPLOAD_MAX_FILESIZE":"64M","POST_MAX_SIZE":"64M","WORDPRESS_DEBUG":"0"}`
+	env := map[string]string{}
+	if latest, lerr := a.store.LatestConfig(updated.ID); lerr == nil && latest.EnvJSON != "" {
+		envJSON = latest.EnvJSON
+	}
+	_ = json.Unmarshal([]byte(envJSON), &env)
+	cs := configgen.SiteSpec{
+		SiteID: updated.SiteID, Domain: newDomain, AdminDomain: updated.AdminDomain, Title: updated.Title,
+		DBName: updated.DBName, DBUser: updated.DBUser, DBPassword: spec.DBPassword, DBHost: a.cfg.SiteDBHost,
+		PHPVersion: updated.PHPVersion, Profile: profile, SiteDir: updated.SiteDir,
+		ContainerName: updated.ContainerName, Network: websites.NetworkName(updated.SiteID),
+		PHPMemory: env["PHP_MEMORY_LIMIT"], UploadSize: env["UPLOAD_MAX_FILESIZE"], Debug: env["WORDPRESS_DEBUG"] == "1",
+		TablePrefix: updated.TablePrefix,
+	}
+	composeYAML, err := configgen.GenerateCompose(cs)
+	if err != nil {
+		http.Redirect(w, r, back+"Domain saved, but generating its configuration failed: "+err.Error(), http.StatusSeeOther)
+		return
+	}
+	spec.ComposeYAML = composeYAML
+	spec.EnvText = configgen.GenerateEnv(cs)
+	if _, err := a.store.SaveConfigVersion(updated.ID, envJSON, composeYAML, "domain change "+old+" -> "+newDomain); err != nil {
+		a.log.Warn("save config version (domain change)", "err", err)
+	}
+	job, err := a.runner.EnqueueSimple(updated, "apply_config", agentproto.Request{Op: agentproto.OpApplyConfig, Site: spec, Arg: old})
+	if err != nil {
+		http.Redirect(w, r, back+"Domain saved, but the rebuild could not be started: "+err.Error(), http.StatusSeeOther)
+		return
+	}
+	http.Redirect(w, r, "/jobs/"+job.ID, http.StatusSeeOther)
 }
 
 var _ = auth.GenerateSecurePassword

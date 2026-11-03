@@ -1205,6 +1205,26 @@ func (a *Agent) applyConfig(ctx context.Context, req agentproto.Request) (*agent
 			return resp, err2
 		}
 	}
+	// A domain change rides along in Arg (the previous domain):
+	// routing has moved to the new name, but every URL inside
+	// WordPress still points at the old one until it is rewritten.
+	// Search-replace is serialization-safe via WP-CLI.
+	if req.Arg != "" && req.Arg != s.Domain {
+		oldURL, newURL := "https://"+req.Arg, "https://"+s.Domain
+		wpEnv := []string{"WORDPRESS_DB_HOST=" + a.db.InternalHost(), "WORDPRESS_DB_NAME=" + s.DBName, "WORDPRESS_DB_USER=" + s.DBUser, "WORDPRESS_DB_PASSWORD=" + s.DBPassword}
+		network := websites.NetworkName(s.SiteID)
+		if _, err := a.runOneShot(ctx, s, "wordpress:cli-2.12.0-php8.3", wordpress.SearchReplaceArgs(oldURL, newURL), wpEnv, nil, network); err != nil {
+			return resp, fmt.Errorf("configuration applied under %s, but rewriting the site's internal URLs from %s failed: %w", s.Domain, req.Arg, err)
+		}
+		for _, args := range [][]string{
+			{"wp", "option", "update", "siteurl", newURL, "--allow-root"},
+			{"wp", "option", "update", "home", newURL, "--allow-root"},
+			{"wp", "cache", "flush", "--allow-root"},
+		} {
+			_, _ = a.runOneShot(ctx, s, "wordpress:cli-2.12.0-php8.3", args, wpEnv, nil, network)
+		}
+		resp.Events = append(resp.Events, agentproto.Event{Progress: 90, Message: "site URLs rewritten from " + oldURL + " to " + newURL, Level: "info"})
+	}
 	resp.OK = true
 	resp.Events = append(resp.Events, agentproto.Event{Progress: 100, Message: "configuration applied", Level: "info"})
 	return resp, nil

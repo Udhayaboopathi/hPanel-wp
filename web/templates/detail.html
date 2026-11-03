@@ -199,7 +199,8 @@ Type: A    Name: wpadmin  Value: {{$.ServerIP}}</pre>
 <h3>Change domain</h3>
 <form method="post" action="/websites/{{$s.SiteID}}/change-domain">{{template "csrf" $csrf}}
 <label>New domain <input name="new_domain" required placeholder="newdomain.com"></label>
-<button class="btn" type="submit" data-confirm="Change the domain in the panel? You must also update DNS and Apply Configuration.">Change domain</button></form>
+<button class="btn" type="submit" data-confirm="Change this site's domain? The site is rebuilt under the new domain and all internal WordPress URLs are rewritten to it. Point the new domain's DNS at this server afterwards.">Change domain</button></form>
+<p class="muted">One job does everything: routing is rebuilt under the new domain and every internal URL inside WordPress is rewritten from the old domain to the new one. Afterwards, point the new domain's DNS A record at this server and run the check above.</p>
 </section>
 {{end}}
 

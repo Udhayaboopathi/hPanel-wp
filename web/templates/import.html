@@ -4,16 +4,16 @@
 
 <section class="card">
 <h2>One-upload import (WPvivid &amp; standard backups)</h2>
-<p>Two ways in: <strong>(1)</strong> upload the site's <strong>wp-content as one ZIP</strong> (if it also contains the WPvivid database file — the <code>…-db</code> file — the database is taken from there), or <strong>(2)</strong> if your backup is a <strong>WPvivid multi-part set</strong> (the separate <code>…-plugins.zip</code>, <code>…-themes.zip</code>, <code>…-uploads.zip</code>, <code>…-mu-plugins.zip</code>, <code>…-others.zip</code> and <code>…-db.gz</code> files), select <strong>all of them at once</strong> in the file field — KR Host combines them itself. A database export (<code>.sql</code>, <code>.sql.gz</code>, or a ZIP of one) can also be added as the second file. KR Host then deploys the site as a tracked job: it provisions the container and a fresh database, installs your files, imports the database, rewrites the old domain to the new one, and creates the administrator account below in the imported site.</p>
+<p>Two ways in: <strong>(1)</strong> upload the site's <strong>wp-content as one ZIP</strong> (if it also contains the WPvivid database file — the <code>…-db</code> file — the database is taken from there), or <strong>(2)</strong> if your backup is a <strong>WPvivid multi-part set</strong> (the separate <code>…-plugins.zip</code>, <code>…-themes.zip</code>, <code>…-uploads.zip</code>, <code>…-mu-plugins.zip</code>, <code>…-others.zip</code> and <code>…-db.gz</code> files), select <strong>all of them at once</strong> in the file field — KR Host combines them itself. A database export (<code>.sql</code>, <code>.sql.gz</code>, or a ZIP of one) can also be added as the second file. KR Host then deploys the site as a tracked job: it provisions the container and a fresh database, installs your files, and imports the database unchanged — the site's original admin accounts come across in it. <strong>Leave the domain empty to keep the site's original domain</strong> (read from the database; afterwards you only point that domain's DNS at this server), or enter a new domain and every internal URL is rewritten to it. <strong>Leave all three administrator fields empty to keep the backup's original WordPress admin</strong> — or fill all three to add/reset an administrator account during the import.</p>
 <form method="post" action="/websites/import" enctype="multipart/form-data">
 {{template "csrf" .CSRF}}
-<label>New domain <input name="domain" required placeholder="example.com"></label>
+<label>New domain — leave empty to keep the site's original domain <input name="domain" placeholder="example.com"></label>
 <label>Site title <input name="title" placeholder="(defaults to the domain)"></label>
 <label>wp-content ZIP — or ALL WPvivid backup parts selected together (required, up to 2 GB total) <input type="file" name="files_zip" accept=".zip,.gz,.sql" multiple required></label>
 <label>Database file (optional if the ZIP contains the WPvivid dump) <input type="file" name="db_file" accept=".sql,.gz,.zip"></label>
-<label>WordPress admin username <input name="admin_user" required autocomplete="username"></label>
-<label>WordPress admin email <input name="admin_email" type="email" required autocomplete="email"></label>
-<label>WordPress admin password (min. 12 characters) <input name="admin_password" type="password" required autocomplete="new-password"></label>
+<label>WordPress admin username — leave all three admin fields empty to keep the original <input name="admin_user" autocomplete="username"></label>
+<label>WordPress admin email <input name="admin_email" type="email" autocomplete="email"></label>
+<label>WordPress admin password (min. 12 characters) <input name="admin_password" type="password" autocomplete="new-password"></label>
 <label>PHP version <select name="php_version"><option value="8.3" selected>PHP 8.3 (WordPress 7.1.4)</option><option value="8.2">PHP 8.2 (WordPress 7.1.4)</option></select></label>
 <label>Resource profile <select name="resource_profile"><option value="lightweight">Lightweight — 0.5 CPU, 512 MB RAM</option><option value="standard" selected>Standard — 1 CPU, 768 MB RAM</option></select></label>
 <button class="btn primary" type="submit">Upload and deploy</button>

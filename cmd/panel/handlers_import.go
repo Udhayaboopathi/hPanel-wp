@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -163,9 +164,49 @@ func (a *App) importSubmit(w http.ResponseWriter, r *http.Request) {
 		AdminPassword: fields["admin_password"],
 		PHPVersion:    fields["php_version"], Profile: fields["resource_profile"],
 	}
-	if err := in.Validate(); err != nil {
-		abort(err.Error())
+	// Migration semantics: an empty domain means "keep the site's
+	// original domain" (read from the backup's database below) and
+	// three empty administrator fields mean "keep the backup's
+	// original admin account" (its users come across in the dump,
+	// password hashes included). Validate everything that does not
+	// depend on the dump now; the domain is resolved after the
+	// dump is analysed.
+	keepDomain := in.Domain == ""
+	keepAdmin := in.AdminUser == "" && in.AdminEmail == "" && in.AdminPassword == ""
+	if !keepAdmin && (in.AdminUser == "" || in.AdminEmail == "" || in.AdminPassword == "") {
+		abort("Fill in all three WordPress administrator fields, or leave all three empty to keep the backup's original admin account.")
 		return
+	}
+	in.Domain = security.NormalizeDomain(in.Domain)
+	if !keepDomain {
+		if err := security.ValidateDomain(in.Domain); err != nil {
+			abort(err.Error())
+			return
+		}
+	}
+	if strings.ContainsAny(in.Title, "\r\n") {
+		abort("site title must not contain line breaks")
+		return
+	}
+	if !keepAdmin {
+		if err := security.ValidateAdminUsername(in.AdminUser); err != nil {
+			abort("wordpress admin username: " + err.Error())
+			return
+		}
+		if err := security.ValidateEmail(in.AdminEmail); err != nil {
+			abort(err.Error())
+			return
+		}
+		if len(in.AdminPassword) < 12 {
+			abort("wordpress admin password must be at least 12 characters")
+			return
+		}
+	}
+	if in.PHPVersion == "" {
+		in.PHPVersion = "8.3"
+	}
+	if in.Profile == "" {
+		in.Profile = "lightweight"
 	}
 	profile, err := configgen.ProfileFor(in.Profile, in.CPULimit, in.MemLimitMB)
 	if err != nil {
@@ -248,6 +289,33 @@ func (a *App) importSubmit(w http.ResponseWriter, r *http.Request) {
 	if err := security.ValidateTablePrefix(prefix); err != nil {
 		abort("The database dump uses an unsupported table prefix: " + err.Error())
 		return
+	}
+
+	// Resolve the domain now that the dump has been read: an empty
+	// form field keeps the site's original domain, so the operator
+	// only has to point that domain's DNS at this server.
+	if keepDomain {
+		host := sourceHost(sourceURL)
+		if host == "" {
+			abort("The domain field was left empty and the backup's database does not show the site's original address (no siteurl found). Re-submit with the domain filled in.")
+			return
+		}
+		in.Domain = security.NormalizeDomain(host)
+		if err := security.ValidateDomain(in.Domain); err != nil {
+			abort("The backup's original domain " + host + " cannot be used: " + err.Error())
+			return
+		}
+	}
+	if in.AdminDomain == "" {
+		in.AdminDomain = "wpadmin." + in.Domain
+	}
+	in.AdminDomain = security.NormalizeDomain(in.AdminDomain)
+	if err := security.ValidateDomain(in.AdminDomain); err != nil {
+		abort("admin domain: " + err.Error())
+		return
+	}
+	if in.Title == "" {
+		in.Title = in.Domain
 	}
 
 	// Same collision and capacity discipline as a normal create.
@@ -349,6 +417,24 @@ func (a *App) importSubmit(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = a.store.AddEvent(job.ID, "info", fmt.Sprintf("backup analysed: database format %s, table prefix %q, source URL %s", format, prefix, orNone(sourceURL)))
 	http.Redirect(w, r, "/websites/"+siteID+"?flash=Import started. Follow progress in Deployment Jobs.", http.StatusSeeOther)
+}
+
+// sourceHost extracts the host from a detected source site URL
+// ("https://www.example.com/blog" -> "www.example.com"). It
+// tolerates scheme-less values and ports.
+func sourceHost(raw string) string {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return ""
+	}
+	if u, err := url.Parse(s); err == nil && u.Host != "" {
+		return u.Hostname()
+	}
+	s = strings.TrimPrefix(s, "//")
+	if i := strings.IndexAny(s, "/:"); i >= 0 {
+		s = s[:i]
+	}
+	return s
 }
 
 func orNone(s string) string {
